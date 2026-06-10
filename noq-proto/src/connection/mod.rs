@@ -5055,6 +5055,9 @@ impl Connection {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
                 }
+                Frame::ResetStreamAt(frame) => {
+                    todo!();
+                }
                 Frame::DataBlocked(DataBlocked(offset)) => {
                     debug!(offset, "peer claims to be blocked at connection level");
                 }
@@ -7722,6 +7725,9 @@ impl SentFrames {
             }
             StreamsBlocked(streams_blocked) => {
                 self.retransmits_mut().streams_blocked[streams_blocked.dir as usize] = true
+            }
+            ResetStreamAt(reset_stream_at) => {
+                todo!();
             }
         }
     }
