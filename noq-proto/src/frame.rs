@@ -135,6 +135,8 @@ pub enum FrameType {
     ReachOutAtIpv6,
     #[assoc(to_u64 = 0x3d7f94)]
     RemoveAddress,
+    // #[assoc(to_u64 = 0x24)]
+    // ResetStreamAt,
 }
 
 /// Encounter a frame ID that was not valid.
