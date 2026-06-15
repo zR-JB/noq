@@ -60,6 +60,20 @@ impl Assembler {
 
     /// Get the the next chunk
     pub(super) fn read(&mut self, max_length: usize, ordered: bool) -> Option<Chunk> {
+        self.read_capped(max_length, ordered, u64::MAX)
+    }
+
+    /// Like [`Self::read`], but never returns data at or beyond `offset_limit`.
+    ///
+    /// Used to deliver only the reliable prefix of a stream subject to a RESET_STREAM_AT. The limit
+    /// is applied by stream offset rather than by the read cursor, because in unordered mode the
+    /// cursor is a running total of bytes handed out, not the contiguous prefix offset.
+    pub(super) fn read_capped(
+        &mut self,
+        max_length: usize,
+        ordered: bool,
+        offset_limit: u64,
+    ) -> Option<Chunk> {
         loop {
             let chunk = self.data.front_mut()?;
 
@@ -84,6 +98,14 @@ impl Assembler {
                     self.buffered -= start;
                 }
             }
+
+            // Never hand out data at or beyond the offset limit, and never let a single chunk
+            // straddle it.
+            if chunk.offset >= offset_limit {
+                self.restore_front_order();
+                return None;
+            }
+            let max_length = max_length.min((offset_limit - chunk.offset) as usize);
 
             if max_length < chunk.bytes.len() {
                 self.bytes_read += max_length as u64;
