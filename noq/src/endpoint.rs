@@ -1359,6 +1359,7 @@ mod packet_queue_tests {
     struct CountingSocket {
         socket: Box<dyn AsyncUdpSocket>,
         polls: Arc<AtomicUsize>,
+        error: Option<io::Error>,
     }
 
     impl AsyncUdpSocket for CountingSocket {
@@ -1373,12 +1374,45 @@ mod packet_queue_tests {
             _: &mut [RecvMeta],
         ) -> Poll<io::Result<usize>> {
             self.polls.fetch_add(1, Ordering::Relaxed);
-            Poll::Pending
+            self.error
+                .take()
+                .map_or(Poll::Pending, |e| Poll::Ready(Err(e)))
         }
 
         fn local_addr(&self) -> io::Result<SocketAddr> {
             self.socket.local_addr()
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn message_size_receive_error_keeps_endpoint_alive() {
+        let factory = crate::tests::EndpointFactory::new();
+        let runtime = Arc::new(HeldRuntime::default());
+        runtime.hold.store(true, Ordering::Relaxed);
+        let endpoint = factory.endpoint_with_runtime("held", Default::default(), runtime.clone());
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let error = socket
+            .send_to(&[0; 1 << 16], socket.local_addr().unwrap())
+            .unwrap_err();
+        assert!(is_msg_size_err(&error), "{error}");
+        let polls = Arc::new(AtomicUsize::new(0));
+        endpoint
+            .rebind_abstract(Box::new(CountingSocket {
+                socket: TokioRuntime.wrap_udp_socket(socket).unwrap(),
+                polls: polls.clone(),
+                error: Some(error),
+            }))
+            .unwrap();
+        std::future::poll_fn(|cx| {
+            let mut state = endpoint.inner.state.lock().unwrap();
+            state.prev_socket = None;
+            let now = state.runtime.now();
+            assert!(!state.drive_recv(cx, now).unwrap());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(polls.load(Ordering::Relaxed), 2);
+        runtime.tasks.lock().unwrap().clear();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1431,6 +1465,7 @@ mod packet_queue_tests {
                 .rebind_abstract(Box::new(CountingSocket {
                     socket: TokioRuntime.wrap_udp_socket(socket).unwrap(),
                     polls: polls.clone(),
+                    error: None,
                 }))
                 .unwrap();
             std::future::poll_fn(|cx| {
