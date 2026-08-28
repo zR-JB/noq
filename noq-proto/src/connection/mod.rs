@@ -5122,7 +5122,10 @@ impl Connection {
                         .map(|span| span.record("path", tracing::field::display(&ack.path_id)));
                     self.on_path_ack_received(now, packet.header.space().into(), ack)?;
                 }
-                Frame::Close(reason) => {
+                // Per RFC 9000 §12.4 Table 3, only a CONNECTION_CLOSE frame of type 0x1c may appear
+                // in Initial or Handshake packets. An application close (0x1d) falls through to the
+                // catch-all arm below.
+                Frame::Close(reason @ Close::Connection(_)) => {
                     let reason = self.owned_peer_close(reason);
                     self.state
                         .move_to_draining(Some(reason.into()), &mut self.endpoint_events);
@@ -5194,9 +5197,12 @@ impl Connection {
             }
 
             let _guard = span.enter();
+            // RFC 9000 §12.5: CRYPTO frames cannot be sent in 0-RTT packets. Both CONNECTION_CLOSE
+            // types are permitted there, as 0-RTT belongs to the application data packet number
+            // space; see §12.4 Table 3.
             if packet.header.is_0rtt() {
                 match frame {
-                    Frame::Crypto(_) | Frame::Close(Close::Application(_)) => {
+                    Frame::Crypto(_) => {
                         return Err(TransportError::PROTOCOL_VIOLATION(
                             "illegal frame type in 0-RTT",
                         ));
