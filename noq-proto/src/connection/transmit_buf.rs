@@ -218,6 +218,11 @@ impl<'a> TransmitBuf<'a> {
     pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
         self.buf.as_mut_slice()
     }
+
+    /// Drops the bytes written past `len`, as of a packet abandoned after its header
+    pub(super) fn truncate(&mut self, len: usize) {
+        self.buf.truncate(len);
+    }
 }
 
 unsafe impl BufMut for TransmitBuf<'_> {
