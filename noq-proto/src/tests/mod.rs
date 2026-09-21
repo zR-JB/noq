@@ -240,6 +240,18 @@ fn server_stateless_reset() {
 }
 
 #[test]
+fn failed_connect_releases_its_cid() {
+    let _guard = subscribe();
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
+    let remote = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 4433);
+    assert_matches!(
+        endpoint.connect(Instant::now(), client_config(), remote, "not a name"),
+        Err(crate::ConnectError::InvalidServerName(_))
+    );
+    assert_eq!(endpoint.known_cids(), 0);
+}
+
+#[test]
 fn client_stateless_reset() {
     let _guard = subscribe();
     let mut key_material = vec![0; 64];
