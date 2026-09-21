@@ -362,7 +362,10 @@ impl Endpoint {
         );
         let tls = config
             .crypto
-            .start_session(config.version, server_name, &params)?;
+            .start_session(config.version, server_name, &params)
+            .inspect_err(|_| {
+                self.index.connection_ids.remove(&local_cid);
+            })?;
 
         let conn = self.add_connection(
             ch,
