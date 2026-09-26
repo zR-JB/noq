@@ -34,7 +34,12 @@ impl Datagrams<'_> {
             .max_size()
             .ok_or(SendDatagramError::UnsupportedByPeer)?;
         let send_buffer_size = self.conn.config.datagram_send_buffer_size;
-        if data.len() > Ord::min(max, send_buffer_size) {
+        if data.len() > max
+            || data
+                .len()
+                .checked_add(size_of::<Datagram>())
+                .is_none_or(|size| size > send_buffer_size)
+        {
             return Err(SendDatagramError::TooLarge);
         }
         if drop {
@@ -49,7 +54,9 @@ impl Datagrams<'_> {
             self.conn.datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
-        self.conn.datagrams.outgoing.push_back(Datagram { data });
+        self.conn.datagrams.outgoing.push_back(Datagram {
+            data: Bytes::copy_from_slice(&data),
+        });
         Ok(())
     }
 
@@ -83,10 +90,13 @@ impl Datagrams<'_> {
             .max_size()
             .ok_or(SendDatagramError::UnsupportedByPeer)?;
         let send_buffer_size = self.conn.config.datagram_send_buffer_size;
-        if datagrams
-            .iter()
-            .any(|data| data.len() > Ord::min(max, send_buffer_size))
-        {
+        if datagrams.iter().any(|data| {
+            data.len() > max
+                || data
+                    .len()
+                    .checked_add(size_of::<Datagram>())
+                    .is_none_or(|size| size > send_buffer_size)
+        }) {
             return Err(SendDatagramError::TooLarge);
         }
 
@@ -107,7 +117,9 @@ impl Datagrams<'_> {
             self.conn
                 .datagrams
                 .outgoing
-                .push_back(Datagram { data: data.clone() });
+                .push_back(Datagram {
+                    data: Bytes::copy_from_slice(data),
+                });
             queued += 1;
         }
 
@@ -166,7 +178,7 @@ impl Datagrams<'_> {
         self.conn
             .config
             .datagram_send_buffer_size
-            .saturating_sub(self.conn.datagrams.outgoing.payload_bytes)
+            .saturating_sub(self.conn.datagrams.outgoing.memory_used())
             .saturating_sub(size_of::<Datagram>())
     }
 }
@@ -205,7 +217,9 @@ impl DatagramState {
             self.recv();
         }
 
-        self.incoming.push_back(datagram);
+        self.incoming.push_back(Datagram {
+            data: Bytes::copy_from_slice(&datagram.data),
+        });
         Ok(was_empty)
     }
 
@@ -219,7 +233,13 @@ impl DatagramState {
     }
 
     fn has_send_buffer_space(&self, datagram_len: usize, send_buffer_size: usize) -> bool {
-        let Some(total) = self.outgoing.memory_used().checked_add(datagram_len) else {
+        // The new datagram's queue entry counts too
+        let Some(total) = self
+            .outgoing
+            .memory_used()
+            .checked_add(datagram_len)
+            .and_then(|size| size.checked_add(size_of::<Datagram>()))
+        else {
             return false;
         };
 
