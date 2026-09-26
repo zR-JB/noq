@@ -1,0 +1,20 @@
+name: graphite-meter fork
+on:
+  push: {branches: ["graphite-meter/**"]}
+  pull_request: {branches: ["graphite-meter/**"]}
+permissions: {contents: read}
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {persist-credentials: false}
+      - run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
+      - run: cargo test --locked -p noq-proto --lib --tests
+      - run: cargo test --locked -p noq --lib --tests
+      - run: cargo check --locked -p noq-proto --no-default-features --features rustls-aws-lc-rs
