@@ -157,6 +157,7 @@ impl Endpoint {
     ) -> Option<DatagramEvent> {
         // Partially decode packet or short-circuit if unable
         let datagram_len = data.len();
+        let storage_size = data.capacity() + std::mem::size_of::<DatagramConnectionEvent>();
         let mut event = match PartialDecode::new(
             data,
             &FixedLengthConnectionIdParser::new(self.local_cid_generator.cid_len()),
@@ -164,6 +165,7 @@ impl Endpoint {
             self.config.grease_quic_bit,
         ) {
             Ok((first_decode, remaining)) => DatagramConnectionEvent {
+                storage_size,
                 now,
                 network_path,
                 path_id: PathId::ZERO, // Corrected later for existing paths
@@ -224,16 +226,16 @@ impl Endpoint {
 
                     if incoming_buffer
                         .total_bytes
-                        .checked_add(datagram_len as u64)
+                        .checked_add(storage_size as u64)
                         .is_some_and(|n| n <= config.incoming_buffer_size)
                         && self
                             .all_incoming_buffers_total_bytes
-                            .checked_add(datagram_len as u64)
+                            .checked_add(storage_size as u64)
                             .is_some_and(|n| n <= config.incoming_buffer_size_total)
                     {
                         incoming_buffer.datagrams.push(event);
-                        incoming_buffer.total_bytes += datagram_len as u64;
-                        self.all_incoming_buffers_total_bytes += datagram_len as u64;
+                        incoming_buffer.total_bytes += storage_size as u64;
+                        self.all_incoming_buffers_total_bytes += storage_size as u64;
                     }
 
                     None

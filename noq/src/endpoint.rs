@@ -39,7 +39,7 @@ use rustc_hash::FxHashMap;
     any(feature = "aws-lc-rs", feature = "ring"),
 ))]
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::{Notify, futures::Notified, mpsc};
+use tokio::sync::{Notify, Semaphore, futures::Notified, mpsc};
 use tracing::{Instrument, Span, trace};
 use udp::{BATCH_SIZE, RecvMeta};
 
@@ -659,13 +659,12 @@ impl State {
                 continue;
             };
             // Ignoring errors from dropped connections that haven't yet been cleaned up
-            let _ = self
-                .recv_state
+            self.recv_state
                 .connections
                 .senders
                 .get_mut(&ch)
                 .unwrap()
-                .send(ConnectionEvent::Proto(event));
+                .send_proto(event);
         }
 
         true
@@ -738,10 +737,44 @@ fn proto_ecn(ecn: udp::EcnCodepoint) -> proto::EcnCodepoint {
     }
 }
 
+const PACKET_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+struct ConnectionSender {
+    events: mpsc::UnboundedSender<ConnectionEvent>,
+    packet_budget: Arc<Semaphore>,
+}
+
+impl std::ops::Deref for ConnectionSender {
+    type Target = mpsc::UnboundedSender<ConnectionEvent>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+
+impl ConnectionSender {
+    fn send_proto(&self, event: proto::ConnectionEvent) {
+        let permit = if let Some(bytes) = event.packet_storage_size() {
+            let Ok(bytes) = u32::try_from(bytes.saturating_add(mem::size_of::<ConnectionEvent>()))
+            else {
+                return;
+            };
+            let Ok(permit) = self.packet_budget.clone().try_acquire_many_owned(bytes) else {
+                return;
+            };
+            Some(permit)
+        } else {
+            None
+        };
+        let _ = self.events.send(ConnectionEvent::Proto(event, permit));
+    }
+}
+
 #[derive(Debug)]
 struct ConnectionSet {
     /// Senders for communicating with the endpoint's connections
-    senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
+    senders: FxHashMap<ConnectionHandle, ConnectionSender>,
     /// Stored to give out clones to new ConnectionInners
     sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     /// Set if the endpoint has been manually closed
@@ -775,7 +808,13 @@ impl ConnectionSet {
             })
             .unwrap();
         }
-        self.senders.insert(handle, send);
+        self.senders.insert(
+            handle,
+            ConnectionSender {
+                events: send,
+                packet_budget: Arc::new(Semaphore::new(PACKET_QUEUE_BYTES)),
+            },
+        );
         self.active_connections += 1;
         Connecting::new(handle, conn, self.sender.clone(), recv, sender, runtime)
     }
@@ -958,9 +997,8 @@ impl RecvState {
                 Poll::Ready(Ok(msgs)) => {
                     self.recv_limiter.record_work(msgs);
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-                        let mut data: BytesMut = buf[0..meta.len].into();
-                        while !data.is_empty() {
-                            let buf = data.split_to(meta.stride.min(data.len()));
+                        for data in buf[..meta.len].chunks(meta.stride.max(1)) {
+                            let buf = BytesMut::from(data);
                             let mut response_buffer = Vec::new();
                             let addresses = FourTuple::new(meta.addr, meta.dst_ip);
                             match endpoint.handle(
@@ -983,12 +1021,11 @@ impl RecvState {
                                     // Ignoring errors from dropped connections that haven't yet
                                     // been cleaned up
                                     received_connection_packet = true;
-                                    let _ = self
-                                        .connections
+                                    self.connections
                                         .senders
                                         .get_mut(&handle)
                                         .unwrap()
-                                        .send(ConnectionEvent::Proto(event));
+                                        .send_proto(event);
                                 }
                                 Some(DatagramEvent::Response(transmit)) => {
                                     respond(transmit, &response_buffer, sender);
@@ -1040,4 +1077,137 @@ struct PollProgress {
     received_connection_packet: bool,
     /// Whether datagram handling was interrupted early by the work limiter for fairness
     keep_going: bool,
+}
+
+#[cfg(all(
+    test,
+    feature = "runtime-tokio",
+    feature = "rustls",
+    any(feature = "aws-lc-rs", feature = "ring")
+))]
+mod packet_queue_tests {
+    use super::*;
+    use crate::runtime::{AsyncTimer, TokioRuntime};
+    use std::sync::atomic::AtomicBool;
+
+    #[derive(Default)]
+    struct HeldRuntime {
+        hold: AtomicBool,
+        tasks: Mutex<Vec<Pin<Box<dyn Future<Output = ()> + Send>>>>,
+    }
+
+    impl fmt::Debug for HeldRuntime {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("HeldRuntime")
+        }
+    }
+
+    impl Runtime for HeldRuntime {
+        fn new_timer(&self, t: Instant) -> Pin<Box<dyn AsyncTimer>> {
+            TokioRuntime.new_timer(t)
+        }
+        fn spawn(&self, task: Pin<Box<dyn Future<Output = ()> + Send>>) {
+            if self.hold.load(Ordering::Relaxed) {
+                self.tasks.lock().unwrap().push(task);
+            } else {
+                TokioRuntime.spawn(task);
+            }
+        }
+        fn wrap_udp_socket(
+            &self,
+            socket: std::net::UdpSocket,
+        ) -> io::Result<Box<dyn AsyncUdpSocket>> {
+            TokioRuntime.wrap_udp_socket(socket)
+        }
+        fn now(&self) -> Instant {
+            TokioRuntime.now()
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_connection_packet_queue_preserves_close_and_reclaims_storage() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let factory = crate::tests::EndpointFactory::new();
+            let runtime = Arc::new(HeldRuntime::default());
+            let server =
+                factory.endpoint_with_runtime("server", Default::default(), runtime.clone());
+            let client =
+                factory.endpoint_with_runtime("client", Default::default(), Arc::new(TokioRuntime));
+            let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            relay
+                .send_to(&[], server.local_addr().unwrap())
+                .await
+                .unwrap();
+            let _client_connecting = client
+                .connect(relay.local_addr().unwrap(), "localhost")
+                .unwrap();
+            let mut initial = vec![0; 65536];
+            let (len, _) = relay.recv_from(&mut initial).await.unwrap();
+            initial.truncate(len);
+            relay
+                .send_to(&initial, server.local_addr().unwrap())
+                .await
+                .unwrap();
+            let incoming = server.accept().await.unwrap();
+            runtime.hold.store(true, Ordering::Relaxed);
+            let connecting = incoming.accept().unwrap();
+            let budget = server
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .recv_state
+                .connections
+                .senders
+                .values()
+                .next()
+                .unwrap()
+                .packet_budget
+                .clone();
+            let reserved = budget
+                .clone()
+                .try_acquire_many_owned((PACKET_QUEUE_BYTES - 16 * 1024) as u32)
+                .unwrap();
+            let charge = initial.len()
+                + mem::size_of::<ConnectionEvent>()
+                + mem::size_of::<proto::ConnectionEvent>();
+            for _ in 0..32 {
+                for _ in 0..16 {
+                    relay
+                        .send_to(&initial, server.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                }
+                tokio::task::yield_now().await;
+                if budget.available_permits() < charge {
+                    break;
+                }
+            }
+            assert!(
+                budget.available_permits() < charge,
+                "packet queue did not reach its bound"
+            );
+            let remaining = budget.available_permits();
+            for _ in 0..16 {
+                relay
+                    .send_to(&initial, server.local_addr().unwrap())
+                    .await
+                    .unwrap();
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(budget.available_permits(), remaining);
+            server.close(VarInt::from_u32(7), b"closed");
+            for task in runtime.tasks.lock().unwrap().drain(..) {
+                tokio::spawn(task);
+            }
+            assert!(matches!(
+                connecting.await,
+                Err(ConnectionError::LocallyClosed)
+            ));
+            drop(reserved);
+            assert_eq!(budget.available_permits(), PACKET_QUEUE_BYTES);
+        })
+        .await
+        .unwrap();
+    }
 }

@@ -1357,6 +1357,9 @@ struct CoalescedDatagram {
 impl CoalescedDatagram {
     fn into_connection_event(self, now: Instant, path_id: PathId) -> ConnectionEvent {
         ConnectionEvent(ConnectionEventInner::Datagram(DatagramConnectionEvent {
+            storage_size: self.first_decode.data().len()
+                + self.remaining.as_ref().map_or(0, |x| x.len())
+                + std::mem::size_of::<DatagramConnectionEvent>(),
             now,
             network_path: FourTuple {
                 remote: self.remote,

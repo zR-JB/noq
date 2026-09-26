@@ -1697,7 +1697,7 @@ impl State {
                     self.inner
                         .handle_network_change(hint.as_deref().map(|x| x as _), self.runtime.now());
                 }
-                Poll::Ready(Some(ConnectionEvent::Proto(event))) => {
+                Poll::Ready(Some(ConnectionEvent::Proto(event, _permit))) => {
                     self.inner.handle_event(event);
                 }
                 Poll::Ready(Some(ConnectionEvent::Close { reason, error_code })) => {

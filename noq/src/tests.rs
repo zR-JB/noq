@@ -335,13 +335,13 @@ fn endpoint_with_config(transport_config: TransportConfig) -> Endpoint {
 }
 
 /// Constructs endpoints suitable for connecting to themselves and each other
-struct EndpointFactory {
+pub(super) struct EndpointFactory {
     cert: rcgen::CertifiedKey<rcgen::KeyPair>,
     endpoint_config: EndpointConfig,
 }
 
 impl EndpointFactory {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             cert: rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap(),
             endpoint_config: EndpointConfig::default(),
@@ -360,7 +360,7 @@ impl EndpointFactory {
         self.endpoint_with_runtime(name, transport_config, Arc::new(TokioRuntime))
     }
 
-    fn endpoint_with_runtime(
+    pub(super) fn endpoint_with_runtime(
         &self,
         name: impl Into<String>,
         transport_config: TransportConfig,

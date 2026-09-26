@@ -10,6 +10,16 @@ use crate::{Duration, Instant, MAX_CID_SIZE, ResetToken, coding::BufExt, packet:
 #[derive(Debug)]
 pub struct ConnectionEvent(pub(crate) ConnectionEventInner);
 
+impl ConnectionEvent {
+    /// Charged ingress capacity; requires independently owned input buffers.
+    pub fn packet_storage_size(&self) -> Option<usize> {
+        match &self.0 {
+            ConnectionEventInner::Datagram(event) => Some(event.storage_size),
+            ConnectionEventInner::NewIdentifiers(..) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ConnectionEventInner {
     /// A datagram has been received for the Connection
@@ -21,6 +31,7 @@ pub(crate) enum ConnectionEventInner {
 /// Variant of [`ConnectionEventInner`].
 #[derive(Debug)]
 pub(crate) struct DatagramConnectionEvent {
+    pub(crate) storage_size: usize,
     pub(crate) now: Instant,
     pub(crate) network_path: FourTuple,
     pub(crate) path_id: PathId,
