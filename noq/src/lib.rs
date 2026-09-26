@@ -101,12 +101,16 @@ pub use crate::send_stream::{SendStream, Stopped, StoppedError, WriteError};
 mod tests;
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ConnectionEvent {
     Close {
         error_code: VarInt,
         reason: bytes::Bytes,
     },
-    Proto(proto::ConnectionEvent),
+    Proto(
+        proto::ConnectionEvent,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    ),
     Rebind(Pin<Box<dyn UdpSender>>),
     LocalAddressChanged(Option<Arc<dyn NetworkChangeHint + Sync + Send>>),
 }

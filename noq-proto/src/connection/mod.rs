@@ -2261,6 +2261,7 @@ impl Connection {
                 ecn,
                 first_decode,
                 remaining,
+                ..
             }) => {
                 let span = trace_span!("pkt", %path_id);
                 let _guard = span.enter();
