@@ -31,7 +31,7 @@ ring = ["dep:ring", "rustls?/ring"] # TODO: Once released, we'll want to depend 
 # Enables BloomTokenLog, and uses it by default
 bloom = ["dep:fastbloom"]
 # Enables rustls as the TLS implementation backend
-rustls = ["dep:rustls", "dep:aes-gcm"]
+rustls = ["dep:rustls"]
 # Provides `ClientConfig::with_platform_verifier()` convenience method
 platform-verifier = ["dep:rustls-platform-verifier"]
 # Configure `tracing` to log events via `log` if no `tracing` subscriber exists.
@@ -53,7 +53,6 @@ __rustls-post-quantum-test =  []
 __all_without_fips = ["arbitrary", "aws-lc-rs", "rustls", "ring", "platform-verifier", "rustls-log", "qlog", "bench", "bloom", "tracing-log"]
 
 [dependencies]
-aes-gcm = { workspace = true, optional = true }
 arbitrary = { workspace = true, optional = true }
 aws-lc-rs = { workspace = true, optional = true }
 bytes = { workspace = true }
