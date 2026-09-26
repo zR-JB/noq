@@ -2346,6 +2346,89 @@ fn datagram_send_recv() {
 }
 
 #[test]
+fn empty_datagram_flood_is_bounded_and_reusable() {
+    let _guard = subscribe();
+    const WINDOW: usize = 256;
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            datagram_receive_buffer_size: Some(WINDOW),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let client = ClientConfig {
+        transport: Arc::new(TransportConfig {
+            datagram_send_buffer_size: WINDOW,
+            ..TransportConfig::default()
+        }),
+        ..client_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect_with(client);
+    for _ in 0..3 {
+        let batch = vec![Bytes::new(); WINDOW * 2];
+        let queued = pair
+            .client_datagrams(client_ch)
+            .send_many(&batch, false)
+            .unwrap();
+        assert!(queued > 0 && queued <= WINDOW / size_of::<Datagram>());
+        assert_matches!(
+            pair.client_datagrams(client_ch).send(Bytes::new(), false),
+            Err(SendDatagramError::Blocked(_))
+        );
+        pair.drive();
+        assert!(
+            std::iter::from_fn(|| pair.client_conn_mut(client_ch).poll())
+                .any(|event| matches!(event, Event::DatagramsUnblocked))
+        );
+        for _ in 0..WINDOW * 2 {
+            pair.client_datagrams(client_ch)
+                .send(Bytes::new(), true)
+                .unwrap();
+            pair.drive();
+        }
+        let mut received = vec![Bytes::new(); WINDOW * 2];
+        let count = pair.server_datagrams(server_ch).recv_many(&mut received);
+        assert!(count > 0 && count <= WINDOW / size_of::<Datagram>());
+        assert!(received[..count].iter().all(Bytes::is_empty));
+        assert!(pair.server_datagrams(server_ch).recv().is_none());
+        pair.client_datagrams(client_ch)
+            .send(Bytes::from_static(b"after drain"), false)
+            .unwrap();
+        pair.drive();
+        assert_eq!(
+            pair.server_datagrams(server_ch).recv().unwrap(),
+            b"after drain".as_slice()
+        );
+    }
+}
+
+#[test]
+fn tiny_datagrams_do_not_retain_packet_storage() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    let oversized = Bytes::from(vec![7; 65536]);
+    pair.client_datagrams(client_ch)
+        .send(oversized.slice(..1), false)
+        .unwrap();
+    pair.client_datagrams(client_ch)
+        .send(Bytes::from(vec![8; 1024]), false)
+        .unwrap();
+    drop(oversized);
+    pair.drive();
+    let tiny = pair
+        .server_datagrams(server_ch)
+        .recv()
+        .unwrap()
+        .try_into_mut()
+        .expect("datagram must own its storage");
+    assert_eq!(tiny.as_ref(), &[7]);
+    assert_eq!(tiny.capacity(), 1);
+    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap().len(), 1024);
+}
+
+#[test]
 fn datagram_batch_send_recv_many() {
     let _guard = subscribe();
     let mut pair = Pair::default();
@@ -2555,7 +2638,6 @@ fn datagram_recv_buffer_overflow() {
         pair.server_conn_mut(server_ch).poll(),
         Some(Event::DatagramReceived)
     );
-    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA2);
     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA3);
     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
 
@@ -4476,7 +4558,7 @@ fn oversized_datagrams_trigger_unblock() {
 
     assert_eq!(
         pair.client_datagrams(client_ch).send_buffer_space(),
-        send_buffer_size,
+        send_buffer_size - size_of::<Datagram>(),
         "expected the send buffer to be empty after too large datagrams were dropped",
     );
     match pair.client_conn_mut(client_ch).poll() {

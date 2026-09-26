@@ -300,7 +300,7 @@ impl TransportConfig {
         self
     }
 
-    /// Maximum number of incoming application datagram bytes to buffer, or None to disable
+    /// Maximum incoming datagram payload and queue-entry bytes to buffer, or None to disable
     /// incoming datagrams
     ///
     /// The peer is forbidden to send single datagrams larger than this size. If the aggregate size
@@ -311,7 +311,7 @@ impl TransportConfig {
         self
     }
 
-    /// Maximum number of outgoing application datagram bytes to buffer
+    /// Maximum outgoing datagram payload and queue-entry bytes to buffer
     ///
     /// While datagrams are sent ASAP, it is possible for an application to generate data faster
     /// than the link, or even the underlying hardware, can transmit them. This limits the amount of
