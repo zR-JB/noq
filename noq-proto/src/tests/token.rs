@@ -18,6 +18,19 @@ use bytes::Bytes;
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
 #[test]
+fn retry_tag_matches_rfc9001_vector() {
+    use crate::{ConnectionId, crypto::ServerConfig as _};
+    use hex_literal::hex;
+    // RFC 9001 appendix A.4
+    let packet = hex!("ff000000010008f067a5502a4262b5746f6b656e");
+    let orig_dst_cid = ConnectionId::new(&hex!("8394c8f03e515708"));
+    assert_eq!(
+        super::util::server_crypto().retry_tag(1, orig_dst_cid, &packet),
+        hex!("04a265ba2eff4d829058fb3f0f2496ba")
+    );
+}
+
+#[test]
 fn stateless_retry() {
     let _guard = subscribe();
     let mut pair = Pair::default();

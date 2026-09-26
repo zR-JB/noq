@@ -1,7 +1,10 @@
 use std::{any::Any, io, str, sync::Arc};
 
-use aes_gcm::{KeyInit, aead::AeadMutInPlace};
+#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
+use aws_lc_rs::aead;
 use bytes::BytesMut;
+#[cfg(feature = "ring")]
+use ring::aead;
 pub use rustls::Error;
 use rustls::{
     self, CipherSuite,
@@ -187,11 +190,13 @@ impl crypto::Session for TlsSession {
         };
 
         // This implements https://www.rfc-editor.org/rfc/rfc9001#name-retry-packet-integrity
-        let key = aes_gcm::Key::<aes_gcm::Aes128Gcm>::from_slice(key);
-        let nonce = aes_gcm::Nonce::from_slice(nonce);
-        let tag = aes_gcm::Tag::from_slice(tag);
-        aes_gcm::Aes128Gcm::new(key)
-            .decrypt_in_place_detached(nonce, aad, &mut [], tag)
+        let mut tag = *tag;
+        retry_key(key)
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(*nonce),
+                aead::Aad::from(aad),
+                &mut tag,
+            )
             .is_ok()
     }
 
@@ -575,13 +580,25 @@ impl crypto::ServerConfig for QuicServerConfig {
         pseudo_packet.extend_from_slice(&orig_dst_cid);
         pseudo_packet.extend_from_slice(packet);
 
-        let nonce = aes_gcm::Nonce::from_slice(nonce);
-        let key = aes_gcm::Key::<aes_gcm::Aes128Gcm>::from_slice(key);
-        let tag = aes_gcm::Aes128Gcm::new(key)
-            .encrypt_in_place_detached(nonce, &pseudo_packet, &mut [])
+        let tag = retry_key(key)
+            .seal_in_place_separate_tag(
+                aead::Nonce::assume_unique_for_key(*nonce),
+                aead::Aad::from(pseudo_packet),
+                &mut [],
+            )
             .unwrap();
-        tag.into()
+        let mut out = [0; 16];
+        out.copy_from_slice(tag.as_ref());
+        out
     }
+}
+
+// Retry integrity (RFC 9001 section 5.8) uses the ring or aws-lc-rs crate that backs rustls.
+#[cfg(not(any(feature = "ring", feature = "aws-lc-rs")))]
+compile_error!("the rustls feature needs the ring or aws-lc-rs feature");
+
+fn retry_key(key: &[u8; 16]) -> aead::LessSafeKey {
+    aead::LessSafeKey::new(aead::UnboundKey::new(&aead::AES_128_GCM, key).unwrap())
 }
 
 pub(crate) fn initial_suite_from_provider(
