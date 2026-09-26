@@ -53,7 +53,9 @@ impl Assembler {
             for chunk in &self.data {
                 recvd.insert(chunk.offset..chunk.offset + chunk.bytes.len() as u64);
             }
-            self.state = State::Unordered { recvd };
+            let mut delivered = ArrayRangeSet::new();
+            delivered.insert(0..self.bytes_read);
+            self.state = State::Unordered { recvd, delivered };
         }
         Ok(())
     }
@@ -114,7 +116,7 @@ impl Assembler {
                 self.buffered -= max_length;
                 let bytes = chunk.bytes.split_to(max_length);
                 self.restore_front_order();
-                return Some(Chunk::new(offset, bytes));
+                return Some(self.deliver(Chunk::new(offset, bytes)));
             }
 
             self.bytes_read += chunk.bytes.len() as u64;
@@ -123,8 +125,15 @@ impl Assembler {
             let offset = chunk.offset;
             let bytes = mem::take(&mut chunk.bytes);
             self.data.pop_front();
-            return Some(Chunk::new(offset, bytes));
+            return Some(self.deliver(Chunk::new(offset, bytes)));
         }
+    }
+
+    fn deliver(&mut self, chunk: Chunk) -> Chunk {
+        if let State::Unordered { delivered, .. } = &mut self.state {
+            delivered.insert(chunk.offset..chunk.offset + chunk.bytes.len() as u64);
+        }
+        chunk
     }
 
     /// Restore ordering after `read` advanced the front's offset.
@@ -205,7 +214,7 @@ impl Assembler {
             bytes.len()
         );
         self.end = self.end.max(offset + bytes.len() as u64);
-        if let State::Unordered { ref mut recvd } = self.state {
+        if let State::Unordered { ref mut recvd, .. } = self.state {
             // Discard duplicate data
             let range = offset..offset + bytes.len() as u64;
             for duplicate in recvd.iter_range(range.clone()) {
@@ -270,6 +279,33 @@ impl Assembler {
     /// Number of bytes consumed by the application
     pub(super) fn bytes_read(&self) -> u64 {
         self.bytes_read
+    }
+
+    /// Contiguous bytes delivered from offset zero. Unordered reads can consume a
+    /// later chunk without making the reliable prefix complete.
+    pub(super) fn delivered_prefix(&self) -> u64 {
+        match &self.state {
+            State::Ordered => self.bytes_read,
+            State::Unordered { delivered, .. } => delivered
+                .iter()
+                .next()
+                .filter(|range| range.start == 0)
+                .map_or(0, |range| range.end),
+        }
+    }
+
+    /// Number of bytes already handed to the application within an offset range.
+    pub(super) fn delivered_within(&self, start: u64, end: u64) -> u64 {
+        if start >= end {
+            return 0;
+        }
+        match &self.state {
+            State::Ordered => self.bytes_read.min(end).saturating_sub(start),
+            State::Unordered { delivered, .. } => delivered
+                .iter_range(start..end)
+                .map(|range| range.end - range.start)
+                .sum(),
+        }
     }
 
     /// Discard all buffered data
@@ -379,6 +415,8 @@ enum State {
         /// The set of offsets that have been received from the peer, including portions not yet
         /// read by the application.
         recvd: ArrayRangeSet,
+        /// Data already handed to the application, tracked by stream offset.
+        delivered: ArrayRangeSet,
     },
 }
 

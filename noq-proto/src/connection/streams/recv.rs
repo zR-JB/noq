@@ -229,7 +229,7 @@ impl Recv {
                 size,
                 reliable_size,
                 ..
-            } => size - reliable_size.saturating_sub(bytes_read),
+            } => size - reliable_size + self.assembler.delivered_within(0, reliable_size),
             RecvState::Recv { .. } => bytes_read,
         };
         let owed = total.saturating_sub(bytes_read + self.unread_credit);
@@ -273,7 +273,7 @@ impl Recv {
         }
 
         // We cannot un-deliver data already read beyond the reliable size.
-        let deliver_cap = reliable_size.max(self.assembler.bytes_read());
+        let deliver_cap = reliable_size.max(self.assembler.delivered_prefix());
 
         match self.state {
             RecvState::ResetRecvd {
@@ -342,6 +342,14 @@ impl Recv {
     pub(super) fn reset_code(&self) -> Option<VarInt> {
         match self.state {
             RecvState::ResetRecvd { error_code, .. } => Some(error_code),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reliable_reset_deliver_cap(&self) -> Option<u64> {
+        match self.state {
+            RecvState::ResetRecvdAt { reliable_size, .. } => Some(reliable_size),
             _ => None,
         }
     }
@@ -468,7 +476,7 @@ impl<'a> Chunks<'a> {
                 error_code,
                 ..
             } => {
-                if rs.assembler.bytes_read() >= reliable_size {
+                if rs.assembler.delivered_prefix() >= reliable_size {
                     // All reliable data has been delivered; surface the reset and dispose of the
                     // stream. Any data buffered beyond the reliable size is dropped undelivered.
                     let state = mem::replace(&mut self.state, ChunksState::Reset(error_code));
