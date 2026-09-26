@@ -331,7 +331,9 @@ impl StreamsState {
         // beyond the reliable size already had its connection credit released (and `end` was
         // advanced to the final size) when the RESET_STREAM_AT was processed, so capture the
         // still-deliverable region now to avoid re-issuing that credit below.
-        let prior_deliver_cap = rs.reliable_reset_deliver_cap();
+        let prior_deliver = rs
+            .reliable_reset_deliver_cap()
+            .map(|cap| (cap, rs.assembler.delivered_within(0, cap)));
 
         // State transition
         if !rs.reset(
@@ -357,10 +359,17 @@ impl StreamsState {
         }
 
         // Update connection-level flow control
-        Ok(if let Some(deliver_cap) = prior_deliver_cap {
+        Ok(if stopped {
+            // stop() already returned credit through `end`; data received after
+            // stopping was credited on arrival. Only the unseen final tail is new.
+            self.data_recvd = self
+                .data_recvd
+                .saturating_add(u64::from(final_offset) - end);
+            self.add_read_credits(u64::from(final_offset) - end)
+        } else if let Some((deliver_cap, delivered)) = prior_deliver {
             // Downgrade from a reliable reset: release only the still-deliverable region; the rest
             // of the final size was already accounted when the RESET_STREAM_AT arrived.
-            self.add_read_credits(deliver_cap.saturating_sub(bytes_read))
+            self.add_read_credits(deliver_cap - delivered)
         } else if bytes_read != final_offset.into_inner() {
             // bytes_read is always <= end, so this won't underflow.
             self.data_recvd = self
@@ -415,18 +424,13 @@ impl StreamsState {
                 // Redundant reset
                 return Ok(ShouldTransmit(false));
             }
-            let bytes_read = rs.assembler.bytes_read();
             let end = rs.end;
             let rs = self.recv.remove(&id).flatten().unwrap();
             self.stream_recv_freed(id, rs);
-            return Ok(if bytes_read != final_offset.into_inner() {
-                self.data_recvd = self
-                    .data_recvd
-                    .saturating_add(u64::from(final_offset) - end);
-                self.add_read_credits(u64::from(final_offset) - bytes_read)
-            } else {
-                ShouldTransmit(false)
-            });
+            self.data_recvd = self
+                .data_recvd
+                .saturating_add(u64::from(final_offset) - end);
+            return Ok(self.add_read_credits(u64::from(final_offset) - end));
         }
 
         let outcome = rs.reset_at(
@@ -2563,6 +2567,7 @@ mod tests {
     fn reliable_reset_on_stopped_stream_is_a_plain_reset() {
         let mut client = make(Side::Client);
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let initial_max = client.local_max_data;
 
         let _ = client
             .received(
@@ -2586,6 +2591,7 @@ mod tests {
             };
             recv.stop(0u32.into()).unwrap();
         }
+        assert_eq!(client.local_max_data - initial_max, 50);
 
         // A reliable reset on a stopped stream is handled exactly like an ordinary RESET_STREAM:
         // the final size is accounted for connection flow control and the stream is freed
@@ -2602,10 +2608,47 @@ mod tests {
             client.data_recvd, 80,
             "final size accounted for flow control"
         );
+        assert_eq!(client.local_max_data - initial_max, 80);
         assert!(
             !client.recv.contains_key(&id),
             "stopped stream is freed on reset"
         );
+    }
+
+    #[test]
+    fn plain_reset_on_stopped_stream_releases_only_unseen_tail() {
+        let mut client = make(Side::Client);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let initial_max = client.local_max_data;
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 50]),
+                },
+                50,
+            )
+            .unwrap();
+        let mut pending = Retransmits::default();
+        RecvStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+        }
+        .stop(0u32.into())
+        .unwrap();
+        assert_eq!(client.local_max_data - initial_max, 50);
+        let _ = client
+            .received_reset(frame::ResetStream {
+                id,
+                error_code: 7u32.into(),
+                final_offset: 80u32.into(),
+            })
+            .unwrap();
+        assert_eq!(client.local_max_data - initial_max, 80);
+        assert_eq!(client.data_recvd, 80);
     }
 
     #[test]
@@ -2651,6 +2694,120 @@ mod tests {
             client.local_max_data - initial_max,
             100,
             "total credit must not exceed the final size"
+        );
+    }
+
+    #[test]
+    fn reliable_reset_ordered_stop_after_read_beyond_reliable_size() {
+        let mut client = make(Side::Client);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let initial_max = client.local_max_data;
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 100]),
+                },
+                100,
+            )
+            .unwrap();
+        let mut pending = Retransmits::default();
+        {
+            let mut recv = RecvStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+            };
+            let mut chunks = recv.read(true).unwrap();
+            assert_eq!(chunks.next(80).unwrap().unwrap().bytes.len(), 80);
+            let _ = chunks.finalize();
+        }
+        assert_eq!(client.local_max_data - initial_max, 80);
+        let _ = client
+            .received_reset_at(frame::ResetStreamAt {
+                id,
+                error_code: 7u32.into(),
+                final_offset: 100u32.into(),
+                reliable_size: 40u32.into(),
+            })
+            .unwrap();
+        assert_eq!(client.local_max_data - initial_max, 100);
+        assert_eq!(
+            client
+                .recv
+                .get(&id)
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_open_recv()
+                .unwrap()
+                .reliable_reset_deliver_cap(),
+            Some(80)
+        );
+        RecvStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+        }
+        .stop(0u32.into())
+        .unwrap();
+        assert_eq!(
+            client.local_max_data - initial_max,
+            100,
+            "already-read prefix must not grant extra credit on stop"
+        );
+    }
+
+    #[test]
+    fn reliable_reset_ordered_stop_does_not_over_issue_credit() {
+        let mut client = make(Side::Client);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let initial_max = client.local_max_data;
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 100]),
+                },
+                100,
+            )
+            .unwrap();
+        let _ = client
+            .received_reset_at(frame::ResetStreamAt {
+                id,
+                error_code: 7u32.into(),
+                final_offset: 100u32.into(),
+                reliable_size: 40u32.into(),
+            })
+            .unwrap();
+        assert_eq!(client.local_max_data - initial_max, 60);
+        let mut pending = Retransmits::default();
+        {
+            let mut recv = RecvStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+            };
+            let mut chunks = recv.read(true).unwrap();
+            assert_eq!(chunks.next(10).unwrap().unwrap().bytes.len(), 10);
+            let _ = chunks.finalize();
+        }
+        assert_eq!(client.local_max_data - initial_max, 70);
+        RecvStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+        }
+        .stop(0u32.into())
+        .unwrap();
+        assert_eq!(
+            client.local_max_data - initial_max,
+            100,
+            "stop must release only the remaining reliable prefix"
         );
     }
 
@@ -2730,6 +2887,80 @@ mod tests {
             "delivers the reliable prefix, not the buffered tail"
         );
         assert_eq!(code, VarInt::from_u32(9));
+    }
+
+    #[test]
+    fn reliable_reset_after_unordered_tail_read_waits_for_prefix_without_extra_credit() {
+        let mut client = make(Side::Client);
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let initial_max = client.local_max_data;
+        let mut pending = Retransmits::default();
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 60,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 20]),
+                },
+                20,
+            )
+            .unwrap();
+        {
+            let mut recv = RecvStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+            };
+            let mut chunks = recv.read(false).unwrap();
+            assert_eq!(chunks.next(100).unwrap().unwrap().offset, 60);
+            let _ = chunks.finalize();
+        }
+        assert_eq!(client.local_max_data - initial_max, 20);
+        let _ = client
+            .received_reset_at(frame::ResetStreamAt {
+                id,
+                error_code: 9u32.into(),
+                final_offset: 100u32.into(),
+                reliable_size: 40u32.into(),
+            })
+            .unwrap();
+        // The consumed tail [60, 80) has already returned credit. The reset
+        // returns only the other 40 bytes beyond the reliable prefix.
+        assert_eq!(client.local_max_data - initial_max, 60);
+        {
+            let mut recv = RecvStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+            };
+            let mut chunks = recv.read(false).unwrap();
+            assert_eq!(chunks.next(100), Err(ReadError::Blocked));
+            let _ = chunks.finalize();
+        }
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 40]),
+                },
+                40,
+            )
+            .unwrap();
+        {
+            let mut recv = RecvStream {
+                id,
+                state: &mut client,
+                pending: &mut pending,
+            };
+            let mut chunks = recv.read(false).unwrap();
+            assert_eq!(chunks.next(100).unwrap().unwrap().offset, 0);
+            assert_eq!(chunks.next(100), Err(ReadError::Reset(9u32.into())));
+            let _ = chunks.finalize();
+        }
+        assert_eq!(client.local_max_data - initial_max, 100);
     }
 
     /// Opens a server-initiated uni send stream with the peer advertising `reset_stream_at`.
