@@ -45,6 +45,11 @@ pub struct Connecting {
 }
 
 impl Connecting {
+    /// Track handshake, stream ownership, and draining; returns `None` after completion.
+    pub fn weak_handle(&self) -> Option<WeakConnectionHandle> {
+        self.conn.as_ref().map(ConnectionRef::weak_handle)
+    }
+
     pub(crate) fn new(
         handle: ConnectionHandle,
         conn: proto::Connection,
@@ -900,6 +905,14 @@ impl Connection {
     pub fn set_max_concurrent_uni_streams(&self, count: VarInt) {
         let mut conn = self.0.lock_and_wake("set_max_concurrent_uni_streams");
         conn.inner.set_max_concurrent_streams(Dir::Uni, count);
+    }
+
+    /// Bytes of stream payload retained until acknowledged or discarded.
+    pub fn send_buffered_bytes(&self) -> u64 {
+        self.0
+            .lock_without_waking("send_buffered_bytes")
+            .inner
+            .send_buffered_bytes()
     }
 
     /// See [`proto::TransportConfig::send_window()`]

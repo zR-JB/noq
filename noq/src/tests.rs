@@ -1265,6 +1265,52 @@ async fn on_closed_endpoint_drop() {
         .expect("client task panicked");
 }
 
+#[tokio::test(start_paused = true)]
+async fn connecting_weak_handle_survives_cancellation() {
+    let endpoint = endpoint();
+    let stalled = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let connecting = endpoint
+        .connect(stalled.local_addr().unwrap(), "localhost")
+        .unwrap();
+    let weak = connecting.weak_handle().unwrap();
+    assert!(weak.is_alive());
+    drop(connecting);
+    assert!(weak.is_alive());
+    tokio::time::timeout(Duration::from_secs(30), endpoint.wait_idle())
+        .await
+        .unwrap();
+    assert!(!weak.is_alive());
+}
+
+#[tokio::test]
+async fn send_buffered_bytes_survive_window_shrink_and_stream_ownership() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let endpoint = endpoint();
+        let mut connecting = endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let weak = connecting.weak_handle().unwrap();
+        let server = async { endpoint.accept().await.unwrap().await.unwrap() };
+        let (client, server) = tokio::join!(&mut connecting, server);
+        assert!(connecting.weak_handle().is_none());
+        let client = client.unwrap();
+        let mut stream = client.open_uni().await.unwrap();
+        stream.write_all(&[42; 4096]).await.unwrap();
+        assert_eq!(client.send_buffered_bytes(), 4096);
+        client.set_send_window(1);
+        assert_eq!(client.send_buffered_bytes(), 4096);
+        client.close(0u32.into(), b"done");
+        drop(client);
+        drop(server);
+        endpoint.wait_idle().await;
+        assert!(weak.is_alive());
+        drop(stream);
+        assert!(!weak.is_alive());
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn weak_connection_handle() {
     let _guard = subscribe();
@@ -1277,12 +1323,9 @@ async fn weak_connection_handle() {
             .expect("endpoint")
             .await
             .expect("connection");
-        // create a weak handle to the connection
-        // ensure the underlying connection is not immediately dropped
         let weak = conn.weak_handle();
         assert!(weak.is_alive());
         drop(conn);
-        // wait to ensure the connection is fully cleaned up
         endpoint2.wait_idle().await;
         assert!(!weak.is_alive());
     });

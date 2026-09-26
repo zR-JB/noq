@@ -2882,6 +2882,11 @@ impl Connection {
         self.streams.max_concurrent(dir)
     }
 
+    /// Bytes of stream payload retained until acknowledged or discarded.
+    pub fn send_buffered_bytes(&self) -> u64 {
+        self.streams.unacked_data
+    }
+
     /// See [`TransportConfig::send_window()`]
     pub fn set_send_window(&mut self, send_window: u64) {
         self.streams.set_send_window(send_window);
