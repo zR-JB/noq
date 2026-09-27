@@ -917,6 +917,14 @@ impl Connection {
             .send_buffered_bytes()
     }
 
+    /// Retained send backing and heap metadata, including acknowledged data behind gaps.
+    pub fn send_allocated_bytes(&self) -> u64 {
+        self.0
+            .lock_without_waking("send_allocated_bytes")
+            .inner
+            .send_allocated_bytes()
+    }
+
     /// See [`proto::TransportConfig::send_window()`]
     pub fn set_send_window(&self, send_window: u64) {
         let mut conn = self.0.lock_and_wake("set_send_window");

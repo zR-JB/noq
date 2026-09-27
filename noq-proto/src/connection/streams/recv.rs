@@ -6,8 +6,11 @@ use tracing::debug;
 
 use super::state::get_or_insert_recv;
 use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
-use crate::connection::assembler::{Assembler, Chunk, OrderingError, ReassemblyBudget};
 use crate::connection::streams::state::StreamRecv;
+use crate::connection::{
+    assembler::{Assembler, Chunk, OrderingError},
+    buffer_budget::BufferBudget,
+};
 use crate::{TransportError, VarInt, frame};
 
 #[derive(Debug)]
@@ -21,7 +24,7 @@ pub(super) struct Recv {
 }
 
 impl Recv {
-    pub(super) fn new(initial_max_data: u64, reassembly: Arc<ReassemblyBudget>) -> Box<Self> {
+    pub(super) fn new(initial_max_data: u64, reassembly: Arc<BufferBudget>) -> Box<Self> {
         Box::new(Self {
             state: RecvState::default(),
             assembler: Assembler::new(reassembly),
@@ -652,7 +655,7 @@ mod tests {
         const INITIAL_BYTES: u64 = 3;
         const INITIAL_OFFSET: u64 = 3;
         const RECV_WINDOW: u64 = 8;
-        let mut s = Recv::new(RECV_WINDOW, ReassemblyBudget::new(1024));
+        let mut s = Recv::new(RECV_WINDOW, BufferBudget::for_receive(1024));
         let mut data_recvd = 0;
         // Receive bytes 3..6
         let (new_bytes, is_closed) = s
@@ -767,7 +770,7 @@ mod tests {
 
     #[test]
     fn reset_at_establishes_reliable_reset() {
-        let mut r = Recv::new(WINDOW, ReassemblyBudget::new(WINDOW));
+        let mut r = Recv::new(WINDOW, BufferBudget::for_receive(WINDOW));
         assert_eq!(ingest_at(&mut r, 0, 30, 0), 30);
 
         // Final size 100, deliver up to 40.
@@ -792,7 +795,7 @@ mod tests {
 
     #[test]
     fn reset_at_does_not_double_count_retransmits() {
-        let mut r = Recv::new(WINDOW, ReassemblyBudget::new(WINDOW));
+        let mut r = Recv::new(WINDOW, BufferBudget::for_receive(WINDOW));
         assert_eq!(ingest_at(&mut r, 0, 20, 0), 20);
         r.reset_at(0u32.into(), 100u32.into(), 40u32.into(), 20, WINDOW)
             .unwrap();
@@ -804,7 +807,7 @@ mod tests {
 
     #[test]
     fn reset_at_ignores_reliable_size_increase() {
-        let mut r = Recv::new(WINDOW, ReassemblyBudget::new(WINDOW));
+        let mut r = Recv::new(WINDOW, BufferBudget::for_receive(WINDOW));
         r.reset_at(0u32.into(), 100u32.into(), 40u32.into(), 0, WINDOW)
             .unwrap();
         // A later (reordered) frame raising the reliable size must be ignored.
@@ -816,7 +819,7 @@ mod tests {
 
     #[test]
     fn reset_at_reduces_reliable_size() {
-        let mut r = Recv::new(WINDOW, ReassemblyBudget::new(WINDOW));
+        let mut r = Recv::new(WINDOW, BufferBudget::for_receive(WINDOW));
         r.reset_at(0u32.into(), 100u32.into(), 40u32.into(), 0, WINDOW)
             .unwrap();
         // Reducing 40 -> 25 releases the 15 bytes that will no longer be delivered.
@@ -834,7 +837,7 @@ mod tests {
 
     #[test]
     fn reset_at_final_size_must_be_consistent() {
-        let mut r = Recv::new(WINDOW, ReassemblyBudget::new(WINDOW));
+        let mut r = Recv::new(WINDOW, BufferBudget::for_receive(WINDOW));
         r.reset_at(0u32.into(), 100u32.into(), 40u32.into(), 0, WINDOW)
             .unwrap();
         let err = r
@@ -845,7 +848,7 @@ mod tests {
 
     #[test]
     fn reset_at_final_size_below_high_water_is_error() {
-        let mut r = Recv::new(WINDOW, ReassemblyBudget::new(WINDOW));
+        let mut r = Recv::new(WINDOW, BufferBudget::for_receive(WINDOW));
         assert_eq!(ingest_at(&mut r, 0, 50, 0), 50);
         // A final size below the data already received is illegal.
         let err = r
@@ -856,7 +859,7 @@ mod tests {
 
     #[test]
     fn reset_at_respects_connection_flow_control() {
-        let mut r = Recv::new(WINDOW, ReassemblyBudget::new(WINDOW));
+        let mut r = Recv::new(WINDOW, BufferBudget::for_receive(WINDOW));
         // Final size 50 would push consumption (20 already + 50) past the 40-byte budget.
         let err = r
             .reset_at(0u32.into(), 50u32.into(), 30u32.into(), 20, 40)
@@ -866,7 +869,7 @@ mod tests {
 
     #[test]
     fn reset_at_error_code_is_immutable() {
-        let mut r = Recv::new(WINDOW, ReassemblyBudget::new(WINDOW));
+        let mut r = Recv::new(WINDOW, BufferBudget::for_receive(WINDOW));
         r.reset_at(7u32.into(), 100u32.into(), 40u32.into(), 0, WINDOW)
             .unwrap();
         // A later frame for the same stream that changes the error code is a STREAM_STATE_ERROR

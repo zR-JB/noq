@@ -1,11 +1,17 @@
-use std::{collections::VecDeque, ops::Range};
+use super::buffer_budget::COPY_BLOCK_BYTES;
+use std::{collections::VecDeque, mem, ops::Range, sync::Arc};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use super::buffer_budget::{
+    Allocation, AllocationError, BufferBudget, ChargedRanges, OwnedBacking,
+};
+#[cfg(test)]
+use bytes::BytesMut;
+use bytes::{Buf, BufMut, Bytes};
 
-use crate::{VarInt, connection::streams::BytesOrSlice, range_set::ArrayRangeSet};
+use crate::{VarInt, connection::streams::BytesOrSlice};
 
 /// Buffer of outgoing retransmittable stream data
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(super) struct SendBuffer {
     /// Data queued by the application that has to be retained for resends.
     ///
@@ -24,25 +30,24 @@ pub(super) struct SendBuffer {
     ///
     /// All ranges must be within `data.range().start..(data.range().end - unsent)`, since data
     /// that has never been sent can't be acknowledged.
-    // TODO: Recover storage from these by compacting (#700)
-    acks: ArrayRangeSet,
+    acks: ChargedRanges,
     /// Previously transmitted ranges deemed lost and marked for retransmission
     ///
     /// All ranges must be within `data.range().start..(data.range().end - unsent)`, since data
     /// that has never been sent can't be retransmitted.
     ///
     /// This should usually not overlap with `acks`, but this is not strictly enforced.
-    retransmits: ArrayRangeSet,
+    retransmits: ChargedRanges,
 }
 
 /// Maximum number of bytes to combine into a single segment
 ///
-/// Any segment larger than this will be stored as-is, possibly triggering a flush of the buffer.
+/// Larger segments use independently owned backing.
 const MAX_COMBINE: usize = 1452;
 
 /// This is where the data of the send buffer lives. It supports appending at the end,
 /// removing from the front, and retrieving data by range.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct SendBufferData {
     /// Start offset of the buffered data
     offset: u64,
@@ -51,7 +56,9 @@ struct SendBufferData {
     /// Buffered data segments
     segments: VecDeque<Bytes>,
     /// Last segment, possibly empty
-    last_segment: BytesMut,
+    last_segment: Option<OwnedBacking>,
+    last_start: usize,
+    allocation: Allocation,
 }
 
 impl SendBufferData {
@@ -66,31 +73,123 @@ impl SendBufferData {
         self.offset..self.offset + self.len as u64
     }
 
-    /// Append data to the end of the buffer
-    fn append<'a>(&'a mut self, data: impl BytesOrSlice<'a>) {
-        self.len += data.len();
-        if data.len() > MAX_COMBINE {
-            // use in place
-            if !self.last_segment.is_empty() {
-                self.segments.push_back(self.last_segment.split().freeze());
+    fn new(budget: Arc<BufferBudget>) -> Self {
+        Self {
+            offset: 0,
+            len: 0,
+            segments: VecDeque::new(),
+            last_segment: None,
+            last_start: 0,
+            allocation: Allocation { budget, bytes: 0 },
+        }
+    }
+
+    fn available_write(&self) -> usize {
+        if let Some(last) = &self.last_segment {
+            let available = last.bytes.capacity() - last.bytes.len();
+            if available != 0 {
+                return available;
             }
-            self.segments.push_back(data.into_bytes());
+        }
+        let count = self.segments.len() + 2;
+        let metadata = if count > self.segments.capacity() {
+            count
+                .max(self.segments.capacity().saturating_mul(2))
+                .max(4)
+                .saturating_mul(mem::size_of::<Bytes>())
         } else {
-            // copy
-            let rest = if self.last_segment.len() + data.len() > MAX_COMBINE
-                && !self.last_segment.is_empty()
-            {
-                // fill up last_segment up to MAX_COMBINE and flush
-                let capacity = MAX_COMBINE.saturating_sub(self.last_segment.len());
-                let (curr, rest) = data.as_ref().split_at(capacity);
-                self.last_segment.put_slice(curr);
-                self.segments.push_back(self.last_segment.split().freeze());
-                rest
-            } else {
-                data.as_ref()
-            };
-            // copy the rest into the now empty last_segment
-            self.last_segment.extend_from_slice(rest);
+            0
+        };
+        self.allocation
+            .budget
+            .available()
+            .saturating_sub(metadata)
+            .saturating_sub(OwnedBacking::OVERHEAD_BYTES)
+            .min(COPY_BLOCK_BYTES)
+    }
+
+    fn prepare_write(&mut self, limit: usize) -> Result<(usize, Allocation), AllocationError> {
+        if limit == 0 || self.available_write() == 0 {
+            return Err(AllocationError);
+        }
+        if let Some(last) = &self.last_segment {
+            let available = last.bytes.capacity() - last.bytes.len();
+            if available != 0 {
+                return Ok((
+                    limit.min(available),
+                    Allocation {
+                        budget: self.allocation.budget.clone(),
+                        bytes: 0,
+                    },
+                ));
+            }
+        }
+        let count = self.segments.len() + 2;
+        if count > self.segments.capacity() {
+            let capacity = count.max(self.segments.capacity().saturating_mul(2)).max(4);
+            let mut allocation = self.allocation.budget.acquire(
+                capacity
+                    .checked_mul(mem::size_of::<Bytes>())
+                    .ok_or(AllocationError)?,
+            )?;
+            let mut segments = VecDeque::new();
+            segments
+                .try_reserve_exact(capacity)
+                .map_err(|_| AllocationError)?;
+            allocation.resize(segments.capacity() * mem::size_of::<Bytes>())?;
+            segments.extend(mem::take(&mut self.segments));
+            self.segments = segments;
+            self.allocation = allocation;
+        }
+        if let Some(last) = self.last_segment.take() {
+            let mut bytes = last.finish();
+            bytes.advance(mem::take(&mut self.last_start));
+            self.segments.push_back(bytes);
+        }
+        let length = limit.min(COPY_BLOCK_BYTES).min(
+            self.allocation
+                .budget
+                .available()
+                .saturating_sub(OwnedBacking::OVERHEAD_BYTES),
+        );
+        if length == 0 {
+            return Err(AllocationError);
+        }
+        let allocation = self
+            .allocation
+            .budget
+            .acquire(length + OwnedBacking::OVERHEAD_BYTES)?;
+        Ok((length, allocation))
+    }
+
+    fn append<'a>(&'a mut self, data: impl BytesOrSlice<'a>, allocation: Allocation) {
+        if data.is_empty() {
+            return;
+        }
+        self.len += data.len();
+        if let Some(last) = &mut self.last_segment {
+            last.bytes.extend_from_slice(data.as_ref());
+            return;
+        }
+        let capacity = if data.len() <= MAX_COMBINE {
+            MAX_COMBINE.min(allocation.bytes - OwnedBacking::OVERHEAD_BYTES)
+        } else {
+            data.len()
+        };
+        let backing = OwnedBacking::from_reserved(data.as_ref(), capacity, allocation);
+        if data.len() <= MAX_COMBINE {
+            self.last_segment = Some(backing);
+        } else {
+            self.segments.push_back(backing.finish());
+        }
+    }
+
+    fn release_empty_segments(&mut self) {
+        if self.segments.is_empty() {
+            self.segments = VecDeque::new();
+            self.allocation
+                .resize(0)
+                .expect("releasing send segment allocation");
         }
     }
 
@@ -122,7 +221,13 @@ impl SendBufferData {
         }
         // Any remainder lives in `last_segment`. If the segments already cover `new_len`, the
         // whole `last_segment` is beyond the cut and is dropped.
-        self.last_segment.truncate(new_len.saturating_sub(kept));
+        let remaining = new_len.saturating_sub(kept);
+        if remaining == 0 {
+            self.last_segment = None;
+            self.last_start = 0;
+        } else if let Some(last) = &mut self.last_segment {
+            last.bytes.truncate(self.last_start + remaining);
+        }
 
         self.len = new_len;
 
@@ -130,9 +235,7 @@ impl SendBufferData {
         self.segments.retain(|s| !s.is_empty());
 
         // shrink segments if we have a lot of unused capacity
-        if self.segments.len() * 4 < self.segments.capacity() {
-            self.segments.shrink_to_fit();
-        }
+        self.release_empty_segments();
     }
 
     /// Discard data from the front of the buffer
@@ -158,21 +261,26 @@ impl SendBufferData {
             }
         }
         // the rest has to be in the last segment
-        self.last_segment.advance(n);
-        // shrink segments if we have a lot of unused capacity
-        if self.segments.len() * 4 < self.segments.capacity() {
-            self.segments.shrink_to_fit();
+        if let Some(last) = &self.last_segment {
+            self.last_start += n;
+            if self.last_start == last.bytes.len() {
+                self.last_segment = None;
+                self.last_start = 0;
+            }
         }
+        // shrink segments if we have a lot of unused capacity
+        self.release_empty_segments();
     }
 
     /// Iterator over all segments in order
     ///
     /// Concatenates `segments` and `last_segment` so they can be handled uniformly
     fn segments_iter(&self) -> impl Iterator<Item = &[u8]> {
-        self.segments
-            .iter()
-            .map(|x| x.as_ref())
-            .chain(std::iter::once(self.last_segment.as_ref()))
+        self.segments.iter().map(|x| x.as_ref()).chain(
+            self.last_segment
+                .iter()
+                .map(|last| &last.bytes[self.last_start..]),
+        )
     }
 
     /// Returns data which is associated with a range
@@ -242,26 +350,61 @@ impl SendBufferData {
 
 impl SendBuffer {
     /// Construct an empty buffer at the initial offset
-    pub(super) fn new() -> Self {
-        Self::default()
+    pub(super) fn new(budget: Arc<BufferBudget>) -> Self {
+        Self {
+            data: SendBufferData::new(budget.clone()),
+            unsent: 0,
+            acks: ChargedRanges::new(&budget),
+            retransmits: ChargedRanges::new(&budget),
+        }
+    }
+
+    pub(super) fn can_write(&self) -> bool {
+        self.data.available_write() != 0
+    }
+
+    pub(super) fn prepare_write(
+        &mut self,
+        limit: usize,
+    ) -> Result<(usize, Allocation), AllocationError> {
+        self.data.prepare_write(limit)
     }
 
     /// Append application data to the end of the stream
-    pub(super) fn write<'a>(&'a mut self, data: impl BytesOrSlice<'a>) {
-        self.data.append(data);
+    pub(super) fn write_reserved<'a>(
+        &'a mut self,
+        data: impl BytesOrSlice<'a>,
+        allocation: Allocation,
+    ) {
+        self.data.append(data, allocation);
+    }
+
+    #[cfg(any(test, feature = "bench"))]
+    fn write<'a>(&'a mut self, data: impl BytesOrSlice<'a>) {
+        let mut bytes = data.as_ref();
+        while !bytes.is_empty() {
+            let (length, allocation) = self.prepare_write(bytes.len()).unwrap();
+            self.write_reserved(&bytes[..length], allocation);
+            bytes = &bytes[length..];
+        }
     }
 
     /// Discard a range of acknowledged stream data
-    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+    pub(super) fn ack(&mut self, mut range: Range<u64>) -> Result<(), AllocationError> {
         // Clamp the range to data which is still tracked
         let base_offset = self.fully_acked_offset();
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
-        self.acks.insert(range);
+        if range.start == base_offset {
+            self.data.pop_front((range.end - base_offset) as usize);
+            self.acks.ranges.remove(0..self.fully_acked_offset());
+        } else {
+            self.acks.try_insert(range)?;
+        }
 
-        while self.acks.min() == Some(self.fully_acked_offset()) {
-            let prefix = self.acks.pop_min().unwrap();
+        while self.acks.ranges.min() == Some(self.fully_acked_offset()) {
+            let prefix = self.acks.ranges.pop_min().unwrap();
             let to_advance = (prefix.end - prefix.start) as usize;
             self.data.pop_front(to_advance);
         }
@@ -270,7 +413,18 @@ impl SendBuffer {
         //
         // We have to do this since we have just dropped the data, and asking
         // for non-present data would be an error.
-        self.retransmits.remove(0..self.fully_acked_offset());
+        self.retransmits.ranges.remove(0..self.fully_acked_offset());
+        self.release_empty_storage();
+        Ok(())
+    }
+
+    pub(super) fn release_empty_storage(&mut self) {
+        if self.data.len == 0 {
+            let budget = self.data.allocation.budget.clone();
+            self.data.release_empty_segments();
+            self.acks = ChargedRanges::new(&budget);
+            self.retransmits = ChargedRanges::new(&budget);
+        }
     }
 
     /// Discard buffered data at or beyond `offset`, abandoning it.
@@ -287,8 +441,9 @@ impl SendBuffer {
 
         // We no longer have the discarded data, so we must not try to send or track it.
         self.unsent = self.unsent.min(new_end);
-        self.retransmits.remove(new_end..old_end);
-        self.acks.remove(new_end..old_end);
+        self.retransmits.ranges.remove(new_end..old_end);
+        self.acks.ranges.remove(new_end..old_end);
+        self.release_empty_storage();
     }
 
     /// Compute the next range to transmit on this stream and update state to account for that
@@ -308,7 +463,7 @@ impl SendBuffer {
         debug_assert!(max_len >= 8 + 8);
         let mut encode_length = false;
 
-        if let Some(range) = self.retransmits.pop_min() {
+        if let Some(range) = self.retransmits.ranges.pop_min() {
             // Retransmit sent data
 
             // When the offset is known, we know how many bytes are required to encode it.
@@ -323,7 +478,7 @@ impl SendBuffer {
 
             let end = range.end.min((max_len as u64).saturating_add(range.start));
             if end != range.end {
-                self.retransmits.insert(end..range.end);
+                self.retransmits.ranges.insert(end..range.end);
             }
             return (range.start..end, encode_length);
         }
@@ -364,7 +519,7 @@ impl SendBuffer {
     }
 
     /// Queue a range of sent but unacknowledged data to be retransmitted
-    pub(super) fn retransmit(&mut self, mut range: Range<u64>) {
+    pub(super) fn retransmit(&mut self, mut range: Range<u64>) -> Result<(), AllocationError> {
         debug_assert!(range.end <= self.unsent, "unsent data can't be lost");
         // don't allow retransmitting data that has already been fully acknowledged,
         // since we don't have it anymore.
@@ -373,7 +528,7 @@ impl SendBuffer {
         // for simplicity. Not doing so would require clipping the range against
         // all acknowledged ranges.
         range.start = range.start.max(self.fully_acked_offset());
-        self.retransmits.insert(range);
+        self.retransmits.try_insert(range)
     }
 
     pub(super) fn retransmit_all_for_0rtt(&mut self) {
@@ -402,12 +557,18 @@ impl SendBuffer {
     ///
     /// There may be sent unacknowledged data even when this is false.
     pub(super) fn has_unsent_data(&self) -> bool {
-        self.unsent != self.offset() || !self.retransmits.is_empty()
+        self.unsent != self.offset() || !self.retransmits.ranges.is_empty()
     }
 
     /// Compute the amount of data that hasn't been acknowledged
     pub(super) fn unacked(&self) -> u64 {
-        self.data.len() as u64 - self.acks.iter().map(|x| x.end - x.start).sum::<u64>()
+        self.data.len() as u64
+            - self
+                .acks
+                .ranges
+                .iter()
+                .map(|x| x.end - x.start)
+                .sum::<u64>()
     }
 }
 
@@ -417,7 +578,7 @@ mod tests {
 
     #[test]
     fn fragment_with_length() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
         const MSG: &[u8] = b"Hello, world!";
         buf.write(MSG);
         // 0 byte offset => 19 bytes left => 13 byte data isn't enough
@@ -435,7 +596,7 @@ mod tests {
 
     #[test]
     fn fragment_without_length() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
         const MSG: &[u8] = b"Hello, world with some extra data!";
         buf.write(MSG);
         // 0 byte offset => 19 bytes left => can be filled by 34 bytes payload
@@ -452,7 +613,7 @@ mod tests {
 
     #[test]
     fn reserves_encoded_offset() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
 
         // Pretend we have more than 1 GB of data in the buffer
         let chunk: Bytes = Bytes::from_static(&[0; 1024 * 1024]);
@@ -466,7 +627,7 @@ mod tests {
 
         // Offset 0 requires no space
         assert_eq!(buf.poll_transmit(16), (0..16, false));
-        buf.retransmit(0..16);
+        buf.retransmit(0..16).unwrap();
         assert_eq!(buf.poll_transmit(16), (0..16, false));
         let mut transmitted = 16u64;
 
@@ -475,7 +636,7 @@ mod tests {
             buf.poll_transmit((SIZE1 - transmitted + 1) as usize),
             (transmitted..SIZE1, false)
         );
-        buf.retransmit(transmitted..SIZE1);
+        buf.retransmit(transmitted..SIZE1).unwrap();
         assert_eq!(
             buf.poll_transmit((SIZE1 - transmitted + 1) as usize),
             (transmitted..SIZE1, false)
@@ -487,7 +648,7 @@ mod tests {
             buf.poll_transmit((SIZE2 - transmitted + 2) as usize),
             (transmitted..SIZE2, false)
         );
-        buf.retransmit(transmitted..SIZE2);
+        buf.retransmit(transmitted..SIZE2).unwrap();
         assert_eq!(
             buf.poll_transmit((SIZE2 - transmitted + 2) as usize),
             (transmitted..SIZE2, false)
@@ -499,7 +660,7 @@ mod tests {
             buf.poll_transmit((SIZE3 - transmitted + 4) as usize),
             (transmitted..SIZE3, false)
         );
-        buf.retransmit(transmitted..SIZE3);
+        buf.retransmit(transmitted..SIZE3).unwrap();
         assert_eq!(
             buf.poll_transmit((SIZE3 - transmitted + 4) as usize),
             (transmitted..SIZE3, false)
@@ -511,14 +672,35 @@ mod tests {
             buf.poll_transmit(chunk.len() + 8),
             (transmitted..transmitted + chunk.len() as u64, false)
         );
-        buf.retransmit(transmitted..transmitted + chunk.len() as u64);
+        buf.retransmit(transmitted..transmitted + chunk.len() as u64)
+            .unwrap();
         assert_eq!(
             buf.poll_transmit(chunk.len() + 8),
             (transmitted..transmitted + chunk.len() as u64, false)
         );
     }
 
-    /// tests that large segments are copied as-is in the SendBuffer
+    #[test]
+    fn backing_charge_survives_ack_gap_and_truncation() {
+        let budget = BufferBudget::new(64 * 1024);
+        let mut buf = SendBuffer::new(budget.clone());
+        let source = Bytes::from(vec![0x5a; 1024 * 1024]);
+        buf.write(source.slice(0..4000));
+        assert_eq!(buf.get(0..4000), &[0x5a; 4000]);
+        let allocated = budget.used();
+        assert!((4000..64 * 1024).contains(&allocated));
+        buf.poll_transmit(5000);
+        buf.ack(1..4000).unwrap();
+        assert_eq!(budget.used(), allocated);
+        buf.truncate(1);
+        assert!(budget.used() >= 4000);
+        buf.ack(0..1).unwrap();
+        assert_eq!(budget.used(), 0);
+        buf.write(source.slice(0..4000));
+        buf.truncate(0);
+        assert_eq!(budget.used(), 0);
+    }
+
     #[test]
     fn multiple_large_segments() {
         // this must be bigger than MAX_COMBINE so we don't get writes coalesced.
@@ -534,12 +716,7 @@ mod tests {
             buf.freeze()
         }
 
-        fn same(a: &[u8], b: &[u8]) -> bool {
-            // surprisingly, eq also checks the fat pointer metadata aka length
-            std::ptr::eq(a.as_ptr(), b.as_ptr())
-        }
-
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
         let msg: Bytes = dup(b"Hello, world!");
         let msg_len: u64 = msg.len() as u64;
 
@@ -554,75 +731,69 @@ mod tests {
         let seg5: Bytes = dup(b"rld!");
         buf.write(seg5.clone());
         assert_eq!(aggregate_unacked(&buf), msg);
-        // Check that the segments were stored as-is
-        assert!(same(buf.get(0..5 * K), &seg1));
-        assert!(same(buf.get(2 * K..8 * K), &seg2));
-        assert!(same(buf.get(6 * K..8 * K), &seg3));
-        assert!(same(buf.get(8 * 2000..msg_len), &seg4));
-        assert!(same(buf.get(9 * 2000..msg_len), &seg5));
         // Now drain the segments
-        buf.ack(0..K);
+        buf.ack(0..K).unwrap();
         assert_eq!(aggregate_unacked(&buf), &msg[N..]);
-        buf.ack(0..3 * K);
+        buf.ack(0..3 * K).unwrap();
         assert_eq!(aggregate_unacked(&buf), &msg[3 * N..]);
-        buf.ack(3 * K..5 * K);
+        buf.ack(3 * K..5 * K).unwrap();
         assert_eq!(aggregate_unacked(&buf), &msg[5 * N..]);
         // ack with gap, doesn't free anything
-        buf.ack(7 * K..9 * K);
+        buf.ack(7 * K..9 * K).unwrap();
         assert_eq!(aggregate_unacked(&buf), &msg[5 * N..]);
         // fill the gap, free up to 9 K
-        buf.ack(4 * K..7 * K);
+        buf.ack(4 * K..7 * K).unwrap();
         assert_eq!(aggregate_unacked(&buf), &msg[9 * N..]);
         // ack all
-        buf.ack(0..msg_len);
+        buf.ack(0..msg_len).unwrap();
         assert_eq!(aggregate_unacked(&buf), &[] as &[u8]);
     }
 
     #[test]
     fn retransmit() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
         const MSG: &[u8] = b"Hello, world with extra data!";
         buf.write(MSG);
         // Transmit two frames
         assert_eq!(buf.poll_transmit(16), (0..16, false));
         assert_eq!(buf.poll_transmit(16), (16..23, true));
         // Lose the first, but not the second
-        buf.retransmit(0..16);
+        buf.retransmit(0..16).unwrap();
         // Ensure we only retransmit the lost frame, then continue sending fresh data
         assert_eq!(buf.poll_transmit(16), (0..16, false));
         assert_eq!(buf.poll_transmit(16), (23..MSG.len() as u64, true));
         // Lose the second frame
-        buf.retransmit(16..23);
+        buf.retransmit(16..23).unwrap();
         assert_eq!(buf.poll_transmit(16), (16..23, true));
     }
 
     #[test]
     fn ack() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
         const MSG: &[u8] = b"Hello, world!";
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(16), (0..8, true));
-        buf.ack(0..8);
+        buf.ack(0..8).unwrap();
         assert_eq!(aggregate_unacked(&buf), &MSG[8..]);
     }
 
     #[test]
     fn reordered_ack() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
         const MSG: &[u8] = b"Hello, world with extra data!";
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(16), (0..16, false));
         assert_eq!(buf.poll_transmit(16), (16..23, true));
-        buf.ack(16..23);
+        buf.ack(16..23).unwrap();
         assert_eq!(aggregate_unacked(&buf), MSG);
-        buf.ack(0..16);
+        buf.ack(0..16).unwrap();
         assert_eq!(aggregate_unacked(&buf), &MSG[23..]);
-        assert!(buf.acks.is_empty());
+        assert!(buf.acks.ranges.is_empty());
     }
 
     #[test]
     fn truncate_basic() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
         const MSG: &[u8] = b"Hello, world!"; // 13 bytes, coalesced into last_segment
         buf.write(MSG);
         assert_eq!(buf.offset(), 13);
@@ -644,7 +815,7 @@ mod tests {
 
     #[test]
     fn truncate_multiple_segments() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
         // Segments larger than MAX_COMBINE are stored as standalone segments.
         buf.write(Bytes::from(vec![1u8; 2000]));
         buf.write(Bytes::from(vec![2u8; 2000]));
@@ -668,11 +839,11 @@ mod tests {
 
     #[test]
     fn truncate_after_ack_and_below_front() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
         const MSG: &[u8] = b"abcdefghij"; // 10 bytes
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(64), (0..10, true));
-        buf.ack(0..4); // drop the first 4 bytes from the front
+        buf.ack(0..4).unwrap(); // drop the first 4 bytes from the front
         assert_eq!(buf.fully_acked_offset(), 4);
 
         // Truncate within the retained range.
@@ -690,12 +861,12 @@ mod tests {
 
     #[test]
     fn truncate_drops_retransmits_and_unacked() {
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
         const MSG: &[u8] = b"Hello, world with extra data!"; // 29 bytes
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(64), (0..29, true));
         // Mark a tail range lost, queuing it for retransmission.
-        buf.retransmit(20..29);
+        buf.retransmit(20..29).unwrap();
         assert_eq!(buf.unacked(), 29);
         assert!(buf.has_unsent_data());
 
@@ -715,14 +886,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "Requested range is outside of buffered data")]
     fn send_buffer_get_out_of_range() {
-        let data = SendBufferData::default();
+        let data = SendBufferData::new(BufferBudget::new(u64::MAX));
         data.get(0..1);
     }
 
     #[test]
     #[should_panic(expected = "Requested range is outside of buffered data")]
     fn send_buffer_get_into_out_of_range() {
-        let data = SendBufferData::default();
+        let data = SendBufferData::new(BufferBudget::new(u64::MAX));
         let mut buf = Vec::new();
         data.get_into(0..1, &mut buf);
     }
@@ -772,7 +943,7 @@ mod proptests {
         #[strategy(proptest::collection::vec(any::<Op>(), 1..100))] ops: Vec<Op>,
     ) {
         let _guard = subscribe();
-        let mut sb = SendBuffer::new();
+        let mut sb = SendBuffer::new(BufferBudget::new(u64::MAX));
         // all data written to the send buffer
         let mut buf = Vec::new();
         // max offset that has been returned by poll_transmit
@@ -795,13 +966,13 @@ mod proptests {
                         max_full_send_offset = range.end;
                     }
                     trace!("Op::Ack({:?})", range);
-                    sb.ack(range);
+                    sb.ack(range).unwrap();
                 }
                 Op::Retransmit(range) => {
                     // we can only get retransmits for data that has been sent
                     let range = map_range(range, 0..max_send_offset);
                     trace!("Op::Retransmit({:?})", range);
-                    sb.retransmit(range);
+                    sb.retransmit(range).unwrap();
                 }
                 Op::Truncate(raw) => {
                     // Choose a truncation point within the data that has actually been sent.
@@ -841,7 +1012,7 @@ mod proptests {
         }
         // Drain all remaining data
         trace!("Op::Retransmit({:?})", 0..max_send_offset);
-        sb.retransmit(0..max_send_offset);
+        sb.retransmit(0..max_send_offset).unwrap();
         loop {
             trace!("Op::PollTransmit({})", 1024);
             let (range, _partial) = sb.poll_transmit(1024);
@@ -849,7 +1020,7 @@ mod proptests {
                 break;
             }
             trace!("Op::Ack({:?})", range);
-            sb.ack(range);
+            sb.ack(range).unwrap();
         }
         assert!(
             sb.is_fully_acked(),
@@ -872,7 +1043,7 @@ pub mod send_buffer_benches {
     /// Pathological case: many segments, get from end
     pub fn get_into_many_segments(criterion: &mut Criterion) {
         let mut group = criterion.benchmark_group("get_into_many_segments");
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
 
         const SEGMENTS: u64 = 10000;
         const SEGMENT_SIZE: u64 = 10;
@@ -897,7 +1068,7 @@ pub mod send_buffer_benches {
     /// Get segments in the old way, using a loop of get calls
     pub fn get_loop_many_segments(criterion: &mut Criterion) {
         let mut group = criterion.benchmark_group("get_loop_many_segments");
-        let mut buf = SendBuffer::new();
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
 
         const SEGMENTS: u64 = 10000;
         const SEGMENT_SIZE: u64 = 10;

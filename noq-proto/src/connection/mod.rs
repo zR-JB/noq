@@ -54,7 +54,9 @@ mod ack_frequency;
 use ack_frequency::AckFrequencyState;
 
 mod assembler;
-pub use assembler::{Chunk, ReceiveAllocationHandle};
+pub use assembler::Chunk;
+mod buffer_budget;
+pub use buffer_budget::ReceiveAllocationHandle;
 
 mod cid_state;
 use cid_state::CidState;
@@ -2905,6 +2907,11 @@ impl Connection {
         self.streams.unacked_data
     }
 
+    /// Retained send backing and heap metadata, including acknowledged data behind gaps.
+    pub fn send_allocated_bytes(&self) -> u64 {
+        self.streams.transmit.used() as u64
+    }
+
     /// See [`TransportConfig::send_window()`]
     pub fn set_send_window(&mut self, send_window: u64) {
         self.streams.set_send_window(send_window);
@@ -3230,7 +3237,10 @@ impl Connection {
         }
 
         for frame in info.stream_frames {
-            self.streams.received_ack_of(frame);
+            if let Err(error) = self.streams.received_ack_of(frame) {
+                self.close_inner(now, Close::Connection(error.into()));
+                return;
+            }
         }
     }
 
@@ -3521,7 +3531,10 @@ impl Connection {
                     .remove_in_flight(&info);
 
                 for frame in info.stream_frames {
-                    self.streams.retransmit(frame);
+                    if let Err(error) = self.streams.retransmit(frame) {
+                        self.close_inner(now, Close::Connection(error.into()));
+                        return;
+                    }
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 let path = self.path_data_mut(path_id);

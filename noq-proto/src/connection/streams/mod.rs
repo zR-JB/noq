@@ -290,7 +290,10 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.transmit.clone(),
+            ))
             .ok_or(WriteError::ClosedStream)?;
 
         if limit == 0 {
@@ -306,7 +309,16 @@ impl<'a> SendStream<'a> {
         }
 
         let was_pending = stream.is_pending();
-        let written = stream.write(source, limit)?;
+        let written = match stream.write(source, limit) {
+            Err(WriteError::Blocked) => {
+                if !stream.connection_blocked {
+                    stream.connection_blocked = true;
+                    self.state.connection_blocked.push(self.id);
+                }
+                return Err(WriteError::Blocked);
+            }
+            result => result?,
+        };
         self.state.data_sent += written.bytes as u64;
         self.state.unacked_data += written.bytes as u64;
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);
@@ -336,7 +348,10 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.transmit.clone(),
+            ))
             .ok_or(FinishError::ClosedStream)?;
 
         let was_pending = stream.is_pending();
@@ -358,7 +373,10 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.transmit.clone(),
+            ))
             .ok_or(ClosedStream { _private: () })?;
 
         if matches!(stream.state, SendState::ResetSent) || stream.reset_at.is_some() {
@@ -408,7 +426,10 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.transmit.clone(),
+            ))
             .ok_or(ResetStreamAtError::ClosedStream)?;
 
         // Restore the send window consumed by data beyond the reliable size, which we are about to
@@ -440,7 +461,10 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.transmit.clone(),
+            ))
             .ok_or(ClosedStream { _private: () })?;
 
         stream.priority = priority;
@@ -660,17 +684,8 @@ pub(super) trait BytesOrSlice<'a>: AsRef<[u8]> + 'a {
     fn is_empty(&self) -> bool {
         self.as_ref().is_empty()
     }
-    fn into_bytes(self) -> Bytes;
 }
 
-impl BytesOrSlice<'_> for Bytes {
-    fn into_bytes(self) -> Bytes {
-        self
-    }
-}
+impl BytesOrSlice<'_> for Bytes {}
 
-impl<'a> BytesOrSlice<'a> for &'a [u8] {
-    fn into_bytes(self) -> Bytes {
-        Bytes::copy_from_slice(self)
-    }
-}
+impl<'a> BytesOrSlice<'a> for &'a [u8] {}
