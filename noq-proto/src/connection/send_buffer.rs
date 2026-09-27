@@ -48,8 +48,8 @@ struct SendBufferData {
     offset: u64,
     /// Total size of [`Self::segments`] and [`Self::last_segment`]
     len: usize,
-    /// Buffered data segments
-    segments: VecDeque<Bytes>,
+    /// Buffered data segments, each with the stream offset it ends at
+    segments: VecDeque<(u64, Bytes)>,
     /// Last segment, possibly empty
     last_segment: Option<OwnedBacking>,
     last_start: usize,
@@ -91,7 +91,7 @@ impl SendBufferData {
             count
                 .max(self.segments.capacity().saturating_mul(2))
                 .max(4)
-                .saturating_mul(mem::size_of::<Bytes>())
+                .saturating_mul(mem::size_of::<(u64, Bytes)>())
         } else {
             0
         };
@@ -124,14 +124,14 @@ impl SendBufferData {
             let capacity = count.max(self.segments.capacity().saturating_mul(2)).max(4);
             let mut allocation = self.allocation.budget.acquire(
                 capacity
-                    .checked_mul(mem::size_of::<Bytes>())
+                    .checked_mul(mem::size_of::<(u64, Bytes)>())
                     .ok_or(AllocationError)?,
             )?;
             let mut segments = VecDeque::new();
             segments
                 .try_reserve_exact(capacity)
                 .map_err(|_| AllocationError)?;
-            allocation.resize(segments.capacity() * mem::size_of::<Bytes>())?;
+            allocation.resize(segments.capacity() * mem::size_of::<(u64, Bytes)>())?;
             segments.extend(mem::take(&mut self.segments));
             self.segments = segments;
             self.allocation = allocation;
@@ -139,7 +139,7 @@ impl SendBufferData {
         if let Some(last) = self.last_segment.take() {
             let mut bytes = last.finish();
             bytes.advance(mem::take(&mut self.last_start));
-            self.segments.push_back(bytes);
+            self.segments.push_back((self.range().end, bytes));
         }
         let length = limit.min(COPY_BLOCK_BYTES).min(
             self.allocation
@@ -175,7 +175,8 @@ impl SendBufferData {
         if data.len() <= MAX_COMBINE {
             self.last_segment = Some(backing);
         } else {
-            self.segments.push_back(backing.finish());
+            self.segments
+                .push_back((self.range().end, backing.finish()));
         }
     }
 
@@ -204,11 +205,12 @@ impl SendBufferData {
         // Walk the stored segments (and finally `last_segment`), keeping the first `new_len`
         // bytes and dropping everything after them.
         let mut kept = 0usize;
-        for segment in self.segments.iter_mut() {
+        for (end, segment) in self.segments.iter_mut() {
             if kept >= new_len {
                 segment.clear();
             } else if kept + segment.len() > new_len {
                 segment.truncate(new_len - kept);
+                *end = self.offset + new_len as u64;
                 kept = new_len;
             } else {
                 kept += segment.len();
@@ -227,7 +229,7 @@ impl SendBufferData {
         self.len = new_len;
 
         // remove empty segments
-        self.segments.retain(|s| !s.is_empty());
+        self.segments.retain(|(_, s)| !s.is_empty());
 
         // shrink segments if we have a lot of unused capacity
         self.release_empty_segments();
@@ -242,7 +244,7 @@ impl SendBufferData {
         self.offset += n as u64;
         while n > 0 {
             // segments is empty, which leaves only last_segment
-            let Some(front) = self.segments.front_mut() else {
+            let Some((_, front)) = self.segments.front_mut() else {
                 break;
             };
             if front.len() <= n {
@@ -267,15 +269,19 @@ impl SendBufferData {
         self.release_empty_segments();
     }
 
-    /// Iterator over all segments in order
+    /// Segments in order from the one holding `offset`, each with the stream offset it ends at
     ///
     /// Concatenates `segments` and `last_segment` so they can be handled uniformly
-    fn segments_iter(&self) -> impl Iterator<Item = &[u8]> {
-        self.segments.iter().map(|x| x.as_ref()).chain(
-            self.last_segment
-                .iter()
-                .map(|last| &last.bytes[self.last_start..]),
-        )
+    fn segments_from(&self, offset: u64) -> impl Iterator<Item = (u64, &[u8])> {
+        let first = self.segments.partition_point(|(end, _)| *end <= offset);
+        self.segments
+            .range(first..)
+            .map(|(end, segment)| (*end, segment.as_ref()))
+            .chain(
+                self.last_segment
+                    .iter()
+                    .map(|last| (self.range().end, &last.bytes[self.last_start..])),
+            )
     }
 
     /// Returns data which is associated with a range
@@ -287,23 +293,12 @@ impl SendBufferData {
             offsets.start >= self.range().start && offsets.end <= self.range().end,
             "Requested range is outside of buffered data"
         );
-        // translate to segment-relative offsets and usize
-        let offsets = Range {
-            start: (offsets.start - self.offset) as usize,
-            end: (offsets.end - self.offset) as usize,
-        };
-        let mut segment_offset = 0;
-        for segment in self.segments_iter() {
-            if offsets.start >= segment_offset && offsets.start < segment_offset + segment.len() {
-                let start = offsets.start - segment_offset;
-                let end = offsets.end - segment_offset;
-
-                return &segment[start..end.min(segment.len())];
-            }
-            segment_offset += segment.len();
-        }
-
-        unreachable!("impossible if segments and range are consistent");
+        let (end, segment) = self
+            .segments_from(offsets.start)
+            .next()
+            .expect("impossible if segments and range are consistent");
+        let start = end - segment.len() as u64;
+        &segment[(offsets.start - start) as usize..(offsets.end.min(end) - start) as usize]
     }
 
     fn get_into(&self, offsets: Range<u64>, buf: &mut impl BufMut) {
@@ -311,22 +306,13 @@ impl SendBufferData {
             offsets.start >= self.range().start && offsets.end <= self.range().end,
             "Requested range is outside of buffered data"
         );
-        // translate to segment-relative offsets and usize
-        let offsets = Range {
-            start: (offsets.start - self.offset) as usize,
-            end: (offsets.end - self.offset) as usize,
-        };
-        let mut segment_offset = 0;
-        for segment in self.segments_iter() {
+        for (end, segment) in self.segments_from(offsets.start) {
             // intersect segment range with requested range
-            let start = segment_offset.max(offsets.start);
-            let end = (segment_offset + segment.len()).min(offsets.end);
-            if start < end {
-                // slice range intersects with requested range
-                buf.put_slice(&segment[start - segment_offset..end - segment_offset]);
-            }
-            segment_offset += segment.len();
-            if segment_offset >= offsets.end {
+            let start = end - segment.len() as u64;
+            let from = (offsets.start.max(start) - start) as usize;
+            let to = (offsets.end.min(end) - start) as usize;
+            buf.put_slice(&segment[from..to]);
+            if end >= offsets.end {
                 // we are beyond the requested range
                 break;
             }
@@ -336,9 +322,7 @@ impl SendBufferData {
     #[cfg(test)]
     fn to_vec(&self) -> Vec<u8> {
         let mut result = Vec::with_capacity(self.len);
-        for segment in self.segments_iter() {
-            result.extend_from_slice(segment);
-        }
+        self.get_into(self.range(), &mut result);
         result
     }
 }
@@ -1063,8 +1047,8 @@ mod proptests {
 
     #[derive(Debug, Clone, Arbitrary)]
     enum Op {
-        // write the given bytes
-        Write(#[strategy(proptest::collection::vec(any::<u8>(), 0..1024))] Vec<u8>),
+        // write the given bytes, above MAX_COMBINE into their own segment
+        Write(#[strategy(proptest::collection::vec(any::<u8>(), 0..2048))] Vec<u8>),
         // ack a random range
         Ack(Range<u64>),
         // retransmit a random range
