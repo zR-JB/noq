@@ -269,7 +269,7 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
                 self.sent_frames.allocation_failed = true;
             }
         } else {
-            debug_assert!(!frame.is_ack_eliciting());
+            debug_assert!(!frame.is_ack_eliciting() || matches!(frame, EncodableFrame::Ping(_)));
         }
     }
 
