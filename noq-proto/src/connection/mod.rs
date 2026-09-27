@@ -1555,7 +1555,7 @@ impl Connection {
                 can_send.other = false;
                 can_send.space_specific = false;
             }
-            let needs_loss_probe = track && self.spaces[space_id].for_path(path_id).loss_probes > 0;
+            let needs_loss_probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
             let space_will_send = {
                 if scheduling_info.is_abandoned {
                     // If this path is abandoned then we might still have to send
@@ -1637,14 +1637,18 @@ impl Connection {
                 }
 
                 if needs_loss_probe {
-                    // Ensure we have something to send for a tail-loss probe.
-                    let request_immediate_ack =
-                        space_id == SpaceId::Data && self.peer_supports_ack_frequency();
-                    self.spaces[space_id].queue_tail_loss_probe(
-                        path_id,
-                        request_immediate_ack,
-                        &self.streams,
-                    );
+                    // Without packet metadata a PING still elicits the ACK that frees it
+                    if track {
+                        let request_immediate_ack =
+                            space_id == SpaceId::Data && self.peer_supports_ack_frequency();
+                        self.spaces[space_id].queue_tail_loss_probe(
+                            path_id,
+                            request_immediate_ack,
+                            &self.streams,
+                        );
+                    } else {
+                        self.spaces[space_id].for_path(path_id).pending_ping = true;
+                    }
 
                     self.spaces[space_id].for_path(path_id).loss_probes -= 1; // needs_loss_probe ensures loss_probes > 0
 
@@ -3126,10 +3130,8 @@ impl Connection {
                 .is_none_or(|pn| ack.largest > pn)
             {
                 space.largest_acked_packet_pn = Some(ack.largest);
+                // Untracked ACK-only and probe packets keep the previous send time
                 if let Some(info) = space.sent_packets.get(ack.largest) {
-                    // This should always succeed, but a misbehaving peer might ACK a packet we
-                    // haven't sent. At worst, that will result in us spuriously reducing the
-                    // congestion window.
                     space.largest_acked_packet_send_time = info.time_sent;
                 }
                 Some(ack.largest)
@@ -3158,7 +3160,8 @@ impl Connection {
             }
         }
 
-        if newly_acked.is_empty() {
+        // A new largest may acknowledge only an untracked probe, which still reveals losses
+        if newly_acked.is_empty() && new_largest_pn.is_none() {
             return Ok(());
         }
 
@@ -6329,6 +6332,13 @@ impl Connection {
             }
         }
 
+        // PING
+        if !scheduling_info.is_abandoned
+            && mem::replace(&mut space.for_path(path_id).pending_ping, false)
+        {
+            builder.write_frame(frame::Ping, stats);
+        }
+
         if !builder.track {
             return;
         }
@@ -6342,13 +6352,6 @@ impl Connection {
             && mem::replace(&mut space.pending.handshake_done, false)
         {
             builder.write_frame(frame::HandshakeDone, stats);
-        }
-
-        // PING
-        if !scheduling_info.is_abandoned
-            && mem::replace(&mut space.for_path(path_id).pending_ping, false)
-        {
-            builder.write_frame(frame::Ping, stats);
         }
 
         // IMMEDIATE_ACK
