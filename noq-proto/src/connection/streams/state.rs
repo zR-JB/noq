@@ -1129,9 +1129,17 @@ impl StreamsState {
             let diff = self.receive_window - receive_window;
             self.receive_window_shrink_debt = self.receive_window_shrink_debt.saturating_add(diff);
         }
-        self.reassembly.set_limit(receive_window.saturating_mul(3));
         self.receive_window = receive_window;
+        self.limit_reassembly();
         expanded
+    }
+
+    fn limit_reassembly(&self) {
+        self.reassembly.set_limit(
+            self.receive_window
+                .saturating_add(self.receive_window_shrink_debt)
+                .saturating_mul(3),
+        );
     }
 
     pub(in crate::connection) fn allocation_failed(&self) -> bool {
@@ -1265,13 +1273,12 @@ impl StreamsState {
     /// suppress sending further updates until the window increases significantly
     /// again.
     pub(super) fn add_read_credits(&mut self, credits: u64) -> ShouldTransmit {
-        if credits > self.receive_window_shrink_debt {
-            let net_credits = credits - self.receive_window_shrink_debt;
-            self.local_max_data = self.local_max_data.saturating_add(net_credits);
-            self.receive_window_shrink_debt = 0;
-        } else {
-            self.receive_window_shrink_debt -= credits;
+        let paid = credits.min(self.receive_window_shrink_debt);
+        if paid != 0 {
+            self.receive_window_shrink_debt -= paid;
+            self.limit_reassembly();
         }
+        self.local_max_data = self.local_max_data.saturating_add(credits - paid);
 
         if self.local_max_data > VarInt::MAX.into_inner() {
             return ShouldTransmit(false);
@@ -1621,8 +1628,8 @@ mod tests {
                     .unwrap();
             }
         }
-        receiver.set_receive_window(1024u32.into());
         let budget = receiver.reassembly.clone();
+        let _exhausted = budget.acquire(budget.available()).unwrap();
         let before = budget.used();
         let mut pending = Retransmits::default();
         let mut recv = RecvStream {
@@ -2757,6 +2764,26 @@ mod tests {
         assert_eq!(server.receive_window_shrink_debt, 0);
         assert_eq!(server.local_max_data, expected_local_max_data);
         assert!(should_transmit.should_transmit());
+    }
+
+    #[test]
+    fn shrinking_receive_window_keeps_room_for_granted_credit() {
+        let mut receiver = make(Side::Server);
+        receiver.set_receive_window((64 * 1024u32).into());
+        let data = Bytes::from(vec![7; 16 * 1024]);
+        for offset in (0..1024 * 1024).step_by(data.len()) {
+            let _ = receiver
+                .received(
+                    frame::Stream {
+                        id: StreamId::new(Side::Client, Dir::Uni, 0),
+                        offset,
+                        fin: false,
+                        data: data.clone(),
+                    },
+                    data.len(),
+                )
+                .unwrap();
+        }
     }
 
     #[test]
