@@ -15,8 +15,8 @@ use crate::{
 };
 
 mod recv;
-use recv::{Recv, ResetAtOutcome};
 pub use recv::{Chunks, ReadError, ReadableError};
+use recv::{Recv, ResetAtOutcome};
 
 mod send;
 pub(crate) use send::{ByteSlice, BytesArray, Written};
@@ -156,7 +156,10 @@ impl RecvStream<'_> {
             hash_map::Entry::Occupied(s) => s,
             hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
         };
-        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
+        let stream = get_or_insert_recv(
+            self.state.stream_receive_window,
+            self.state.reassembly.clone(),
+        )(entry.get_mut());
 
         let (read_credits, stop_sending) = stream.stop()?;
         if stop_sending.should_transmit() {

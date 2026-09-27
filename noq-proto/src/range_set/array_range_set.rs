@@ -76,6 +76,26 @@ where
         Default::default()
     }
 
+    pub(crate) fn with_capacity(
+        capacity: usize,
+    ) -> Result<Self, std::collections::TryReserveError> {
+        let mut ranges = Vec::new();
+        ranges.try_reserve_exact(capacity)?;
+        Ok(Self(TinyVec::Heap(ranges)))
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    pub(crate) fn heap_capacity(&self) -> usize {
+        if self.0.is_heap() {
+            self.0.capacity()
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = Range<T>> + '_ {
         self.0.iter().cloned()
     }

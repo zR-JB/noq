@@ -4,7 +4,7 @@ use std::ops::{Index, IndexMut};
 use tracing::{debug, trace};
 
 use super::SpaceKind;
-use crate::connection::assembler::Assembler;
+use crate::connection::assembler::{Assembler, ReassemblyBudget};
 use crate::crypto::{self, HeaderKey, KeyPair, Keys, PacketKey};
 use crate::packet::{Packet, PartialDecode};
 use crate::token::ResetToken;
@@ -111,14 +111,19 @@ impl CryptoState {
         init_cid: ConnectionId,
         side: Side,
         rng: &mut impl CryptoRng,
+        buffer_size: usize,
     ) -> Self {
         let initial_keys = session.initial_keys(init_cid, side);
-        let initial_space = CryptoSpace {
-            keys: Some(initial_keys),
-            ..Default::default()
-        };
+        let budget = ReassemblyBudget::new(buffer_size as u64);
+        let mut spaces = std::array::from_fn(|_| CryptoSpace {
+            keys: None,
+            crypto_stream: Assembler::new(budget.clone()),
+            crypto_offset: 0,
+            sent_with_keys: 0,
+        });
+        spaces[0].keys = Some(initial_keys);
         Self {
-            spaces: [initial_space, Default::default(), Default::default()],
+            spaces,
             session,
             next_crypto: None,
             prev_crypto: None,
@@ -455,7 +460,6 @@ impl CryptoState {
 }
 
 /// Per space kind cryptographic state.
-#[derive(Default)]
 pub(super) struct CryptoSpace {
     /// Packet protection keys for this space.
     pub(super) keys: Option<Keys>,

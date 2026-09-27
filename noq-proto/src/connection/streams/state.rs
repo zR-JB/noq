@@ -2,6 +2,7 @@ use std::{
     collections::{VecDeque, hash_map},
     convert::TryFrom,
     mem,
+    sync::Arc,
 };
 
 use rustc_hash::FxHashMap;
@@ -13,7 +14,7 @@ use super::{
 };
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
-    connection::{PacketBuilder, stats::FrameStats},
+    connection::{PacketBuilder, assembler::ReassemblyBudget, stats::FrameStats},
     frame::{self, FrameStruct},
     transport_parameters::TransportParameters,
 };
@@ -70,6 +71,7 @@ pub struct StreamsState {
     pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
     pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
     pub(super) free_recv: Vec<StreamRecv>,
+    pub(super) reassembly: Arc<ReassemblyBudget>,
     pub(super) next: [u64; 2],
     /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
     /// connection so far, per direction
@@ -159,6 +161,7 @@ impl StreamsState {
             send: FxHashMap::default(),
             recv: FxHashMap::default(),
             free_recv: Vec::new(),
+            reassembly: ReassemblyBudget::new(receive_window.into()),
             next: [0, 0],
             max: [0, 0],
             max_remote: [max_remote_bi.into(), max_remote_uni.into()],
@@ -261,11 +264,10 @@ impl StreamsState {
         // Create state for this stream if the remote peer created it.
         let newly_created = self.ensure_remote(id);
 
-        let Some(rs) = self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        else {
+        let Some(rs) = self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window,
+            self.reassembly.clone(),
+        )) else {
             trace!("dropping frame for closed stream");
             return Ok(ShouldTransmit(false));
         };
@@ -318,11 +320,10 @@ impl StreamsState {
         // Create state for this stream if the remote peer created it.
         let newly_created = self.ensure_remote(id);
 
-        let Some(rs) = self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        else {
+        let Some(rs) = self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window,
+            self.reassembly.clone(),
+        )) else {
             trace!("received RESET_STREAM on closed stream");
             return Ok(ShouldTransmit(false));
         };
@@ -402,11 +403,10 @@ impl StreamsState {
         // Create state for this stream if the remote peer created it.
         let newly_created = self.ensure_remote(id);
 
-        let Some(rs) = self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        else {
+        let Some(rs) = self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window,
+            self.reassembly.clone(),
+        )) else {
             trace!("received RESET_STREAM_AT on closed stream");
             return Ok(ShouldTransmit(false));
         };
@@ -1007,6 +1007,7 @@ impl StreamsState {
             let diff = self.receive_window - receive_window;
             self.receive_window_shrink_debt = self.receive_window_shrink_debt.saturating_add(diff);
         }
+        self.reassembly.set_limit(receive_window);
         self.receive_window = receive_window;
         expanded
     }
@@ -1131,13 +1132,14 @@ pub(super) fn get_or_insert_send(
 #[inline]
 pub(super) fn get_or_insert_recv(
     initial_max_data: u64,
+    reassembly: Arc<ReassemblyBudget>,
 ) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv {
     move |opt| {
         *opt = opt.take().map(|s| match s {
             StreamRecv::Free(recv) => StreamRecv::Open(recv),
             s => s,
         });
-        opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data)))
+        opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data, reassembly.clone())))
             .as_open_recv_mut()
             .unwrap()
     }
@@ -1147,7 +1149,7 @@ pub(super) fn get_or_insert_recv(
 mod tests {
     use super::*;
     use crate::{
-        ReadableError, ReadError, RecvStream, ResetStreamAtError, SendStream, TransportErrorCode,
+        ReadError, ReadableError, RecvStream, ResetStreamAtError, SendStream, TransportErrorCode,
         WriteError, connection::State as ConnState, connection::Streams,
     };
     use bytes::Bytes;
@@ -1161,6 +1163,280 @@ mod tests {
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
         )
+    }
+
+    #[test]
+    fn sparse_receive_frames_exhaust_reassembly_before_flow_control() {
+        let mut receiver = StreamsState::new(
+            Side::Server,
+            2u32.into(),
+            2u32.into(),
+            1024,
+            1024u32.into(),
+            1024u32.into(),
+        );
+        let mut rejected = false;
+        for offset in (1..1024).step_by(2) {
+            let result = receiver.received(
+                frame::Stream {
+                    id: StreamId::new(Side::Client, Dir::Uni, 0),
+                    offset,
+                    fin: false,
+                    data: Bytes::from_static(b"x"),
+                },
+                16,
+            );
+            if let Err(error) = result {
+                assert_eq!(error.code, TransportErrorCode::INTERNAL_ERROR);
+                rejected = true;
+                break;
+            }
+        }
+        assert!(
+            rejected,
+            "sparse frames exceeded the connection's metadata allowance"
+        );
+        assert!(receiver.data_recvd < 1024);
+    }
+
+    #[test]
+    fn receive_reassembly_is_shared_and_reset_releases_capacity() {
+        let mut receiver = StreamsState::new(
+            Side::Server,
+            2u32.into(),
+            2u32.into(),
+            1024,
+            1024u32.into(),
+            1024u32.into(),
+        );
+        let first = StreamId::new(Side::Client, Dir::Uni, 0);
+        let second = StreamId::new(Side::Client, Dir::Uni, 1);
+        let mut rejected = false;
+        for offset in (1..1024).step_by(2) {
+            for id in [first, second] {
+                if receiver
+                    .received(
+                        frame::Stream {
+                            id,
+                            offset,
+                            fin: false,
+                            data: Bytes::from_static(b"x"),
+                        },
+                        16,
+                    )
+                    .is_err()
+                {
+                    rejected = true;
+                    break;
+                }
+            }
+            if rejected {
+                break;
+            }
+        }
+        assert!(rejected);
+        assert!(
+            receiver.recv[&first]
+                .as_ref()
+                .unwrap()
+                .as_open_recv()
+                .unwrap()
+                .end
+                > 0
+        );
+        assert!(
+            receiver.recv[&second]
+                .as_ref()
+                .unwrap()
+                .as_open_recv()
+                .unwrap()
+                .end
+                > 0
+        );
+        assert!(receiver.reassembly.used() <= 4096);
+        for id in [first, second] {
+            let final_offset = receiver.recv[&id]
+                .as_ref()
+                .unwrap()
+                .as_open_recv()
+                .unwrap()
+                .end;
+            let _ = receiver
+                .received_reset(frame::ResetStream {
+                    id,
+                    error_code: 0u32.into(),
+                    final_offset: VarInt::from_u64(final_offset).unwrap(),
+                })
+                .unwrap();
+        }
+        assert_eq!(receiver.reassembly.used(), 0);
+        let mut pending = Retransmits::default();
+        for id in [first, second] {
+            let mut recv = RecvStream {
+                id,
+                state: &mut receiver,
+                pending: &mut pending,
+            };
+            assert!(matches!(
+                recv.read(true).unwrap().next(1),
+                Err(ReadError::Reset(_))
+            ));
+        }
+        let next = StreamId::new(Side::Client, Dir::Uni, 2);
+        let _ = receiver
+            .received(
+                frame::Stream {
+                    id: next,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(b"live"),
+                },
+                16,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn duplicate_receive_frames_compact_without_spending_flow_credit() {
+        let mut receiver = StreamsState::new(
+            Side::Server,
+            1u32.into(),
+            1u32.into(),
+            1024,
+            1024u32.into(),
+            1024u32.into(),
+        );
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        for _ in 0..1000 {
+            let _ = receiver
+                .received(
+                    frame::Stream {
+                        id,
+                        offset: 1,
+                        fin: false,
+                        data: Bytes::from_static(b"x"),
+                    },
+                    16,
+                )
+                .unwrap();
+        }
+        assert_eq!(receiver.data_recvd, 2);
+        assert!(receiver.reassembly.used() <= 4096);
+    }
+
+    #[test]
+    fn unordered_receive_history_is_charged_before_delivery() {
+        let mut receiver = StreamsState::new(
+            Side::Server,
+            1u32.into(),
+            1u32.into(),
+            4096,
+            4096u32.into(),
+            4096u32.into(),
+        );
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        for offset in (1..32).step_by(2) {
+            let _ = receiver
+                .received(
+                    frame::Stream {
+                        id,
+                        offset,
+                        fin: false,
+                        data: Bytes::from_static(b"x"),
+                    },
+                    16,
+                )
+                .unwrap();
+        }
+        let ordered_capacity = receiver.reassembly.used();
+        let budget = receiver.reassembly.clone();
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: &mut receiver,
+            pending: &mut pending,
+        };
+        let mut chunks = recv.read(false).unwrap();
+        let unordered_capacity = budget.used();
+        assert!(unordered_capacity > ordered_capacity);
+        let mut count = 0;
+        while let Ok(Some(chunk)) = chunks.next(1) {
+            assert_eq!(chunk.bytes.as_ref(), b"x");
+            count += 1;
+            assert!(budget.used() <= unordered_capacity);
+        }
+        assert_eq!(count, 16);
+        drop(chunks);
+        let final_offset = receiver.recv[&id]
+            .as_ref()
+            .unwrap()
+            .as_open_recv()
+            .unwrap()
+            .end;
+        let _ = receiver
+            .received_reset(frame::ResetStream {
+                id,
+                error_code: 0u32.into(),
+                final_offset: VarInt::from_u64(final_offset).unwrap(),
+            })
+            .unwrap();
+        let mut recv = RecvStream {
+            id,
+            state: &mut receiver,
+            pending: &mut pending,
+        };
+        assert!(matches!(
+            recv.read(false).unwrap().next(1),
+            Err(ReadError::Reset(_))
+        ));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn unordered_allocation_failure_preserves_stream_ownership() {
+        let mut receiver = StreamsState::new(
+            Side::Server,
+            2u32.into(),
+            2u32.into(),
+            4096,
+            8192u32.into(),
+            4096u32.into(),
+        );
+        let ids = [
+            StreamId::new(Side::Client, Dir::Uni, 0),
+            StreamId::new(Side::Client, Dir::Uni, 1),
+        ];
+        for id in ids {
+            for offset in (1..64).step_by(2) {
+                let _ = receiver
+                    .received(
+                        frame::Stream {
+                            id,
+                            offset,
+                            fin: false,
+                            data: Bytes::from_static(b"x"),
+                        },
+                        16,
+                    )
+                    .unwrap();
+            }
+        }
+        receiver.set_receive_window(4096u32.into());
+        let budget = receiver.reassembly.clone();
+        let before = budget.used();
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id: ids[0],
+            state: &mut receiver,
+            pending: &mut pending,
+        };
+        assert!(matches!(
+            recv.read(false),
+            Err(super::super::ReadableError::ReassemblyLimit)
+        ));
+        assert_eq!(budget.used(), before);
+        let mut chunks = recv.read(true).unwrap();
+        assert!(matches!(chunks.next(1), Err(ReadError::Blocked)));
     }
 
     #[test]
