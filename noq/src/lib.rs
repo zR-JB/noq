@@ -66,9 +66,9 @@ pub use proto::{
     ConnectionIdGenerator, ConnectionStats, DecryptedInitial, Dir, EcnCodepoint, EndpointConfig,
     FourTuple, FrameStats, FrameType, IdleTimeout, InvalidCid, MtuDiscoveryConfig,
     NetworkChangeHint, NoneTokenLog, NoneTokenStore, PathError, PathEvent, PathId, PathStats,
-    PathStatus, ResetStreamAtError, ServerConfig, SetPathStatusError, Side, StdSystemTime,
-    StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit,
-    TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
+    PathStatus, ResetStreamAtError, ServerConfig, SetPathStatusError, SharedBudget, Side,
+    StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore,
+    Transmit, TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
     VarIntBoundsExceeded, congestion, crypto,
 };
 #[cfg(feature = "qlog")]
@@ -107,10 +107,7 @@ enum ConnectionEvent {
         error_code: VarInt,
         reason: bytes::Bytes,
     },
-    Proto(
-        proto::ConnectionEvent,
-        Option<tokio::sync::OwnedSemaphorePermit>,
-    ),
+    Proto(proto::ConnectionEvent, Option<endpoint::PacketCharge>),
     Rebind(Pin<Box<dyn UdpSender>>),
     LocalAddressChanged(Option<Arc<dyn NetworkChangeHint + Sync + Send>>),
 }

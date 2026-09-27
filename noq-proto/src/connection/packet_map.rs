@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn sparse_packet_numbers_and_consuming_owner() {
-        let budget = BufferBudget::new(64 * 1024);
+        let budget = BufferBudget::new(64 * 1024, None);
         let mut packets = PacketMap::new(budget.clone());
         for number in 0..40 {
             packets.insert(number * 1_000_000, [7_u8; 32]).unwrap();
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn node_admission_survives_split_and_empty_root() {
-        let budget = BufferBudget::new(64 * 1024);
+        let budget = BufferBudget::new(64 * 1024, None);
         let mut packets = PacketMap::new(budget.clone());
         let mut end = 0;
         while packets.insert(end, [0_u8; 256]).is_ok() {

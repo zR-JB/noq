@@ -16,7 +16,7 @@ use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     connection::{
         PacketBuilder,
-        buffer_budget::{Allocation, AllocationError, BufferBudget},
+        buffer_budget::{Allocation, AllocationError, BufferBudget, SharedBudget},
         packet_map::btree_entry_lease,
         spaces::{ControlKind, reserve_control_vec},
         stats::FrameStats,
@@ -121,7 +121,7 @@ pub struct StreamsState {
     recv_allocation: Allocation,
     pub(super) blocked_allocation: Allocation,
     pub(super) allocation_failed: bool,
-    pub(in crate::connection) reassembly: Arc<BufferBudget>,
+    pub(super) reassembly: Arc<BufferBudget>,
     pub(in crate::connection) transmit: Arc<BufferBudget>,
     pub(super) next: [u64; 2],
     /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
@@ -206,9 +206,10 @@ impl StreamsState {
         send_window: u64,
         receive_window: VarInt,
         stream_receive_window: VarInt,
+        shared: Option<&Arc<dyn SharedBudget>>,
     ) -> Self {
-        let reassembly = BufferBudget::for_receive(receive_window.into());
-        let transmit = BufferBudget::new(send_window);
+        let reassembly = BufferBudget::for_receive(receive_window.into(), shared);
+        let transmit = BufferBudget::new(send_window, shared);
         Self {
             side,
             send: BTreeMap::new(),
@@ -1127,7 +1128,11 @@ impl StreamsState {
     }
 
     pub(in crate::connection) fn allocation_failed(&self) -> bool {
-        self.allocation_failed || self.pending.allocation_failed || self.events.allocation_failed
+        self.allocation_failed
+            || self.pending.allocation_failed
+            || self.events.allocation_failed
+            || self.reassembly.refused()
+            || self.transmit.refused()
     }
 
     fn reserve_streams(&mut self, send: usize, recv: usize) -> Result<(), AllocationError> {
@@ -1352,6 +1357,7 @@ mod tests {
             1024 * 1024,
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
+            None,
         )
     }
 
@@ -1364,6 +1370,7 @@ mod tests {
             65536,
             65536u32.into(),
             65536u32.into(),
+            None,
         );
         let mut rejected = false;
         for offset in (1..65536).step_by(2) {
@@ -1398,6 +1405,7 @@ mod tests {
             65536,
             65536u32.into(),
             65536u32.into(),
+            None,
         );
         let first = StreamId::new(Side::Client, Dir::Uni, 0);
         let second = StreamId::new(Side::Client, Dir::Uni, 1);
@@ -1498,6 +1506,7 @@ mod tests {
             1024,
             1024u32.into(),
             1024u32.into(),
+            None,
         );
         let id = StreamId::new(Side::Client, Dir::Uni, 0);
         for _ in 0..1000 {
@@ -1526,6 +1535,7 @@ mod tests {
             4096,
             4096u32.into(),
             4096u32.into(),
+            None,
         );
         let id = StreamId::new(Side::Client, Dir::Uni, 0);
         for offset in (1..32).step_by(2) {
@@ -1594,6 +1604,7 @@ mod tests {
             4096,
             65536u32.into(),
             4096u32.into(),
+            None,
         );
         let ids = [
             StreamId::new(Side::Client, Dir::Uni, 0),
@@ -1641,6 +1652,7 @@ mod tests {
             1024 * 1024,
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
+            None,
         );
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
         let initial_max = client.local_max_data;
@@ -2617,6 +2629,7 @@ mod tests {
             1024 * 1024,
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
+            None,
         );
         // No slots allocated until a stream is actually received.
         assert!(client.recv.is_empty());
