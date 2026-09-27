@@ -400,16 +400,32 @@ impl RecvStream {
         let status = match self.reset {
             Some(code) => ReadStatus::Failed(None, Reset(code)),
             None => {
-                let mut recv = conn.inner.recv_stream(self.stream);
-                let mut chunks = recv.read(ordered).map_err(|e| match e {
-                    ReadableError::ClosedStream => ReadError::ClosedStream,
-                    ReadableError::IllegalOrderedRead => ReadError::ClosedStream,
-                })?;
-                let status = read_fn(&mut chunks);
-                if chunks.finalize().should_transmit() {
-                    conn.wake();
+                let result = {
+                    let mut recv = conn.inner.recv_stream(self.stream);
+                    recv.read(ordered).map(|mut chunks| {
+                        let status = read_fn(&mut chunks);
+                        (status, chunks.finalize().should_transmit())
+                    })
+                };
+                match result {
+                    Ok((status, transmit)) => {
+                        if transmit {
+                            conn.wake();
+                        }
+                        status
+                    }
+                    Err(ReadableError::ReassemblyLimit) => {
+                        let now = conn.runtime.now();
+                        let error = conn.inner.close_for_reassembly_limit(now);
+                        let error = proto::ConnectionError::TransportError(error);
+                        conn.terminate(error.clone(), &self.conn.shared);
+                        conn.wake();
+                        return Poll::Ready(Err(ReadError::ConnectionLost(error)));
+                    }
+                    Err(ReadableError::ClosedStream | ReadableError::IllegalOrderedRead) => {
+                        return Poll::Ready(Err(ReadError::ClosedStream));
+                    }
                 }
-                status
             }
         };
 

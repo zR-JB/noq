@@ -114,12 +114,9 @@ impl Datagrams<'_> {
                 self.conn.datagrams.send_blocked = true;
                 break;
             }
-            self.conn
-                .datagrams
-                .outgoing
-                .push_back(Datagram {
-                    data: Bytes::copy_from_slice(data),
-                });
+            self.conn.datagrams.outgoing.push_back(Datagram {
+                data: Bytes::copy_from_slice(data),
+            });
             queued += 1;
         }
 

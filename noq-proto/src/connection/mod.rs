@@ -367,7 +367,8 @@ impl Connection {
             ),
         )]);
 
-        let crypto_state = CryptoState::new(crypto, init_cid, side, &mut rng);
+        let crypto_state =
+            CryptoState::new(crypto, init_cid, side, &mut rng, config.crypto_buffer_size);
         #[cfg(test)]
         let crypto_state = crypto_state.with_key_phase_size(config.initial_key_phase_size);
 
@@ -2654,6 +2655,13 @@ impl Connection {
         )
     }
 
+    #[doc(hidden)]
+    pub fn close_for_reassembly_limit(&mut self, now: Instant) -> TransportError {
+        let error = TransportError::INTERNAL_ERROR("receive reassembly allocation limit");
+        self.close_inner(now, Close::Connection(error.clone().into()));
+        error
+    }
+
     /// Close the connection immediately, initiated by an API call.
     ///
     /// This will not produce a [`ConnectionLost`] event propagated by the
@@ -4107,7 +4115,9 @@ impl Connection {
         crypto_space
             .crypto_stream
             .insert(crypto.offset, crypto.data.clone(), payload_len)
-            .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer"))?;
+            .map_err(|_| {
+                TransportError::CRYPTO_BUFFER_EXCEEDED("receive reassembly allocation limit")
+            })?;
         while let Some(chunk) = crypto_space.crypto_stream.read(usize::MAX, true) {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
             if self.crypto_state.session.read_handshake(&chunk.bytes)? {
