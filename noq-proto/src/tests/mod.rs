@@ -5338,6 +5338,35 @@ fn regression_initial_coalescing_large_cid() {
 }
 
 #[test]
+fn close_reason_backing_survives_connection_handles() {
+    let mut pair = ConnPair::default();
+    let allocation = pair.conn(Server).receive_allocation_handle();
+    let mut arena = vec![0; 1024 * 1024];
+    arena[..4].copy_from_slice(b"done");
+    let reason = Bytes::from(arena).slice(..4);
+    let now = pair.time;
+    pair.conn_mut(Client)
+        .close(now, VarInt::from_u32(42), reason);
+    assert!(pair.conn(Client).receive_buffer_allocated_bytes() < 1024);
+    pair.drive();
+    let reason = loop {
+        if let Event::ConnectionLost {
+            reason: ConnectionError::ApplicationClosed(close),
+        } = pair.conn_mut(Server).poll().expect("peer close event")
+        {
+            assert_eq!(close.error_code, VarInt::from_u32(42));
+            break close.reason;
+        }
+    };
+    assert_eq!(reason, b"done"[..]);
+    assert!(pair.conn(Server).receive_buffer_allocated_bytes() < 1024);
+    drop(pair);
+    assert!(allocation.has_allocations());
+    drop(reason);
+    assert!(!allocation.has_allocations());
+}
+
+#[test]
 fn pending_control_pressure_closes_connection() {
     let mut pair = ConnPair::default();
     let stream = pair.streams(Client).open(Dir::Uni).unwrap();
