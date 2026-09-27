@@ -1071,10 +1071,11 @@ impl Connection {
         max_datagrams: NonZeroUsize,
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
-        if self
-            .spaces
-            .iter()
-            .any(|space| space.pending.allocation_failed)
+        if self.streams.allocation_failed()
+            || self
+                .spaces
+                .iter()
+                .any(|space| space.pending.allocation_failed)
         {
             self.close_buffer_limit(now);
         }

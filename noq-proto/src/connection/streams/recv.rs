@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{boxed::Box, collections::btree_map::Entry, sync::Arc};
 use core::mem;
 
 use thiserror::Error;
@@ -11,11 +11,10 @@ use crate::connection::{
     assembler::{Assembler, Chunk, OrderingError},
     buffer_budget::BufferBudget,
 };
-use crate::{TransportError, VarInt, frame, hash_map::Entry};
+use crate::{TransportError, VarInt, frame};
 
 #[derive(Debug)]
 pub(super) struct Recv {
-    // NB: when adding or removing fields, remember to update `reinit`.
     state: RecvState,
     pub(super) assembler: Assembler,
     sent_max_stream_data: u64,
@@ -37,16 +36,6 @@ impl Recv {
             stopped: false,
             unread_credit: 0,
         })
-    }
-
-    /// Reset to the initial state
-    pub(super) fn reinit(&mut self, initial_max_data: u64) {
-        self.state = RecvState::default();
-        self.assembler.reinit();
-        self.sent_max_stream_data = initial_max_data;
-        self.end = 0;
-        self.stopped = false;
-        self.unread_credit = 0;
     }
 
     /// Process a STREAM frame
@@ -467,7 +456,7 @@ impl<'a> Chunks<'a> {
                 let state = mem::replace(&mut self.state, ChunksState::Reset(error_code));
                 // At this point if we have `rs` self.state must be `ChunksState::Readable`
                 let recv = match state {
-                    ChunksState::Readable(recv) => StreamRecv::Open(recv),
+                    ChunksState::Readable(recv) => StreamRecv(recv),
                     _ => unreachable!("state must be ChunkState::Readable"),
                 };
                 self.streams.stream_recv_freed(self.id, recv);
@@ -483,7 +472,7 @@ impl<'a> Chunks<'a> {
                     // stream. Any data buffered beyond the reliable size is dropped undelivered.
                     let state = mem::replace(&mut self.state, ChunksState::Reset(error_code));
                     let recv = match state {
-                        ChunksState::Readable(recv) => StreamRecv::Open(recv),
+                        ChunksState::Readable(recv) => StreamRecv(recv),
                         _ => unreachable!("state must be ChunkState::Readable"),
                     };
                     self.streams.stream_recv_freed(self.id, recv);
@@ -498,7 +487,7 @@ impl<'a> Chunks<'a> {
                     let state = mem::replace(&mut self.state, ChunksState::Finished);
                     // At this point if we have `rs` self.state must be `ChunksState::Readable`
                     let recv = match state {
-                        ChunksState::Readable(recv) => StreamRecv::Open(recv),
+                        ChunksState::Readable(recv) => StreamRecv(recv),
                         _ => unreachable!("state must be ChunkState::Readable"),
                     };
                     self.streams.stream_recv_freed(self.id, recv);
@@ -548,9 +537,7 @@ impl<'a> Chunks<'a> {
                 self.pending.queue_max_stream_data(self.id);
             }
             // Return the stream to storage for future use
-            self.streams
-                .recv
-                .insert(self.id, Some(StreamRecv::Open(rs)));
+            self.streams.recv.insert(self.id, Some(StreamRecv(rs)));
         }
 
         // Issue connection-level flow control credit for any data we read regardless of state
