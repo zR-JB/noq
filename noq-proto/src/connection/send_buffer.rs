@@ -17,7 +17,7 @@ pub(super) struct SendBuffer {
     ///
     /// Only data up to the highest contiguous acknowledged offset can be discarded.
     /// We could discard acknowledged in this buffer, but it would require a more
-    /// complex data structure. Instead, we track acknowledged bytes in `acks`.
+    /// complex data structure. Instead, we track acknowledged ranges in `acks`.
     ///
     /// Data keeps track of the base offset of the buffered data.
     data: SendBufferData,
@@ -25,7 +25,7 @@ pub(super) struct SendBuffer {
     ///
     /// Always lies in `data.range()`
     unsent: u64,
-    acks: AckBitmap,
+    acks: ChargedRanges,
     /// Previously transmitted ranges deemed lost and marked for retransmission
     ///
     /// All ranges must be within `data.range().start..(data.range().end - unsent)`, since data
@@ -79,7 +79,7 @@ impl SendBufferData {
         }
     }
 
-    fn available_write(&self) -> usize {
+    fn available_write(&self, reserve: usize) -> usize {
         if let Some(last) = &self.last_segment {
             let available = last.bytes.capacity() - last.bytes.len();
             if available != 0 {
@@ -99,12 +99,17 @@ impl SendBufferData {
             .budget
             .available()
             .saturating_sub(metadata)
+            .saturating_sub(reserve)
             .saturating_sub(OwnedBacking::OVERHEAD_BYTES)
             .min(COPY_BLOCK_BYTES)
     }
 
-    fn prepare_write(&mut self, limit: usize) -> Result<(usize, Allocation), AllocationError> {
-        if limit == 0 || self.available_write() == 0 {
+    fn prepare_write(
+        &mut self,
+        limit: usize,
+        reserve: usize,
+    ) -> Result<(usize, Allocation), AllocationError> {
+        if limit == 0 || self.available_write(reserve) == 0 {
             return Err(AllocationError);
         }
         if let Some(last) = &self.last_segment {
@@ -145,6 +150,7 @@ impl SendBufferData {
             self.allocation
                 .budget
                 .available()
+                .saturating_sub(reserve)
                 .saturating_sub(OwnedBacking::OVERHEAD_BYTES),
         );
         if length == 0 {
@@ -327,152 +333,30 @@ impl SendBufferData {
     }
 }
 
-#[derive(Debug)]
-struct AckBitmap {
-    words: VecDeque<u64>,
-    first_word: u64,
-    allocation: Allocation,
-}
-
-impl AckBitmap {
-    fn new(budget: Arc<BufferBudget>, offset: u64) -> Self {
-        Self {
-            words: VecDeque::new(),
-            first_word: offset / 64,
-            allocation: Allocation { budget, bytes: 0 },
-        }
-    }
-
-    fn available_bits(&self, offset: u64) -> usize {
-        (self
-            .first_word
-            .saturating_add(self.words.capacity() as u64)
-            .saturating_mul(64)
-            .saturating_sub(offset)) as usize
-    }
-
-    fn growth_bytes(&self, offset: u64) -> usize {
-        if self.available_bits(offset) != 0 {
-            return 0;
-        }
-        (self.words.capacity() + 1)
-            .max(self.words.capacity().saturating_mul(2))
-            .saturating_mul(mem::size_of::<u64>())
-    }
-
-    fn reserve(&mut self, end: u64) -> Result<(), AllocationError> {
-        let count =
-            usize::try_from(end.div_ceil(64) - self.first_word).map_err(|_| AllocationError)?;
-        if count > self.words.capacity() {
-            let capacity = count.max(self.words.capacity().saturating_mul(2));
-            let mut allocation = self.allocation.budget.acquire(
-                capacity
-                    .checked_mul(mem::size_of::<u64>())
-                    .ok_or(AllocationError)?,
-            )?;
-            let mut words = VecDeque::new();
-            words
-                .try_reserve_exact(capacity)
-                .map_err(|_| AllocationError)?;
-            allocation.resize(words.capacity() * mem::size_of::<u64>())?;
-            words.extend(mem::take(&mut self.words));
-            self.words = words;
-            self.allocation = allocation;
-        }
-        self.words.resize(count, 0);
-        Ok(())
-    }
-
-    fn mark(&mut self, range: Range<u64>) -> u64 {
-        let mut acknowledged = 0;
-        let mut offset = range.start;
-        while offset < range.end {
-            let shift = offset % 64;
-            let length = (range.end - offset).min(64 - shift);
-            let mask = u64::MAX >> (64 - length);
-            let word = &mut self.words[(offset / 64 - self.first_word) as usize];
-            acknowledged += u64::from(((mask << shift) & !*word).count_ones());
-            *word |= mask << shift;
-            offset += length;
-        }
-        acknowledged
-    }
-
-    fn prefix(&self, range: Range<u64>) -> u64 {
-        let mut offset = range.start;
-        while offset < range.end {
-            let shift = offset % 64;
-            let length = (range.end - offset).min(64 - shift);
-            let word = self.words[(offset / 64 - self.first_word) as usize] >> shift;
-            let acknowledged = u64::from(word.trailing_ones()).min(length);
-            offset += acknowledged;
-            if acknowledged != length {
-                break;
-            }
-        }
-        offset
-    }
-
-    fn discard_prefix(&mut self, offset: u64) {
-        while self.first_word < offset / 64 {
-            self.words.pop_front();
-            self.first_word += 1;
-        }
-        if let Some(first) = self.words.front_mut() {
-            *first &= u64::MAX << (offset % 64);
-        }
-    }
-
-    fn truncate(&mut self, end: u64) {
-        self.words
-            .truncate((end.div_ceil(64) - self.first_word) as usize);
-        if !end.is_multiple_of(64)
-            && let Some(last) = self.words.back_mut()
-        {
-            *last &= u64::MAX >> (64 - end % 64);
-        }
-    }
-
-    fn acknowledged(&self) -> u64 {
-        self.words
-            .iter()
-            .map(|word| u64::from(word.count_ones()))
-            .sum()
-    }
-}
-
 impl SendBuffer {
     /// Construct an empty buffer at the initial offset
     pub(super) fn new(budget: Arc<BufferBudget>) -> Self {
         Self {
             data: SendBufferData::new(budget.clone()),
             unsent: 0,
-            acks: AckBitmap::new(budget.clone(), 0),
+            acks: ChargedRanges::new(&budget),
             retransmits: ChargedRanges::new(&budget),
         }
     }
 
     pub(super) fn can_write(&self) -> bool {
-        self.data.available_write() > self.acks.growth_bytes(self.offset())
+        self.data.available_write(self.range_growth()) != 0
     }
 
     pub(super) fn prepare_write(
         &mut self,
         limit: usize,
     ) -> Result<(usize, Allocation), AllocationError> {
-        let mut limit = limit.min(COPY_BLOCK_BYTES);
-        let end = self
-            .offset()
-            .checked_add(limit as u64)
-            .ok_or(AllocationError)?;
-        if self.acks.reserve(end).is_err() {
-            limit = limit.min(self.acks.available_bits(self.offset()));
-            if limit == 0 {
-                return Err(AllocationError);
-            }
-            self.acks.reserve(self.offset() + limit as u64)?;
-        }
-        self.data.prepare_write(limit)
+        self.data.prepare_write(limit, self.range_growth())
+    }
+
+    fn range_growth(&self) -> usize {
+        self.acks.growth_bytes() + self.retransmits.growth_bytes()
     }
 
     /// Append application data to the end of the stream
@@ -501,10 +385,23 @@ impl SendBuffer {
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
-        let acknowledged = self.acks.mark(range);
-        let prefix = self.acks.prefix(self.data.range());
-        self.data.pop_front((prefix - base_offset) as usize);
-        self.acks.discard_prefix(prefix);
+        let duplicate: u64 = self
+            .acks
+            .ranges
+            .iter_range(range.clone())
+            .map(|acked| acked.end - acked.start)
+            .sum();
+        let acknowledged = range.end - range.start - duplicate;
+        if range.start == base_offset {
+            self.data.pop_front((range.end - base_offset) as usize);
+            self.acks.ranges.remove(0..range.end);
+        } else {
+            self.acks.try_insert(range)?;
+        }
+        while self.acks.ranges.min() == Some(self.fully_acked_offset()) {
+            let prefix = self.acks.ranges.pop_min().unwrap();
+            self.data.pop_front((prefix.end - prefix.start) as usize);
+        }
 
         // Remove retransmit ranges which have been acknowledged
         //
@@ -519,7 +416,7 @@ impl SendBuffer {
         if self.data.len == 0 {
             let budget = self.data.allocation.budget.clone();
             self.data.release_empty_segments();
-            self.acks = AckBitmap::new(budget.clone(), self.fully_acked_offset());
+            self.acks = ChargedRanges::new(&budget);
             self.retransmits = ChargedRanges::new(&budget);
         }
     }
@@ -539,7 +436,7 @@ impl SendBuffer {
         // We no longer have the discarded data, so we must not try to send or track it.
         self.unsent = self.unsent.min(new_end);
         self.retransmits.ranges.remove(new_end..old_end);
-        self.acks.truncate(new_end);
+        self.acks.ranges.remove(new_end..old_end);
         self.release_empty_storage();
     }
 
@@ -664,7 +561,7 @@ impl SendBuffer {
 
     /// Compute the amount of data that hasn't been acknowledged
     pub(super) fn unacked(&self) -> u64 {
-        self.data.len() as u64 - self.acks.acknowledged()
+        self.data.len() as u64 - self.acks.ranges.elts_count()
     }
 }
 
@@ -777,29 +674,6 @@ mod tests {
     }
 
     #[test]
-    fn sparse_acks_never_allocate_with_exhausted_storage() {
-        let budget = BufferBudget::new(64 * 1024, None);
-        let mut buf = SendBuffer::new(budget.clone());
-        let data = vec![7; 64 * 1024];
-        while let Ok((length, allocation)) = buf.prepare_write(data.len()) {
-            buf.write_reserved(&data[..length], allocation);
-        }
-        let end = buf.offset();
-        buf.poll_transmit(100_000);
-        let allocated = budget.used();
-        for offset in (1..end).step_by(2) {
-            buf.ack(offset..offset + 1).unwrap();
-        }
-        assert_eq!(budget.used(), allocated);
-        assert_eq!(buf.unacked(), end.div_ceil(2));
-        for offset in (0..end).step_by(2) {
-            buf.ack(offset..offset + 1).unwrap();
-        }
-        assert!(buf.is_fully_acked());
-        assert_eq!(budget.used(), 0);
-    }
-
-    #[test]
     fn sparse_losses_retransmit_with_exhausted_storage() {
         let budget = BufferBudget::new(64 * 1024, None);
         let mut buf = SendBuffer::new(budget.clone());
@@ -809,6 +683,7 @@ mod tests {
         }
         let end = buf.offset();
         buf.poll_transmit(100_000);
+        let _exhausted = budget.acquire(budget.available()).unwrap();
         let allocated = budget.used();
         for offset in (1..40).step_by(2) {
             buf.retransmit(offset..offset + 1).unwrap();
@@ -925,7 +800,7 @@ mod tests {
         assert_eq!(aggregate_unacked(&buf), MSG);
         buf.ack(0..16).unwrap();
         assert_eq!(aggregate_unacked(&buf), &MSG[23..]);
-        assert_eq!(buf.acks.acknowledged(), 0);
+        assert!(buf.acks.ranges.is_empty());
     }
 
     #[test]

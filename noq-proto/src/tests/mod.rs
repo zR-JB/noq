@@ -5161,13 +5161,13 @@ fn congestion_blocked_ack_defers_ping() {
 
 #[test]
 fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
-    assert!(bidirectional_metadata_pressure(17, 19)?.untracked_probes > 0);
+    assert!(bidirectional_metadata_pressure(6, 19)?.untracked_probes > 0);
     Ok(())
 }
 
 #[test]
 fn packet_metadata_pressure_preserves_stream_credit() -> TestResult {
-    assert!(bidirectional_metadata_pressure(19, 17)?.reads_while_blocked > 0);
+    assert!(bidirectional_metadata_pressure(11, 22)?.reads_while_blocked > 0);
     Ok(())
 }
 

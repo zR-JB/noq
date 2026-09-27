@@ -256,7 +256,6 @@ where
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn min(&self) -> Option<T> {
         self.iter().next().map(|x| x.start)
     }

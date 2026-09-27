@@ -927,9 +927,10 @@ impl StreamsState {
             frame.offsets.end = frame.offsets.end.min(reliable_size);
             frame.offsets.start = frame.offsets.start.min(frame.offsets.end);
         }
-        let (finished, acknowledged) = stream
-            .ack(frame)
-            .map_err(|_| TransportError::INTERNAL_ERROR("send buffer allocation limit"))?;
+        let Ok((finished, acknowledged)) = stream.ack(frame.clone()) else {
+            // No storage to record this ACK gap: resend the range so a later ACK records it
+            return self.retransmit(frame);
+        };
         self.unacked_data -= acknowledged;
         if !finished {
             // The stream is unfinished or may still need retransmits
@@ -2880,23 +2881,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ack_gap_cannot_reopen_retained_send_storage() {
+    fn uni_sender(send_window: u64) -> (StreamsState, StreamId) {
         let mut sender = make(Side::Server);
-        sender.set_send_window(64 * 1024);
+        sender.set_send_window(send_window);
         sender.set_params(&TransportParameters {
             initial_max_data: VarInt::MAX,
             initial_max_stream_data_uni: VarInt::MAX,
             initial_max_streams_uni: 1u32.into(),
             ..TransportParameters::default()
         });
-        let conn_state = ConnState::established();
         let id = Streams {
             state: &mut sender,
-            conn_state: &conn_state,
+            conn_state: &ConnState::established(),
         }
         .open(Dir::Uni)
         .unwrap();
+        (sender, id)
+    }
+
+    #[test]
+    fn ack_gap_cannot_reopen_retained_send_storage() {
+        let (mut sender, id) = uni_sender(64 * 1024);
+        let conn_state = ConnState::established();
         let data = vec![7; 64 * 1024];
         let mut stream = SendStream {
             id,
@@ -2926,7 +2932,13 @@ mod tests {
                 .unwrap();
         }
         let retransmitted = stream.state.write_frames_for_test(100_000, true);
-        assert_eq!(retransmitted.first().unwrap().offsets, 0..end);
+        assert_eq!(
+            retransmitted
+                .iter()
+                .map(|frame| frame.offsets.clone())
+                .collect::<Vec<_>>(),
+            [0..10, 20..30, 40..50]
+        );
         stream
             .state
             .received_ack_of(frame::StreamMeta {
@@ -2978,6 +2990,43 @@ mod tests {
             })
             .unwrap();
         assert!(stream.write(&data).is_ok());
+    }
+
+    #[test]
+    fn unrecorded_ack_gaps_are_resent() {
+        let (mut sender, id) = uni_sender(64 * 1024);
+        let mut stream = SendStream {
+            id,
+            state: &mut sender,
+            conn_state: &ConnState::established(),
+        };
+        while stream.write(&[7; 1024]).is_ok() {}
+        let budget = sender.send_budget();
+        let exhausted = budget.acquire(budget.available()).unwrap();
+        let used = budget.used();
+        let mut sent = Vec::new();
+        loop {
+            let frames = sender.write_frames_for_test(1200, true);
+            if frames.is_empty() {
+                break;
+            }
+            sent.extend(frames);
+        }
+        for frame in sent.into_iter().skip(1).step_by(2) {
+            sender.received_ack_of(frame).unwrap();
+        }
+        assert_eq!(budget.used(), used);
+        loop {
+            let frames = sender.write_frames_for_test(1200, true);
+            if frames.is_empty() {
+                break;
+            }
+            for frame in frames {
+                sender.received_ack_of(frame).unwrap();
+            }
+        }
+        assert_eq!(sender.unacked_data, 0);
+        assert_eq!(budget.used(), exhausted.bytes);
     }
 
     #[test]
