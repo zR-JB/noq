@@ -5599,6 +5599,40 @@ fn stream_control_survives_packet_metadata_pressure() {
 }
 
 #[test]
+fn untracked_probes_back_off_from_their_send_time() {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .with_latency(Duration::from_millis(10))
+        .disable_mtud_discovery()
+        .connect();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(b"lost").unwrap();
+    let mut sends = Vec::new();
+    let mut datagrams = pair.stats(Client).udp_tx.datagrams;
+    let _charged = loop {
+        pair.drive_client();
+        pair.server.inbound.clear();
+        if pair.stats(Client).udp_tx.datagrams > datagrams {
+            sends.push(pair.time);
+            break pair.conn_mut(Client).exhaust_packet_metadata();
+        }
+        assert!(pair.advance_time());
+    };
+    while sends.len() < 3 {
+        assert!(pair.advance_time());
+        pair.drive_client();
+        pair.server.inbound.clear();
+        let sent = pair.stats(Client).udp_tx.datagrams;
+        if sent > datagrams && sends.last() != Some(&pair.time) {
+            sends.push(pair.time);
+        }
+        datagrams = sent;
+    }
+    assert!(pair.conn(Client).packet_metadata_blocked());
+    assert_eq!(sends[2] - sends[1], 2 * (sends[1] - sends[0]));
+}
+
+#[test]
 fn packet_pressure_ack_avoids_untracked_mtu_padding() {
     let transport = TransportConfig {
         pad_to_mtu: true,

@@ -316,7 +316,19 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             conn.close_buffer_limit(now);
             return;
         }
+        if ack_eliciting {
+            conn.spaces[space_id]
+                .for_path(path_id)
+                .time_of_last_ack_eliciting_packet = Some(now);
+            if conn.path_data(path_id).permit_idle_reset {
+                conn.reset_idle_timeout(now, space_id.kind(), path_id);
+            }
+            conn.path_data_mut(path_id).permit_idle_reset = false;
+        }
         if !track {
+            if ack_eliciting {
+                conn.set_loss_detection_timer(now, path_id);
+            }
             return;
         }
 
@@ -350,13 +362,6 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         conn.reset_keep_alive(path_id, now);
         if size != 0 {
             if ack_eliciting {
-                conn.spaces[space_id]
-                    .for_path(path_id)
-                    .time_of_last_ack_eliciting_packet = Some(now);
-                if conn.path_data(path_id).permit_idle_reset {
-                    conn.reset_idle_timeout(now, space_id.kind(), path_id);
-                }
-                conn.path_data_mut(path_id).permit_idle_reset = false;
                 conn.path_data_mut(path_id)
                     .congestion
                     .on_packet_sent(now, size, packet_number)
