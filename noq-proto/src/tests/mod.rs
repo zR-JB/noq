@@ -5633,6 +5633,43 @@ fn untracked_probes_back_off_from_their_send_time() {
 }
 
 #[test]
+fn untracked_largest_acknowledged_keeps_ecn_and_rtt() {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .with_latency(Duration::from_millis(10))
+        .disable_mtud_discovery()
+        .connect();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(b"marked").unwrap();
+    pair.congestion_experienced = true;
+    pair.drive_client();
+    pair.congestion_experienced = false;
+    pair.drive();
+    let before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(before.congestion_events, 1);
+
+    pair.send_stream(Client, stream).write(b"held").unwrap();
+    pair.drive_client();
+    let _charged = pair.conn_mut(Client).exhaust_packet_metadata();
+    pair.routes.set_latency(Duration::from_millis(50));
+    let sent = pair.stats(Client).udp_tx.datagrams;
+    pair.congestion_experienced = true;
+    while pair.stats(Client).udp_tx.datagrams == sent {
+        pair.time = pair.poll_timeout(Client).unwrap();
+        pair.drive_client();
+    }
+    pair.congestion_experienced = false;
+    for _ in 0..2 {
+        pair.time += Duration::from_millis(50);
+        pair.drive_server();
+        pair.drive_client();
+    }
+    let after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert!(after.cwnd < before.cwnd);
+    assert!(after.rtt > before.rtt);
+}
+
+#[test]
 fn packet_pressure_ack_avoids_untracked_mtu_padding() {
     let transport = TransportConfig {
         pad_to_mtu: true,

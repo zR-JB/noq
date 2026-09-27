@@ -3144,7 +3144,7 @@ impl Connection {
         if ack.largest >= self.spaces[space].for_path(path).next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
-        // `Some(pn)` if this ACK raised `largest_acked_packet_pn`, with its send time if tracked.
+        // `Some(pn)` if this ACK raised `largest_acked_packet_pn`, with its send time if known.
         let (new_largest_pn, largest_sent) = {
             let space = &mut self.spaces[space].for_path(path);
             if space
@@ -3152,12 +3152,9 @@ impl Connection {
                 .is_none_or(|pn| ack.largest > pn)
             {
                 space.largest_acked_packet_pn = Some(ack.largest);
-                let sent = space
-                    .sent_packets
-                    .get(ack.largest)
-                    .map(|info| info.time_sent);
-                if let Some(sent) = sent {
-                    space.largest_acked_packet_send_time = sent;
+                let sent = space.sent_info(ack.largest);
+                if let Some((time_sent, _)) = sent {
+                    space.largest_acked_packet_send_time = time_sent;
                 }
                 (Some(ack.largest), sent)
             } else {
@@ -3190,7 +3187,7 @@ impl Connection {
             return Ok(());
         }
 
-        let mut ack_eliciting_acked = false;
+        let mut ack_eliciting_acked = largest_sent.is_some_and(|(_, ack_eliciting)| ack_eliciting);
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].for_path(path).take(packet) {
                 for (acked_path_id, acked_pn) in info.largest_acked.iter() {
@@ -3231,8 +3228,8 @@ impl Connection {
             .congestion
             .on_end_acks(now, in_flight, app_limited, largest_ackd);
 
-        // An untracked largest has no send time, and an older one would inflate the sample
-        if let Some(largest_sent) = largest_sent
+        // Without the largest's send time an older one would inflate the sample
+        if let Some((largest_sent, _)) = largest_sent
             && ack_eliciting_acked
         {
             let ack_delay = if space != SpaceId::Data {

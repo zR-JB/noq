@@ -270,6 +270,8 @@ pub(super) struct PacketNumberSpace {
     /// Packets that were deemed lost
     // Older packets are regularly removed in `Connection::drain_lost_packets`.
     pub(super) lost_packets: PacketMap<LostPacket>,
+    /// Number, send time and ack-elicitation of the latest untracked packets, newest first
+    untracked: [Option<(u64, Instant, bool)>; 8],
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(super) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -332,6 +334,7 @@ impl PacketNumberSpace {
             unacked_non_ack_eliciting_tail: 0,
             sent_packets: PacketMap::new(budget.clone()),
             lost_packets: PacketMap::new(budget),
+            untracked: [None; 8],
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
             pending_ping: false,
@@ -362,6 +365,7 @@ impl PacketNumberSpace {
             unacked_non_ack_eliciting_tail: 0,
             sent_packets: PacketMap::new(budget.clone()),
             lost_packets: PacketMap::new(budget),
+            untracked: [None; 8],
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
             pending_ping: false,
@@ -449,6 +453,24 @@ impl PacketNumberSpace {
         // congestion check obvious.
         self.ecn_feedback = ecn;
         Ok(ce_increase != 0)
+    }
+
+    pub(super) fn sent_untracked(&mut self, number: u64, time_sent: Instant, ack_eliciting: bool) {
+        self.untracked.rotate_right(1);
+        self.untracked[0] = Some((number, time_sent, ack_eliciting));
+    }
+
+    pub(super) fn sent_info(&self, number: u64) -> Option<(Instant, bool)> {
+        self.sent_packets
+            .get(number)
+            .map(|info| (info.time_sent, info.ack_eliciting))
+            .or_else(|| {
+                self.untracked
+                    .iter()
+                    .flatten()
+                    .find(|packet| packet.0 == number)
+                    .map(|&(_, time_sent, ack_eliciting)| (time_sent, ack_eliciting))
+            })
     }
 
     /// Stop tracking sent packet `number`, and return what we knew about it
