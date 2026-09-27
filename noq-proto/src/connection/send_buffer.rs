@@ -1191,7 +1191,7 @@ pub mod send_buffer_benches {
     use bytes::Bytes;
     use criterion::Criterion;
 
-    use super::SendBuffer;
+    use super::{BufferBudget, SendBuffer};
 
     /// Pathological case: many segments, get from end
     pub fn get_into_many_segments(criterion: &mut Criterion) {
