@@ -5111,6 +5111,11 @@ fn packet_metadata_pressure_preserves_stream_credit() -> TestResult {
     bidirectional_metadata_pressure(19, 17)
 }
 
+#[test]
+fn packet_metadata_pressure_acknowledges_when_congestion_blocked() -> TestResult {
+    bidirectional_metadata_pressure(7, 7)
+}
+
 fn bidirectional_metadata_pressure(server_drop: usize, client_drop: usize) -> TestResult {
     let mut transport = TransportConfig::default();
     transport.send_window(64 * 1024);
@@ -5175,6 +5180,7 @@ fn bidirectional_metadata_pressure(server_drop: usize, client_drop: usize) -> Te
             break;
         }
         steps += 1;
+        assert!(steps <= 20_000, "delivery did not finish");
         idle = !pair.blackhole_step(steps % server_drop == 0, steps % client_drop == 0);
     }
     assert!(metadata_blocked);

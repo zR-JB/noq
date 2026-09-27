@@ -1533,7 +1533,7 @@ impl Connection {
                 .reserve_entry()
                 .and_then(|()| self.packet_budget.acquire(ack_metadata_bytes))
                 .ok();
-            let allocation = allocation.filter(|_| {
+            let mut allocation = allocation.filter(|_| {
                 let pending = !self.spaces[space_id].pending.is_empty(&self.streams)
                     || space_id == SpaceId::Data && self.streams.can_send_control();
                 let probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
@@ -1548,7 +1548,7 @@ impl Connection {
                 };
                 self.packet_budget.available() >= reserve
             });
-            let track = allocation.is_some();
+            let mut track = allocation.is_some();
             let mut can_send =
                 self.space_can_send(space_id, path_id, max_packet_size, connection_close_pending);
             if !track {
@@ -1605,12 +1605,22 @@ impl Connection {
                 };
             }
 
-            // We want to send on this space, check congestion control if we can. But only
-            // if we will need to start a new datagram. If we are coalescing into an already
-            // started datagram we do not need to check congestion control again.
+            // Congestion control applies when starting a new datagram, not when coalescing into
+            // one. A full window still lets due ACKs out untracked: ACK-only packets are not
+            // congestion controlled (RFC 9002 §7).
             if transmit.datagram_remaining_mut() == 0 {
-                let path_blocked =
+                let mut path_blocked =
                     self.path_congestion_check(space_id, path_id, transmit, &can_send, now);
+                if path_blocked == PathBlocked::Congestion
+                    && can_send.acks
+                    && scheduling_info.may_send_data
+                    && !scheduling_info.is_abandoned
+                {
+                    allocation = None;
+                    track = false;
+                    can_send.other = false;
+                    path_blocked = PathBlocked::No;
+                }
                 if path_blocked != PathBlocked::No {
                     // Previous iterations of this loop may have built packets already.
                     return match last_packet_number {
