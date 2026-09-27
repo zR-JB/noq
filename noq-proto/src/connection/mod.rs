@@ -3133,21 +3133,24 @@ impl Connection {
         if ack.largest >= self.spaces[space].for_path(path).next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
-        // `Some(pn)` if this ACK raised `largest_acked_packet_pn`.
-        let new_largest_pn = {
+        // `Some(pn)` if this ACK raised `largest_acked_packet_pn`, with its send time if tracked.
+        let (new_largest_pn, largest_sent) = {
             let space = &mut self.spaces[space].for_path(path);
             if space
                 .largest_acked_packet_pn
                 .is_none_or(|pn| ack.largest > pn)
             {
                 space.largest_acked_packet_pn = Some(ack.largest);
-                // Untracked ACK-only and probe packets keep the previous send time
-                if let Some(info) = space.sent_packets.get(ack.largest) {
-                    space.largest_acked_packet_send_time = info.time_sent;
+                let sent = space
+                    .sent_packets
+                    .get(ack.largest)
+                    .map(|info| info.time_sent);
+                if let Some(sent) = sent {
+                    space.largest_acked_packet_send_time = sent;
                 }
-                Some(ack.largest)
+                (Some(ack.largest), sent)
             } else {
-                None
+                (None, None)
             }
         };
 
@@ -3217,7 +3220,10 @@ impl Connection {
             .congestion
             .on_end_acks(now, in_flight, app_limited, largest_ackd);
 
-        if new_largest_pn.is_some() && ack_eliciting_acked {
+        // An untracked largest has no send time, and an older one would inflate the sample
+        if let Some(largest_sent) = largest_sent
+            && ack_eliciting_acked
+        {
             let ack_delay = if space != SpaceId::Data {
                 Duration::from_micros(0)
             } else {
@@ -3226,11 +3232,7 @@ impl Connection {
                     Duration::from_micros(ack.delay << self.peer_params.ack_delay_exponent.0),
                 )
             };
-            let rtt = now.saturating_duration_since(
-                self.spaces[space]
-                    .for_path(path)
-                    .largest_acked_packet_send_time,
-            );
+            let rtt = now.saturating_duration_since(largest_sent);
 
             let next_pn = self.spaces[space].for_path(path).next_packet_number;
             let path_data = self.path_data_mut(path);

@@ -5116,6 +5116,11 @@ fn packet_metadata_pressure_acknowledges_when_congestion_blocked() -> TestResult
     bidirectional_metadata_pressure(7, 7)
 }
 
+#[test]
+fn packet_metadata_pressure_samples_rtt_from_tracked_packets() -> TestResult {
+    bidirectional_metadata_pressure(6, 5)
+}
+
 fn bidirectional_metadata_pressure(server_drop: usize, client_drop: usize) -> TestResult {
     let mut transport = TransportConfig::default();
     transport.send_window(64 * 1024);
