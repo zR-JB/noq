@@ -91,7 +91,7 @@ pub use spaces::Retransmits;
 #[cfg(not(fuzzing))]
 use spaces::Retransmits;
 pub(crate) use spaces::SpaceKind;
-use spaces::{OpenStatus, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
+use spaces::{ControlKind, OpenStatus, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
@@ -609,8 +609,7 @@ impl Connection {
         if !self.remote_cids.contains_key(&path_id) {
             self.spaces[SpaceId::Data]
                 .pending
-                .path_cids_blocked
-                .insert(path_id, VarInt(0));
+                .queue_path_cids_blocked(path_id, VarInt(0));
             return Err(PathError::RemoteCidsExhausted);
         }
 
@@ -702,9 +701,7 @@ impl Connection {
 
         let pending_space = &mut self.spaces[SpaceId::Data].pending;
         // Send PATH_ABANDON
-        pending_space
-            .path_abandon
-            .insert(path_id, reason.error_code());
+        pending_space.queue_path_abandon(path_id, reason.error_code());
 
         // Remove pending NEW CIDs for this path
         pending_space.new_cids.retain(|cid| cid.path_id != path_id);
@@ -854,8 +851,7 @@ impl Connection {
             Some(prev) => {
                 self.spaces[SpaceId::Data]
                     .pending
-                    .path_status
-                    .insert(path_id);
+                    .queue_path_status(path_id);
                 prev
             }
             None => path.local_status(),
@@ -1036,8 +1032,7 @@ impl Connection {
             debug!(%path_id, "Remote opened path without issuing CIDs");
             self.spaces[SpaceId::Data]
                 .pending
-                .path_cids_blocked
-                .insert(path_id, VarInt(0));
+                .queue_path_cids_blocked(path_id, VarInt(0));
             // Do not abandon this path right away. CIDs might be in-flight still and arrive
             // soon. It is up to the remote to handle this situation.
         }
@@ -1061,6 +1056,13 @@ impl Connection {
         max_datagrams: NonZeroUsize,
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
+        if self
+            .spaces
+            .iter()
+            .any(|space| space.pending.allocation_failed)
+        {
+            self.close_buffer_limit(now);
+        }
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => NonZeroUsize::MIN,
             true => max_datagrams,
@@ -1520,11 +1522,33 @@ impl Connection {
                 // A new datagram needs to be started.
                 transmit.segment_size()
             };
-            let track = self.spaces[space_id]
+            let ack_metadata_bytes = self.spaces[space_id]
+                .number_spaces
+                .values()
+                .filter(|space| !space.pending_acks.ranges().is_empty())
+                .count()
+                .saturating_mul(packet_map::btree_entry_lease::<PathId, u64>());
+            let allocation = self.spaces[space_id]
                 .for_path(path_id)
                 .sent_packets
                 .reserve_entry()
-                .is_ok();
+                .and_then(|()| self.packet_budget.acquire(ack_metadata_bytes))
+                .ok();
+            let allocation = allocation.filter(|_| {
+                let pending = !self.spaces[space_id].pending.is_empty(&self.streams);
+                let probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
+                let reserve = if pending {
+                    Retransmits::first_control_bytes()
+                } else if probe {
+                    0
+                } else {
+                    packet_map::btree_entry_lease::<u64, SentPacket>()
+                        .saturating_add(ack_metadata_bytes)
+                        .saturating_add(2 * Retransmits::first_control_bytes())
+                };
+                self.packet_budget.available() >= reserve
+            });
+            let track = allocation.is_some();
             let mut can_send =
                 self.space_can_send(space_id, path_id, max_packet_size, connection_close_pending);
             if !track {
@@ -1662,9 +1686,9 @@ impl Connection {
                 prev.update_unacked = false;
             }
 
-            let Some(mut builder) =
-                PacketBuilder::new(now, space_id, path_id, remote_cid, transmit, self, track)
-            else {
+            let Some(mut builder) = PacketBuilder::new(
+                now, space_id, path_id, remote_cid, transmit, self, allocation,
+            ) else {
                 // Confidentiality limit is exceeded and the connection has been killed. We
                 // should not send any other packets. This works in a roundabout way: We
                 // have started a datagram but not written anything into it. So even if we
@@ -1897,7 +1921,7 @@ impl Connection {
             active_cid,
             &mut transmit,
             self,
-            true,
+            Some(self.packet_budget.acquire(0).ok()?),
         )?;
 
         // We implement MTU probes as ping packets padded up to the probe size
@@ -2078,8 +2102,15 @@ impl Connection {
         // sent once, immediately after migration, when the CID is known to be valid. Even
         // if a post-migration packet caused the CID to be retired, it's fair to pretend
         // this is sent first.
-        let mut builder =
-            PacketBuilder::new(now, SpaceId::Data, path_id, *prev_cid, buf, self, true)?;
+        let mut builder = PacketBuilder::new(
+            now,
+            SpaceId::Data,
+            path_id,
+            *prev_cid,
+            buf,
+            self,
+            Some(self.packet_budget.acquire(0).ok()?),
+        )?;
         let challenge = frame::PathChallenge(token);
         let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
         builder.write_frame_with_log_msg(challenge, stats, Some("validating previous path"));
@@ -2134,7 +2165,15 @@ impl Connection {
         let buf = &mut TransmitBuf::new(buf, NonZeroUsize::MIN, MIN_INITIAL_SIZE.into());
         buf.start_new_datagram();
 
-        let mut builder = PacketBuilder::new(now, SpaceId::Data, path_id, cid, buf, self, true)?;
+        let mut builder = PacketBuilder::new(
+            now,
+            SpaceId::Data,
+            path_id,
+            cid,
+            buf,
+            self,
+            Some(self.packet_budget.acquire(0).ok()?),
+        )?;
         let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
         builder.write_frame_with_log_msg(frame, stats, Some("(off-path)"));
 
@@ -2213,8 +2252,15 @@ impl Connection {
         let mut buf = TransmitBuf::new(buf, NonZeroUsize::MIN, MIN_INITIAL_SIZE.into());
         buf.start_new_datagram();
 
-        let mut builder =
-            PacketBuilder::new(now, SpaceId::Data, path_id, cid, &mut buf, self, true)?;
+        let mut builder = PacketBuilder::new(
+            now,
+            SpaceId::Data,
+            path_id,
+            cid,
+            &mut buf,
+            self,
+            Some(self.packet_budget.acquire(0).ok()?),
+        )?;
         let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
         builder.write_frame_with_log_msg(frame, stats, Some("(nat-traversal)"));
         // Off-path: not tracked in congestion control. The packet is sent to a
@@ -2374,7 +2420,7 @@ impl Connection {
                 cid_state.new_cids(&ids, now);
 
                 ids.into_iter().rev().for_each(|frame| {
-                    self.spaces[SpaceId::Data].pending.new_cids.push(frame);
+                    self.spaces[SpaceId::Data].pending.queue_new_cids(frame);
                 });
                 // Always update Timer::PushNewCid
                 self.reset_cid_retirement(now);
@@ -2696,6 +2742,15 @@ impl Connection {
         let error = TransportError::INTERNAL_ERROR("buffer allocation limit");
         self.close_inner(now, Close::Connection(error.clone().into()));
         error
+    }
+
+    fn close_buffer_limit(&mut self, now: Instant) {
+        if self.state.is_closed() {
+            return;
+        }
+        let error = TransportError::from(buffer_budget::AllocationError);
+        self.close_inner(now, Close::Connection(error.clone().into()));
+        self.state.move_to_closed(error);
     }
 
     /// Close the connection immediately, initiated by an API call.
@@ -4212,10 +4267,13 @@ impl Connection {
             }
             self.crypto_state.spaces[space].crypto_offset += outgoing.len() as u64;
             trace!("wrote {} {:?} CRYPTO bytes", outgoing.len(), space);
-            self.spaces[space].pending.crypto.push_back(frame::Crypto {
-                offset,
-                data: outgoing,
-            });
+            self.spaces[space].pending.queue_crypto(
+                frame::Crypto {
+                    offset,
+                    data: outgoing,
+                },
+                false,
+            );
         }
         Ok(())
     }
@@ -4728,10 +4786,13 @@ impl Connection {
                         self.packet_budget.clone(),
                     );
                     space.for_path(path_id).next_packet_number = next_pn;
-                    space.pending.crypto.push_back(frame::Crypto {
-                        offset: 0,
-                        data: client_hello,
-                    });
+                    space.pending.queue_crypto(
+                        frame::Crypto {
+                            offset: 0,
+                            data: client_hello,
+                        },
+                        false,
+                    );
                     space
                 };
 
@@ -4810,7 +4871,8 @@ impl Connection {
                             self.streams.zero_rtt_rejected();
 
                             // Discard already-queued frames
-                            self.spaces[SpaceId::Data].pending = Retransmits::default();
+                            self.spaces[SpaceId::Data].pending =
+                                Retransmits::with_budget(self.packet_budget.clone());
 
                             // Discard 0-RTT packets
                             let sent_packets = self.spaces[SpaceId::Data]
@@ -5283,14 +5345,13 @@ impl Connection {
                             self.open_nat_traversed_paths(now);
                         }
                         Ok(Some((retired, reset_token))) => {
-                            let pending_retired =
-                                &mut self.spaces[SpaceId::Data].pending.retire_cids;
+                            let pending = &mut self.spaces[SpaceId::Data].pending;
                             /// Ensure `pending_retired` cannot grow without bound. Limit is
                             /// somewhat arbitrary but very permissive.
                             const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
                             // We don't bother counting in-flight frames because those are bounded
                             // by congestion control.
-                            if (pending_retired.len() as u64)
+                            if (pending.retire_cids.len() as u64)
                                 .saturating_add(retired.end.saturating_sub(retired.start))
                                 > MAX_PENDING_RETIRED_CIDS
                             {
@@ -5298,7 +5359,9 @@ impl Connection {
                                     "queued too many retired CIDs",
                                 ));
                             }
-                            pending_retired.extend(retired.map(|seq| (path_id, seq)));
+                            for seq in retired {
+                                pending.queue_retire_cids((path_id, seq));
+                            }
                             self.set_reset_token(path_id, network_path.remote, reset_token);
                             self.open_nat_traversed_paths(now);
                         }
@@ -5312,8 +5375,7 @@ impl Connection {
                             // was retired all at once via retire_prior_to.
                             self.spaces[SpaceId::Data]
                                 .pending
-                                .retire_cids
-                                .push((path_id, frame.sequence));
+                                .queue_retire_cids((path_id, frame.sequence));
                             continue;
                         }
                     };
@@ -6086,10 +6148,11 @@ impl Connection {
             };
 
             // Retire the current remote CID and any CIDs we had to skip.
-            self.spaces[SpaceId::Data]
-                .pending
-                .retire_cids
-                .extend(retired.map(|seq| (path_id, seq)));
+            for seq in retired {
+                self.spaces[SpaceId::Data]
+                    .pending
+                    .queue_retire_cids((path_id, seq));
+            }
 
             debug_assert!(!self.state.is_drained()); // required for endpoint_events, checked above
             self.endpoint_events
@@ -6108,10 +6171,11 @@ impl Connection {
         };
 
         // Retire the current remote CID and any CIDs we had to skip.
-        self.spaces[SpaceId::Data]
-            .pending
-            .retire_cids
-            .extend(retired.map(|seq| (path_id, seq)));
+        for seq in retired {
+            self.spaces[SpaceId::Data]
+                .pending
+                .queue_retire_cids((path_id, seq));
+        }
         let remote = self.path_data(path_id).network_path.remote;
         self.set_reset_token(path_id, remote, reset_token);
     }
@@ -6246,6 +6310,8 @@ impl Connection {
         if !is_0rtt
             && !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
+            && space.pending.handshake_done
+            && builder.reserve_control(ControlKind::Inline)
             && mem::replace(&mut space.pending.handshake_done, false)
         {
             builder.write_frame(frame::HandshakeDone, stats);
@@ -6273,6 +6339,8 @@ impl Connection {
         // ACK_FREQUENCY
         if !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
+            && space.pending.ack_frequency
+            && builder.reserve_control(ControlKind::Inline)
             && mem::replace(&mut space.pending.ack_frequency, false)
         {
             let sequence_number = self.ack_frequency.next_sequence_number();
@@ -6335,7 +6403,7 @@ impl Connection {
 
             if is_multipath_negotiated && !path.validated && path.pending_challenge {
                 // queue informing the path status along with the challenge
-                space.pending.path_status.insert(path_id);
+                space.pending.queue_path_status(path_id);
             }
 
             // Always include an OBSERVED_ADDR frame with a PATH_CHALLENGE, regardless
@@ -6373,6 +6441,8 @@ impl Connection {
             && !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && frame::AddAddress::SIZE_BOUND <= builder.frame_space_remaining()
+            && !space.pending.add_address.is_empty()
+            && builder.reserve_control(ControlKind::AddAddress)
         {
             if let Some(added_address) = space.pending.add_address.pop_last() {
                 builder.write_frame(added_address, stats);
@@ -6386,6 +6456,8 @@ impl Connection {
             && !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && frame::RemoveAddress::SIZE_BOUND <= builder.frame_space_remaining()
+            && !space.pending.remove_address.is_empty()
+            && builder.reserve_control(ControlKind::RemoveAddress)
         {
             if let Some(removed_address) = space.pending.remove_address.pop_last() {
                 builder.write_frame(removed_address, stats);
@@ -6397,6 +6469,8 @@ impl Connection {
         // REACH_OUT
         while !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
+            && !space.pending.reach_out.is_empty()
+            && builder.reserve_control(ControlKind::ReachOut)
             && let Some(reach_out) = space
                 .pending
                 .reach_out
@@ -6410,6 +6484,8 @@ impl Connection {
             && scheduling_info.is_abandoned
             && scheduling_info.may_self_abandon
             && frame::PathAbandon::SIZE_BOUND <= builder.frame_space_remaining()
+            && space.pending.path_abandon.contains_key(&path_id)
+            && builder.reserve_control(ControlKind::PathAbandon)
             && let Some(error_code) = space.pending.path_abandon.remove(&path_id)
         {
             let frame = frame::PathAbandon {
@@ -6425,6 +6501,8 @@ impl Connection {
         while space_id == SpaceId::Data
             && scheduling_info.may_send_data
             && frame::PathAbandon::SIZE_BOUND <= builder.frame_space_remaining()
+            && !space.pending.path_abandon.is_empty()
+            && builder.reserve_control(ControlKind::PathAbandon)
             && let Some((abandoned_path_id, error_code)) = space.pending.path_abandon.pop_first()
         {
             let frame = frame::PathAbandon {
@@ -6458,6 +6536,9 @@ impl Connection {
             && scheduling_info.may_send_data
             && builder.frame_space_remaining() > frame::Crypto::SIZE_BOUND
         {
+            if !space.pending.crypto.is_empty() && !builder.reserve_control(ControlKind::Crypto) {
+                break;
+            }
             let Some(mut frame) = space.pending.crypto.pop_front() else {
                 break;
             };
@@ -6484,7 +6565,7 @@ impl Connection {
 
             if !frame.data.is_empty() {
                 frame.offset += len as u64;
-                space.pending.crypto.push_front(frame);
+                space.pending.queue_crypto(frame, true);
             }
         }
 
@@ -6493,6 +6574,8 @@ impl Connection {
             && !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && frame::PathStatusAvailable::SIZE_BOUND <= builder.frame_space_remaining()
+            && !space.pending.path_status.is_empty()
+            && builder.reserve_control(ControlKind::PathStatus)
         {
             let Some(path_id) = space.pending.path_status.pop_first() else {
                 break;
@@ -6526,6 +6609,7 @@ impl Connection {
             && !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && space.pending.max_path_id
+            && builder.reserve_control(ControlKind::Inline)
             && frame::MaxPathId::SIZE_BOUND <= builder.frame_space_remaining()
         {
             let frame = frame::MaxPathId(self.local_max_path_id);
@@ -6538,6 +6622,8 @@ impl Connection {
             && !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && frame::PathsBlocked::SIZE_BOUND <= builder.frame_space_remaining()
+            && space.pending.paths_blocked.is_some()
+            && builder.reserve_control(ControlKind::Inline)
             && let Some(remote_max_path_id) = space.pending.paths_blocked.take()
         {
             let frame = frame::PathsBlocked(remote_max_path_id);
@@ -6549,6 +6635,8 @@ impl Connection {
             && !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && frame::PathCidsBlocked::SIZE_BOUND <= builder.frame_space_remaining()
+            && !space.pending.path_cids_blocked.is_empty()
+            && builder.reserve_control(ControlKind::PathCidsBlocked)
         {
             let Some((path_id, next_seq)) = space.pending.path_cids_blocked.pop_first() else {
                 break;
@@ -6578,6 +6666,8 @@ impl Connection {
         while !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && builder.frame_space_remaining() > new_cid_size_bound
+            && !space.pending.new_cids.is_empty()
+            && builder.reserve_control(ControlKind::NewCids)
         {
             let Some(issued) = space.pending.new_cids.pop() else {
                 break;
@@ -6614,6 +6704,8 @@ impl Connection {
         while !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && builder.frame_space_remaining() > retire_cid_bound
+            && !space.pending.retire_cids.is_empty()
+            && builder.reserve_control(ControlKind::RetireCids)
         {
             let (path_id, sequence) = match space.pending.retire_cids.pop() {
                 Some((PathId::ZERO, seq)) if !is_multipath_negotiated => (None, seq),
@@ -6640,7 +6732,10 @@ impl Connection {
 
         // NEW_TOKEN
         if !scheduling_info.is_abandoned && scheduling_info.may_send_data {
-            while let Some(network_path) = space.pending.new_tokens.pop() {
+            while !space.pending.new_tokens.is_empty()
+                && builder.reserve_control(ControlKind::NewTokens)
+                && let Some(network_path) = space.pending.new_tokens.pop()
+            {
                 debug_assert_eq!(space_id, SpaceId::Data);
                 let ConnectionSide::Server { server_config } = &self.side else {
                     panic!("NEW_TOKEN frames should not be enqueued by clients");
@@ -6666,12 +6761,16 @@ impl Connection {
                 };
 
                 if builder.frame_space_remaining() < new_token.size() {
-                    space.pending.new_tokens.push(network_path);
+                    space.pending.queue_new_tokens(network_path);
                     break;
                 }
 
                 builder.write_frame(new_token, stats);
-                builder.retransmits_mut().new_tokens.push(network_path);
+                if let Ok(retransmits) = builder.retransmits_mut() {
+                    retransmits.queue_new_tokens(network_path);
+                } else {
+                    builder.mark_allocation_failed();
+                }
             }
         }
 
@@ -7187,10 +7286,10 @@ impl Connection {
             return;
         };
         let network_path = self.path_data(path_id).network_path;
-        let new_tokens = &mut self.spaces[SpaceId::Data as usize].pending.new_tokens;
-        new_tokens.clear();
+        let pending = &mut self.spaces[SpaceId::Data as usize].pending;
+        pending.new_tokens.clear();
         for _ in 0..server_config.validation_token.sent {
-            new_tokens.push(network_path);
+            pending.queue_new_tokens(network_path);
         }
     }
 
@@ -7242,7 +7341,7 @@ impl Connection {
         address: SocketAddr,
     ) -> Result<(), n0_nat_traversal::Error> {
         if let Some(added) = self.n0_nat_traversal.add_local_address(address)? {
-            self.spaces[SpaceId::Data].pending.add_address.insert(added);
+            self.spaces[SpaceId::Data].pending.queue_add_address(added);
         };
         Ok(())
     }
@@ -7257,8 +7356,7 @@ impl Connection {
         if let Some(removed) = self.n0_nat_traversal.remove_local_address(address)? {
             self.spaces[SpaceId::Data]
                 .pending
-                .remove_address
-                .insert(removed);
+                .queue_remove_address(removed);
         }
         Ok(())
     }
@@ -7301,8 +7399,7 @@ impl Connection {
 
         let ipv6 = self.is_ipv6();
         let client_state = self.n0_nat_traversal.client_side_mut()?;
-        let (mut reach_out_frames, probed_addrs) =
-            client_state.initiate_nat_traversal_round(ipv6)?;
+        let (reach_out_frames, probed_addrs) = client_state.initiate_nat_traversal_round(ipv6)?;
         if let Some(delay) = self.n0_nat_traversal.retry_delay(self.config.initial_rtt) {
             self.timers.set(
                 Timer::Conn(ConnTimer::NatTraversalProbeRetry),
@@ -7313,8 +7410,7 @@ impl Connection {
 
         self.spaces[SpaceId::Data]
             .pending
-            .reach_out
-            .append(&mut reach_out_frames);
+            .queue_reach_out_batch(reach_out_frames);
 
         Ok(probed_addrs)
     }
@@ -7755,9 +7851,11 @@ const MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE: usize =
 #[derive(Default)]
 struct SentFrames {
     retransmits: ThinRetransmits,
+    allocation: Option<buffer_budget::Allocation>,
+    allocation_failed: bool,
     path_retransmits: PathRetransmits,
     /// The packet number of the largest acknowledged packet for each path
-    largest_acked: FxHashMap<PathId, u64>,
+    largest_acked: BTreeMap<PathId, u64>,
     stream_frames: StreamMetaVec,
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
@@ -7766,6 +7864,99 @@ struct SentFrames {
 }
 
 impl SentFrames {
+    fn stream_metadata_bytes(&self) -> Result<usize, buffer_budget::AllocationError> {
+        if self.stream_frames.is_heap() {
+            self.stream_frames
+                .capacity()
+                .checked_mul(mem::size_of::<frame::StreamMeta>())
+                .ok_or(buffer_budget::AllocationError)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn reserve_ack(&mut self, path_id: PathId) -> Result<(), buffer_budget::AllocationError> {
+        let len = self
+            .largest_acked
+            .len()
+            .checked_add(usize::from(!self.largest_acked.contains_key(&path_id)))
+            .ok_or(buffer_budget::AllocationError)?;
+        let bytes = len
+            .checked_mul(packet_map::btree_entry_lease::<PathId, u64>())
+            .and_then(|bytes| {
+                self.stream_metadata_bytes()
+                    .ok()
+                    .and_then(|stream_bytes| bytes.checked_add(stream_bytes))
+            })
+            .ok_or(buffer_budget::AllocationError)?;
+        if let Some(allocation) = &mut self.allocation {
+            allocation.resize(allocation.bytes.max(bytes))?;
+        }
+        Ok(())
+    }
+
+    fn reserve_stream_metadata(&mut self) -> Result<(), buffer_budget::AllocationError> {
+        if self.stream_frames.len() < self.stream_frames.capacity() {
+            return Ok(());
+        }
+        let old_bytes = self.stream_metadata_bytes()?;
+        let Some(allocation) = &mut self.allocation else {
+            self.stream_frames.reserve(1);
+            return Ok(());
+        };
+        let capacity = self
+            .stream_frames
+            .len()
+            .checked_add(1)
+            .ok_or(buffer_budget::AllocationError)?
+            .max(self.stream_frames.capacity().saturating_mul(2))
+            .max(4);
+        let mut replacement_allocation = allocation.budget.acquire(
+            capacity
+                .checked_mul(mem::size_of::<frame::StreamMeta>())
+                .ok_or(buffer_budget::AllocationError)?,
+        )?;
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(capacity)
+            .map_err(|_| buffer_budget::AllocationError)?;
+        let new_bytes = replacement
+            .capacity()
+            .checked_mul(mem::size_of::<frame::StreamMeta>())
+            .ok_or(buffer_budget::AllocationError)?;
+        replacement_allocation.resize(new_bytes)?;
+        let retained_bytes = allocation
+            .bytes
+            .checked_sub(old_bytes)
+            .and_then(|bytes| bytes.checked_add(new_bytes))
+            .ok_or(buffer_budget::AllocationError)?;
+        replacement.extend(self.stream_frames.drain(..));
+        let old = mem::replace(&mut self.stream_frames, StreamMetaVec::Heap(replacement));
+        drop(old);
+        allocation.absorb(replacement_allocation);
+        allocation.resize(retained_bytes)
+    }
+
+    fn sync_allocation(&mut self) -> Result<(), buffer_budget::AllocationError> {
+        if self.largest_acked.is_empty() {
+            self.largest_acked = BTreeMap::new();
+        }
+        let bytes = self
+            .largest_acked
+            .len()
+            .checked_mul(packet_map::btree_entry_lease::<PathId, u64>())
+            .and_then(|bytes| {
+                self.stream_metadata_bytes()
+                    .ok()
+                    .and_then(|stream_bytes| bytes.checked_add(stream_bytes))
+            })
+            .ok_or(buffer_budget::AllocationError)?;
+        if let Some(allocation) = &mut self.allocation {
+            allocation.resize(bytes)?;
+        }
+        Ok(())
+    }
+
     /// Returns whether the packet contains only ACKs
     fn is_ack_only(&self, streams: &StreamsState) -> bool {
         !self.largest_acked.is_empty()
@@ -7774,91 +7965,94 @@ impl SentFrames {
             && self.retransmits.is_empty(streams)
     }
 
-    fn retransmits_mut(&mut self) -> &mut Retransmits {
-        self.retransmits.get_or_create()
+    fn retransmits_mut(&mut self) -> Result<&mut Retransmits, buffer_budget::AllocationError> {
+        self.retransmits.get_or_create(
+            self.allocation
+                .as_ref()
+                .map(|allocation| &allocation.budget),
+        )
     }
 
-    fn record_sent_frame(&mut self, frame: frame::EncodableFrame<'_>) {
+    fn record_sent_frame(
+        &mut self,
+        frame: frame::EncodableFrame<'_>,
+    ) -> Result<(), buffer_budget::AllocationError> {
         use frame::EncodableFrame::*;
         match frame {
             PathAck(path_ack_encoder) => {
                 if let Some(max) = path_ack_encoder.ranges.max() {
+                    self.reserve_ack(path_ack_encoder.path_id)?;
                     self.largest_acked.insert(path_ack_encoder.path_id, max);
                 }
             }
             Ack(ack_encoder) => {
                 if let Some(max) = ack_encoder.ranges.max() {
+                    self.reserve_ack(PathId::ZERO)?;
                     self.largest_acked.insert(PathId::ZERO, max);
                 }
             }
             Close(_) => { /* non retransmittable, but after this we don't really care */ }
             PathResponse(_) => self.non_retransmits = true,
-            HandshakeDone(_) => self.retransmits_mut().handshake_done = true,
-            ReachOut(frame) => self.retransmits_mut().reach_out.push(frame),
+            HandshakeDone(_) => self.retransmits_mut()?.handshake_done = true,
+            ReachOut(frame) => self.retransmits_mut()?.queue_reach_out(frame),
             ObservedAddr(_) => self.path_retransmits.observed_address = true,
             Ping(_) => self.non_retransmits = true,
             ImmediateAck(_) => self.non_retransmits = true,
-            AckFrequency(_) => self.retransmits_mut().ack_frequency = true,
+            AckFrequency(_) => self.retransmits_mut()?.ack_frequency = true,
             PathChallenge(_) => self.non_retransmits = true,
-            Crypto(crypto) => self.retransmits_mut().crypto.push_back(crypto),
+            Crypto(crypto) => self.retransmits_mut()?.queue_crypto(crypto, false),
             PathAbandon(path_abandon) => {
-                self.retransmits_mut()
-                    .path_abandon
-                    .entry(path_abandon.path_id)
-                    .or_insert(path_abandon.error_code);
+                self.retransmits_mut()?
+                    .queue_path_abandon(path_abandon.path_id, path_abandon.error_code);
             }
             PathStatusAvailable(frame::PathStatusAvailable { path_id, .. })
             | PathStatusBackup(frame::PathStatusBackup { path_id, .. }) => {
-                self.retransmits_mut().path_status.insert(path_id);
+                self.retransmits_mut()?.queue_path_status(path_id);
             }
-            MaxPathId(_) => self.retransmits_mut().max_path_id = true,
+            MaxPathId(_) => self.retransmits_mut()?.max_path_id = true,
             PathsBlocked(frame::PathsBlocked(path_id)) => {
-                let paths_blocked = &mut self.retransmits_mut().paths_blocked;
+                let paths_blocked = &mut self.retransmits_mut()?.paths_blocked;
                 *paths_blocked = cmp::max(*paths_blocked, Some(path_id));
             }
             PathCidsBlocked(path_cids_blocked) => {
-                self.retransmits_mut()
-                    .path_cids_blocked
-                    .entry(path_cids_blocked.path_id)
-                    .and_modify(|next_seq| {
-                        *next_seq = cmp::max(*next_seq, path_cids_blocked.next_seq);
-                    })
-                    .or_insert(path_cids_blocked.next_seq);
+                self.retransmits_mut()?
+                    .queue_path_cids_blocked(path_cids_blocked.path_id, path_cids_blocked.next_seq);
             }
             ResetStream(reset) => self
-                .retransmits_mut()
-                .reset_stream
-                .push((reset.id, reset.error_code)),
-            StopSending(stop_sending) => self.retransmits_mut().stop_sending.push(stop_sending),
-            NewConnectionId(new_cid) => self.retransmits_mut().new_cids.push(new_cid.issued()),
+                .retransmits_mut()?
+                .queue_reset_stream((reset.id, reset.error_code)),
+            StopSending(stop_sending) => self.retransmits_mut()?.queue_stop_sending(stop_sending),
+            NewConnectionId(new_cid) => self.retransmits_mut()?.queue_new_cids(new_cid.issued()),
             RetireConnectionId(retire_cid) => self
-                .retransmits_mut()
-                .retire_cids
-                .push((retire_cid.path_id.unwrap_or_default(), retire_cid.sequence)),
+                .retransmits_mut()?
+                .queue_retire_cids((retire_cid.path_id.unwrap_or_default(), retire_cid.sequence)),
             Datagram(_) => self.non_retransmits = true,
             NewToken(_) => {}
             AddAddress(add_address) => {
-                self.retransmits_mut().add_address.insert(add_address);
+                self.retransmits_mut()?.queue_add_address(add_address);
             }
             RemoveAddress(remove_address) => {
-                self.retransmits_mut().remove_address.insert(remove_address);
+                self.retransmits_mut()?.queue_remove_address(remove_address);
             }
-            StreamMeta(stream_meta_encoder) => self.stream_frames.push(stream_meta_encoder.meta),
-            MaxData(_) => self.retransmits_mut().max_data = true,
+            StreamMeta(stream_meta_encoder) => {
+                self.reserve_stream_metadata()?;
+                self.stream_frames.push(stream_meta_encoder.meta);
+            }
+            MaxData(_) => self.retransmits_mut()?.max_data = true,
             MaxStreamData(max) => {
-                self.retransmits_mut().max_stream_data.insert(max.id);
+                self.retransmits_mut()?.queue_max_stream_data(max.id);
             }
             MaxStreams(max_streams) => {
-                self.retransmits_mut().max_stream_id[max_streams.dir as usize] = true
+                self.retransmits_mut()?.max_stream_id[max_streams.dir as usize] = true
             }
             StreamsBlocked(streams_blocked) => {
-                self.retransmits_mut().streams_blocked[streams_blocked.dir as usize] = true
+                self.retransmits_mut()?.streams_blocked[streams_blocked.dir as usize] = true
             }
             ResetStreamAt(frame) => self
-                .retransmits_mut()
-                .reset_stream_at
-                .push((frame.id, frame.reliable_size)),
+                .retransmits_mut()?
+                .queue_reset_stream_at((frame.id, frame.reliable_size)),
         }
+        Ok(())
     }
 }
 

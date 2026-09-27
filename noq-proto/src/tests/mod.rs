@@ -5128,6 +5128,7 @@ fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
     let mut client_received = 0;
     let mut server_received = 0;
     let mut metadata_blocked = false;
+    let mut steps = 0;
     loop {
         metadata_blocked |= pair.conn(Client).packet_metadata_blocked()
             || pair.conn(Server).packet_metadata_blocked();
@@ -5151,7 +5152,8 @@ fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
             pair.recv_stream(Server, server_stream),
             &mut server_received,
         );
-        if !pair.step() {
+        steps += 1;
+        if !pair.blackhole_step(steps % 17 == 0, steps % 19 == 0) {
             break;
         }
     }
@@ -5168,6 +5170,38 @@ fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
     assert_eq!(server_remaining, 0);
     assert_eq!(client_received, 256 * 1024);
     assert_eq!(server_received, 256 * 1024);
+    Ok(())
+}
+
+#[test]
+fn packet_metadata_pressure_preserves_one_way_delivery() -> TestResult {
+    let mut transport = TransportConfig::default();
+    transport.send_window(64 * 1024);
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(transport)
+        .with_latency(Duration::from_millis(50))
+        .connect();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let total = 2 * 1024 * 1024;
+    let mut remaining = total;
+    let mut received = 0;
+    let mut accepted = false;
+    loop {
+        if remaining > 0 {
+            send_bytes(pair.send_stream(Client, stream), &mut remaining)?;
+        }
+        if !accepted {
+            accepted = pair.streams(Server).accept(Dir::Uni).is_some();
+        }
+        if accepted {
+            recv_bytes(pair.recv_stream(Server, stream), &mut received);
+        }
+        if !pair.step() {
+            break;
+        }
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(received, total);
     Ok(())
 }
 
@@ -5301,6 +5335,22 @@ fn regression_initial_coalescing_large_cid() {
     // in time a bit:
     pair.time += Duration::from_secs(5);
     pair.drive_client(); // this used to try to build a packet without enough datagram space
+}
+
+#[test]
+fn pending_control_pressure_closes_connection() {
+    let mut pair = ConnPair::default();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let _charged = pair.conn_mut(Client).exhaust_packet_metadata();
+    pair.send_stream(Client, stream)
+        .reset(VarInt::from_u32(42))
+        .unwrap();
+    pair.drive_client();
+    assert_matches!(pair.conn_mut(Client).poll(),
+        Some(Event::ConnectionLost { reason: ConnectionError::TransportError(ref error) })
+        if error.code == TransportErrorCode::INTERNAL_ERROR);
+    pair.drive_client();
+    assert_matches!(pair.conn_mut(Client).poll(), None);
 }
 
 #[test]

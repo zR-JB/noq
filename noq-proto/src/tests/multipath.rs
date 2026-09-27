@@ -2304,7 +2304,6 @@ fn packet_pressure_blocks_self_abandon_until_storage_returns() -> TestResult {
     };
     pair.open_path(Client, route, PathStatus::Available)?;
     pair.close_path(Client, PathId::ZERO, 0u8.into())?;
-    let charged = pair.conn_mut(Server).exhaust_packet_metadata();
     pair.drive_client();
     let now = pair.time;
     pair.server.drive_incoming(now);
@@ -2317,6 +2316,7 @@ fn packet_pressure_blocks_self_abandon_until_storage_returns() -> TestResult {
     for event in events {
         pair.handle_event(Server, event);
     }
+    let charged = pair.conn_mut(Server).exhaust_packet_metadata();
     let before = pair.conn_mut(Server).stats().frame_tx.path_abandon;
     let mut buf = Vec::new();
     for _ in 0..3 {

@@ -91,6 +91,15 @@ pub(super) struct Allocation {
 }
 
 impl Allocation {
+    pub(super) fn absorb(&mut self, mut other: Self) {
+        assert!(Arc::ptr_eq(&self.budget, &other.budget));
+        self.bytes = self
+            .bytes
+            .checked_add(other.bytes)
+            .expect("budget bounds allocation sum");
+        other.bytes = 0;
+    }
+
     pub(super) fn resize(&mut self, bytes: usize) -> Result<(), AllocationError> {
         if bytes > self.bytes {
             let mut extra = self.budget.acquire(bytes - self.bytes)?;

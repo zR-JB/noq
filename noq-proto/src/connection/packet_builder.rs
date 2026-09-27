@@ -51,11 +51,12 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         dst_cid: ConnectionId,
         buffer: &'a mut TransmitBuf<'b>,
         conn: &mut Connection,
-        track: bool,
+        allocation: Option<super::buffer_budget::Allocation>,
     ) -> Option<Self>
     where
         'b: 'a,
     {
+        let track = allocation.is_some();
         if track
             && conn.spaces[space_id]
                 .for_path(path_id)
@@ -183,7 +184,10 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             level,
             ack_eliciting: false,
             qlog,
-            sent_frames: SentFrames::default(),
+            sent_frames: SentFrames {
+                allocation,
+                ..SentFrames::default()
+            },
             track,
             _span: span,
         })
@@ -261,7 +265,9 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             None => trace!(%frame),
         }
         if self.track {
-            self.sent_frames.record_sent_frame(frame);
+            if self.sent_frames.record_sent_frame(frame).is_err() {
+                self.sent_frames.allocation_failed = true;
+            }
         } else {
             debug_assert!(!frame.is_ack_eliciting());
         }
@@ -297,7 +303,19 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         let packet_number = self.packet_number;
         let space_id = self.space;
         let track = self.track;
-        let (size, padded, sent) = self.finish(conn, now);
+        let (size, padded, mut sent) = self.finish(conn, now);
+        if sent.sync_allocation().is_err() {
+            sent.allocation_failed = true;
+        }
+        if sent.allocation_failed
+            || sent
+                .retransmits
+                .get()
+                .is_some_and(|retransmits| retransmits.allocation_failed)
+        {
+            conn.close_buffer_limit(now);
+            return;
+        }
         if !track {
             return;
         }
@@ -310,6 +328,7 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         let packet = SentPacket {
             path_generation: conn.paths.get_mut(&path_id).unwrap().data.generation(),
             largest_acked: sent.largest_acked,
+            _allocation: sent.allocation,
             time_sent: now,
             size,
             ack_eliciting,
@@ -416,7 +435,26 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         self.sent_frames.requires_padding = true;
     }
 
-    pub(crate) fn retransmits_mut(&mut self) -> &mut Retransmits {
+    pub(in crate::connection) fn reserve_control(
+        &mut self,
+        kind: super::spaces::ControlKind,
+    ) -> bool {
+        self.retransmits_mut()
+            .and_then(|retransmits| retransmits.reserve_control(kind))
+            .is_ok()
+    }
+
+    pub(in crate::connection) fn reserve_stream_metadata(&mut self) -> bool {
+        self.sent_frames.reserve_stream_metadata().is_ok()
+    }
+
+    pub(super) fn mark_allocation_failed(&mut self) {
+        self.sent_frames.allocation_failed = true;
+    }
+
+    pub(crate) fn retransmits_mut(
+        &mut self,
+    ) -> Result<&mut Retransmits, super::buffer_budget::AllocationError> {
         self.sent_frames.retransmits_mut()
     }
 }

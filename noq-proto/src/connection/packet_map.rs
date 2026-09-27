@@ -2,6 +2,17 @@ use std::{collections::BTreeMap, mem, ops::RangeBounds, sync::Arc};
 
 use super::buffer_budget::{Allocation, AllocationError, BufferBudget};
 
+pub(super) fn btree_entry_lease<K, V>() -> usize {
+    let alignment = mem::align_of::<K>()
+        .max(mem::align_of::<V>())
+        .max(mem::align_of::<usize>());
+    mem::size_of::<usize>()
+        + 2 * mem::size_of::<u16>()
+        + 11 * (mem::size_of::<K>() + mem::size_of::<V>())
+        + 5 * (alignment - 1)
+        + 12 * mem::size_of::<usize>()
+}
+
 #[derive(Debug)]
 pub(super) struct PacketMap<T> {
     entries: BTreeMap<u64, T>,
@@ -10,13 +21,7 @@ pub(super) struct PacketMap<T> {
 
 impl<T> PacketMap<T> {
     fn entry_lease() -> usize {
-        // Rust 1.98.1 B-tree nodes have 11 entries, five leaf fields, and 12 edges.
-        let alignment = mem::align_of::<T>().max(mem::align_of::<u64>());
-        mem::size_of::<usize>()
-            + 2 * mem::size_of::<u16>()
-            + 11 * (mem::size_of::<u64>() + mem::size_of::<T>())
-            + 5 * (alignment - 1)
-            + 12 * mem::size_of::<usize>()
+        btree_entry_lease::<u64, T>()
     }
 
     pub(super) fn new(budget: Arc<BufferBudget>) -> Self {

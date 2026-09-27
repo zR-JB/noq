@@ -14,7 +14,9 @@ use super::{
 };
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
-    connection::{PacketBuilder, buffer_budget::BufferBudget, stats::FrameStats},
+    connection::{
+        PacketBuilder, buffer_budget::BufferBudget, spaces::ControlKind, stats::FrameStats,
+    },
     frame::{self, FrameStruct},
     transport_parameters::TransportParameters,
 };
@@ -550,7 +552,10 @@ impl StreamsState {
         stats: &mut FrameStats,
     ) {
         // RESET_STREAM
-        while builder.frame_space_remaining() > frame::ResetStream::SIZE_BOUND {
+        while builder.frame_space_remaining() > frame::ResetStream::SIZE_BOUND
+            && !pending.reset_stream.is_empty()
+            && builder.reserve_control(ControlKind::ResetStream)
+        {
             let Some((id, error_code)) = pending.reset_stream.pop() else {
                 break;
             };
@@ -566,7 +571,10 @@ impl StreamsState {
         }
 
         // RESET_STREAM_AT
-        while builder.frame_space_remaining() > frame::ResetStreamAt::SIZE_BOUND {
+        while builder.frame_space_remaining() > frame::ResetStreamAt::SIZE_BOUND
+            && !pending.reset_stream_at.is_empty()
+            && builder.reserve_control(ControlKind::ResetStreamAt)
+        {
             // The stored reliable size is only used for acknowledgement tracking; the frame is
             // always (re)built from the stream's current (smallest) reliable size below.
             let Some((id, _)) = pending.reset_stream_at.pop() else {
@@ -593,7 +601,10 @@ impl StreamsState {
         }
 
         // STOP_SENDING
-        while builder.frame_space_remaining() > frame::StopSending::SIZE_BOUND {
+        while builder.frame_space_remaining() > frame::StopSending::SIZE_BOUND
+            && !pending.stop_sending.is_empty()
+            && builder.reserve_control(ControlKind::StopSending)
+        {
             let Some(frame) = pending.stop_sending.pop() else {
                 break;
             };
@@ -608,7 +619,10 @@ impl StreamsState {
         }
 
         // MAX_DATA
-        if pending.max_data && builder.frame_space_remaining() > 9 {
+        if pending.max_data
+            && builder.frame_space_remaining() > 9
+            && builder.reserve_control(ControlKind::Inline)
+        {
             pending.max_data = false;
 
             // `local_max_data` can grow bigger than `VarInt`.
@@ -627,7 +641,10 @@ impl StreamsState {
         }
 
         // MAX_STREAM_DATA
-        while builder.frame_space_remaining() > 17 {
+        while builder.frame_space_remaining() > 17
+            && !pending.max_stream_data.is_empty()
+            && builder.reserve_control(ControlKind::MaxStreamData)
+        {
             let id = match pending.max_stream_data.iter().next() {
                 Some(x) => *x,
                 None => break,
@@ -652,7 +669,10 @@ impl StreamsState {
 
         // MAX_STREAMS
         for dir in Dir::iter() {
-            if !pending.max_stream_id[dir as usize] || builder.frame_space_remaining() <= 9 {
+            if !pending.max_stream_id[dir as usize]
+                || builder.frame_space_remaining() <= 9
+                || !builder.reserve_control(ControlKind::Inline)
+            {
                 continue;
             }
 
@@ -669,7 +689,10 @@ impl StreamsState {
                 self.streams_blocked[dir as usize] = false;
             }
 
-            if !pending.streams_blocked[dir as usize] || builder.frame_space_remaining() <= 9 {
+            if !pending.streams_blocked[dir as usize]
+                || builder.frame_space_remaining() <= 9
+                || !builder.reserve_control(ControlKind::Inline)
+            {
                 continue;
             }
 
@@ -685,7 +708,10 @@ impl StreamsState {
         fair: bool,
         stats: &mut FrameStats,
     ) {
-        while builder.frame_space_remaining() > frame::Stream::SIZE_BOUND {
+        while builder.frame_space_remaining() > frame::Stream::SIZE_BOUND
+            && self.pending.iter().next().is_some()
+            && builder.reserve_stream_metadata()
+        {
             // Pop the stream of the highest priority that currently has pending data. If
             // the stream still has some pending data left after writing, it will be
             // reinserted, otherwise not

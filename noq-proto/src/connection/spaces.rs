@@ -7,11 +7,10 @@ use std::{
 };
 
 use super::{
-    buffer_budget::{AllocationError, BufferBudget},
-    packet_map::PacketMap,
+    buffer_budget::{Allocation, AllocationError, BufferBudget},
+    packet_map::{PacketMap, btree_entry_lease},
 };
 use rand::{CryptoRng, RngExt};
-use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::trace;
 
 use super::{PathId, paths::PathResponses, paths::PathRetransmits};
@@ -43,9 +42,9 @@ impl PacketSpace {
         rng: &mut (impl CryptoRng + ?Sized),
         budget: Arc<BufferBudget>,
     ) -> Self {
-        let number_space_0 = PacketNumberSpace::new(now, space, rng, budget);
+        let number_space_0 = PacketNumberSpace::new(now, space, rng, budget.clone());
         Self {
-            pending: Retransmits::default(),
+            pending: Retransmits::with_budget(budget),
             number_spaces: BTreeMap::from([(PathId::ZERO, number_space_0)]),
         }
     }
@@ -56,9 +55,9 @@ impl PacketSpace {
         space: SpaceId,
         budget: Arc<BufferBudget>,
     ) -> Self {
-        let number_space_0 = PacketNumberSpace::new_deterministic(now, space, budget);
+        let number_space_0 = PacketNumberSpace::new_deterministic(now, space, budget.clone());
         Self {
-            pending: Retransmits::default(),
+            pending: Retransmits::with_budget(budget),
             number_spaces: BTreeMap::from([(PathId::ZERO, number_space_0)]),
         }
     }
@@ -525,7 +524,7 @@ pub(super) enum OpenStatus {
 }
 
 /// Represents one or more packets subject to retransmission
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct SentPacket {
     /// [`PathData::generation`](super::PathData::generation) of the path on which this packet was
     /// sent
@@ -539,7 +538,8 @@ pub(super) struct SentPacket {
     /// Whether an acknowledgement is expected directly in response to this packet.
     pub(super) ack_eliciting: bool,
     /// The largest packet number acknowledged by this packet
-    pub(super) largest_acked: FxHashMap<PathId, u64>,
+    pub(super) largest_acked: BTreeMap<PathId, u64>,
+    pub(super) _allocation: Option<Allocation>,
     /// Data which needs to be retransmitted in case the packet is lost.
     ///
     /// These might be retransmitted over any available path in the same [`SpaceKind`].
@@ -563,14 +563,14 @@ pub(super) struct LostPacket {
 ///
 /// Data in this queue must be retransmittable over any path in the same [`SpaceKind`].
 #[allow(unreachable_pub)] // fuzzing only
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct Retransmits {
     pub(super) max_data: bool,
     pub(super) max_stream_id: [bool; 2],
     pub(super) streams_blocked: [bool; 2],
     pub(super) reset_stream: Vec<(StreamId, VarInt)>,
     pub(super) stop_sending: Vec<frame::StopSending>,
-    pub(super) max_stream_data: FxHashSet<StreamId>,
+    pub(super) max_stream_data: BTreeSet<StreamId>,
     pub(super) crypto: VecDeque<frame::Crypto>,
     pub(super) new_cids: PendingNewCids,
     pub(super) retire_cids: Vec<(PathId, u64)>,
@@ -631,9 +631,547 @@ pub struct Retransmits {
     /// only so that, on acknowledgement, a frame carrying a now-superseded (larger) reliable size
     /// can be distinguished from the current one (see `reset_at_acked`).
     pub(super) reset_stream_at: Vec<(StreamId, VarInt)>,
+    allocation: Option<Allocation>,
+    pub(super) allocation_failed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::connection) enum ControlKind {
+    Inline,
+    ResetStream,
+    StopSending,
+    RetireCids,
+    NewTokens,
+    ResetStreamAt,
+    NewCids,
+    ReachOut,
+    Crypto,
+    MaxStreamData,
+    PathAbandon,
+    PathStatus,
+    PathCidsBlocked,
+    AddAddress,
+    RemoveAddress,
+}
+
+fn reserve_control_vec<T>(
+    values: &mut Vec<T>,
+    allocation: Option<&mut Allocation>,
+    additional: usize,
+) -> Result<(), AllocationError> {
+    let needed = values
+        .len()
+        .checked_add(additional)
+        .ok_or(AllocationError)?;
+    if needed <= values.capacity() {
+        return Ok(());
+    }
+    let Some(allocation) = allocation else {
+        values.reserve(additional);
+        return Ok(());
+    };
+    let capacity = needed.max(values.capacity().saturating_mul(2)).max(4);
+    let old_bytes = values
+        .capacity()
+        .checked_mul(mem::size_of::<T>())
+        .ok_or(AllocationError)?;
+    let new_bytes = capacity
+        .checked_mul(mem::size_of::<T>())
+        .ok_or(AllocationError)?;
+    let mut replacement_allocation = allocation.budget.acquire(new_bytes)?;
+    let mut replacement = Vec::new();
+    replacement
+        .try_reserve_exact(capacity)
+        .map_err(|_| AllocationError)?;
+    let new_bytes = replacement
+        .capacity()
+        .checked_mul(mem::size_of::<T>())
+        .ok_or(AllocationError)?;
+    replacement_allocation.resize(new_bytes)?;
+    let retained_bytes = allocation
+        .bytes
+        .checked_sub(old_bytes)
+        .and_then(|bytes| bytes.checked_add(new_bytes))
+        .ok_or(AllocationError)?;
+    let mut old = mem::replace(values, replacement);
+    values.append(&mut old);
+    drop(old);
+    allocation.absorb(replacement_allocation);
+    allocation.resize(retained_bytes)
 }
 
 impl Retransmits {
+    pub(super) fn with_budget(budget: Arc<BufferBudget>) -> Self {
+        Self {
+            allocation: Some(Allocation { budget, bytes: 0 }),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn first_control_bytes() -> usize {
+        mem::size_of::<Self>()
+            + [
+                4 * mem::size_of::<(StreamId, VarInt)>(),
+                4 * mem::size_of::<frame::StopSending>(),
+                4 * mem::size_of::<(PathId, u64)>(),
+                4 * mem::size_of::<FourTuple>(),
+                4 * mem::size_of::<IssuedCid>(),
+                4 * mem::size_of::<frame::ReachOut>(),
+                4 * mem::size_of::<frame::Crypto>(),
+                btree_entry_lease::<StreamId, ()>(),
+                btree_entry_lease::<PathId, TransportErrorCode>(),
+                btree_entry_lease::<PathId, ()>(),
+                btree_entry_lease::<PathId, VarInt>(),
+                btree_entry_lease::<AddAddress, ()>(),
+                btree_entry_lease::<RemoveAddress, ()>(),
+            ]
+            .into_iter()
+            .max()
+            .unwrap()
+    }
+
+    pub(super) fn reserve_control(&mut self, kind: ControlKind) -> Result<(), AllocationError> {
+        if self.allocation_failed {
+            return Err(AllocationError);
+        }
+        self.sync_allocation()?;
+        match kind {
+            ControlKind::Inline => Ok(()),
+            ControlKind::ResetStream => {
+                reserve_control_vec(&mut self.reset_stream, self.allocation.as_mut(), 1)
+            }
+            ControlKind::StopSending => {
+                reserve_control_vec(&mut self.stop_sending, self.allocation.as_mut(), 1)
+            }
+            ControlKind::RetireCids => {
+                reserve_control_vec(&mut self.retire_cids, self.allocation.as_mut(), 1)
+            }
+            ControlKind::NewTokens => {
+                reserve_control_vec(&mut self.new_tokens, self.allocation.as_mut(), 1)
+            }
+            ControlKind::ResetStreamAt => {
+                reserve_control_vec(&mut self.reset_stream_at, self.allocation.as_mut(), 1)
+            }
+            ControlKind::NewCids => {
+                reserve_control_vec(&mut self.new_cids.cids, self.allocation.as_mut(), 1)
+            }
+            ControlKind::ReachOut => {
+                reserve_control_vec(&mut self.reach_out.frames, self.allocation.as_mut(), 1)
+            }
+            ControlKind::Crypto => self.reserve_crypto(1),
+            ControlKind::MaxStreamData => self.precharge_tree::<StreamId, ()>(),
+            ControlKind::PathAbandon => self.precharge_tree::<PathId, TransportErrorCode>(),
+            ControlKind::PathStatus => self.precharge_tree::<PathId, ()>(),
+            ControlKind::PathCidsBlocked => self.precharge_tree::<PathId, VarInt>(),
+            ControlKind::AddAddress => self.precharge_tree::<AddAddress, ()>(),
+            ControlKind::RemoveAddress => self.precharge_tree::<RemoveAddress, ()>(),
+        }
+    }
+
+    fn precharge_tree<K, V>(&mut self) -> Result<(), AllocationError> {
+        if let Some(allocation) = &mut self.allocation {
+            allocation.resize(
+                allocation
+                    .bytes
+                    .checked_add(btree_entry_lease::<K, V>())
+                    .ok_or(AllocationError)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn sync_allocation(&mut self) -> Result<(), AllocationError> {
+        let Some(allocation) = &mut self.allocation else {
+            return Ok(());
+        };
+        if self.max_stream_data.is_empty() {
+            self.max_stream_data = BTreeSet::new();
+        }
+        if self.path_abandon.is_empty() {
+            self.path_abandon = BTreeMap::new();
+        }
+        if self.path_status.is_empty() {
+            self.path_status = BTreeSet::new();
+        }
+        if self.path_cids_blocked.is_empty() {
+            self.path_cids_blocked = BTreeMap::new();
+        }
+        if self.add_address.is_empty() {
+            self.add_address = BTreeSet::new();
+        }
+        if self.remove_address.is_empty() {
+            self.remove_address = BTreeSet::new();
+        }
+        let bytes = [
+            self.reset_stream
+                .capacity()
+                .checked_mul(mem::size_of::<(StreamId, VarInt)>()),
+            self.stop_sending
+                .capacity()
+                .checked_mul(mem::size_of::<frame::StopSending>()),
+            self.retire_cids
+                .capacity()
+                .checked_mul(mem::size_of::<(PathId, u64)>()),
+            self.new_tokens
+                .capacity()
+                .checked_mul(mem::size_of::<FourTuple>()),
+            self.reset_stream_at
+                .capacity()
+                .checked_mul(mem::size_of::<(StreamId, VarInt)>()),
+            self.new_cids
+                .cids
+                .capacity()
+                .checked_mul(mem::size_of::<IssuedCid>()),
+            self.reach_out
+                .frames
+                .capacity()
+                .checked_mul(mem::size_of::<frame::ReachOut>()),
+            self.crypto
+                .capacity()
+                .checked_mul(mem::size_of::<frame::Crypto>()),
+            self.max_stream_data
+                .len()
+                .checked_mul(btree_entry_lease::<StreamId, ()>()),
+            self.path_abandon
+                .len()
+                .checked_mul(btree_entry_lease::<PathId, TransportErrorCode>()),
+            self.path_status
+                .len()
+                .checked_mul(btree_entry_lease::<PathId, ()>()),
+            self.path_cids_blocked
+                .len()
+                .checked_mul(btree_entry_lease::<PathId, VarInt>()),
+            self.add_address
+                .len()
+                .checked_mul(btree_entry_lease::<AddAddress, ()>()),
+            self.remove_address
+                .len()
+                .checked_mul(btree_entry_lease::<RemoveAddress, ()>()),
+        ]
+        .into_iter()
+        .try_fold(0_usize, |total, bytes| total.checked_add(bytes?))
+        .ok_or(AllocationError)?;
+        allocation.resize(bytes)
+    }
+
+    fn prepare(&mut self) -> bool {
+        if self.allocation_failed {
+            return false;
+        }
+        if self.sync_allocation().is_err() {
+            self.allocation_failed = true;
+            return false;
+        }
+        true
+    }
+
+    fn accept(&mut self, admission: Result<(), AllocationError>) -> bool {
+        if admission.is_err() {
+            self.allocation_failed = true;
+            return false;
+        }
+        true
+    }
+
+    fn reserve_tree<K, V>(&mut self, additional: usize) -> bool {
+        if !self.prepare() {
+            return false;
+        }
+        let admission = match &mut self.allocation {
+            Some(allocation) => additional
+                .checked_mul(btree_entry_lease::<K, V>())
+                .and_then(|extra| allocation.bytes.checked_add(extra))
+                .ok_or(AllocationError)
+                .and_then(|bytes| allocation.resize(bytes)),
+            None => Ok(()),
+        };
+        self.accept(admission)
+    }
+
+    pub(super) fn queue_reset_stream(&mut self, frame: (StreamId, VarInt)) {
+        if !self.prepare() {
+            return;
+        }
+        let admission = reserve_control_vec(&mut self.reset_stream, self.allocation.as_mut(), 1);
+        if self.accept(admission) {
+            self.reset_stream.push(frame);
+        }
+    }
+
+    pub(super) fn queue_stop_sending(&mut self, frame: frame::StopSending) {
+        if !self.prepare() {
+            return;
+        }
+        let admission = reserve_control_vec(&mut self.stop_sending, self.allocation.as_mut(), 1);
+        if self.accept(admission) {
+            self.stop_sending.push(frame);
+        }
+    }
+
+    pub(super) fn queue_retire_cids(&mut self, frame: (PathId, u64)) {
+        if !self.prepare() {
+            return;
+        }
+        let admission = reserve_control_vec(&mut self.retire_cids, self.allocation.as_mut(), 1);
+        if self.accept(admission) {
+            self.retire_cids.push(frame);
+        }
+    }
+
+    pub(super) fn queue_new_tokens(&mut self, frame: FourTuple) {
+        if !self.prepare() {
+            return;
+        }
+        let admission = reserve_control_vec(&mut self.new_tokens, self.allocation.as_mut(), 1);
+        if self.accept(admission) {
+            self.new_tokens.push(frame);
+        }
+    }
+
+    pub(super) fn queue_reset_stream_at(&mut self, frame: (StreamId, VarInt)) {
+        if !self.prepare() {
+            return;
+        }
+        let admission = reserve_control_vec(&mut self.reset_stream_at, self.allocation.as_mut(), 1);
+        if self.accept(admission) {
+            self.reset_stream_at.push(frame);
+        }
+    }
+
+    pub(super) fn queue_new_cids(&mut self, frame: IssuedCid) {
+        if !self.prepare() {
+            return;
+        }
+        let admission = reserve_control_vec(&mut self.new_cids.cids, self.allocation.as_mut(), 1);
+        if self.accept(admission) {
+            self.new_cids.push(frame);
+        }
+    }
+
+    pub(super) fn queue_reach_out(&mut self, frame: frame::ReachOut) {
+        if frame.round < self.reach_out.round {
+            return;
+        }
+        if frame.round > self.reach_out.round {
+            self.reach_out.frames.clear();
+        }
+        if !self.prepare() {
+            return;
+        }
+        let admission =
+            reserve_control_vec(&mut self.reach_out.frames, self.allocation.as_mut(), 1);
+        if self.accept(admission) {
+            self.reach_out.push(frame);
+        }
+    }
+
+    pub(super) fn queue_reach_out_batch(&mut self, mut frames: PendingReachOutFrames) {
+        if frames.round < self.reach_out.round {
+            return;
+        }
+        if frames.round > self.reach_out.round {
+            self.reach_out.frames.clear();
+        }
+        if !self.prepare() {
+            return;
+        }
+        let admission = reserve_control_vec(
+            &mut self.reach_out.frames,
+            self.allocation.as_mut(),
+            frames.len(),
+        );
+        if self.accept(admission) {
+            self.reach_out.append(&mut frames);
+        }
+    }
+
+    pub(super) fn queue_max_stream_data(&mut self, id: StreamId) {
+        if self.reserve_tree::<StreamId, ()>(usize::from(!self.max_stream_data.contains(&id))) {
+            self.max_stream_data.insert(id);
+        }
+    }
+    pub(super) fn queue_path_abandon(&mut self, id: PathId, code: TransportErrorCode) {
+        if self.reserve_tree::<PathId, TransportErrorCode>(usize::from(
+            !self.path_abandon.contains_key(&id),
+        )) {
+            self.path_abandon.entry(id).or_insert(code);
+        }
+    }
+    pub(super) fn queue_path_status(&mut self, id: PathId) {
+        if self.reserve_tree::<PathId, ()>(usize::from(!self.path_status.contains(&id))) {
+            self.path_status.insert(id);
+        }
+    }
+    pub(super) fn queue_path_cids_blocked(&mut self, id: PathId, next_seq: VarInt) {
+        if self
+            .reserve_tree::<PathId, VarInt>(usize::from(!self.path_cids_blocked.contains_key(&id)))
+        {
+            self.path_cids_blocked
+                .entry(id)
+                .and_modify(|old| *old = (*old).max(next_seq))
+                .or_insert(next_seq);
+        }
+    }
+    pub(super) fn queue_add_address(&mut self, frame: AddAddress) {
+        if self.reserve_tree::<AddAddress, ()>(usize::from(!self.add_address.contains(&frame))) {
+            self.add_address.insert(frame);
+        }
+    }
+    pub(super) fn queue_remove_address(&mut self, frame: RemoveAddress) {
+        if self
+            .reserve_tree::<RemoveAddress, ()>(usize::from(!self.remove_address.contains(&frame)))
+        {
+            self.remove_address.insert(frame);
+        }
+    }
+
+    pub(super) fn reserve_crypto(&mut self, additional: usize) -> Result<(), AllocationError> {
+        if self.allocation_failed {
+            return Err(AllocationError);
+        }
+        self.sync_allocation()?;
+        let needed = self
+            .crypto
+            .len()
+            .checked_add(additional)
+            .ok_or(AllocationError)?;
+        if needed <= self.crypto.capacity() {
+            return Ok(());
+        }
+        let capacity = needed.max(self.crypto.capacity().saturating_mul(2)).max(4);
+        let Some(allocation) = &mut self.allocation else {
+            self.crypto.reserve(additional);
+            return Ok(());
+        };
+        let old_bytes = self
+            .crypto
+            .capacity()
+            .checked_mul(mem::size_of::<frame::Crypto>())
+            .ok_or(AllocationError)?;
+        let new_bytes = capacity
+            .checked_mul(mem::size_of::<frame::Crypto>())
+            .ok_or(AllocationError)?;
+        let mut replacement_allocation = allocation.budget.acquire(new_bytes)?;
+        let mut replacement = VecDeque::new();
+        replacement
+            .try_reserve_exact(capacity)
+            .map_err(|_| AllocationError)?;
+        let new_bytes = replacement
+            .capacity()
+            .checked_mul(mem::size_of::<frame::Crypto>())
+            .ok_or(AllocationError)?;
+        replacement_allocation.resize(new_bytes)?;
+        let retained_bytes = allocation
+            .bytes
+            .checked_sub(old_bytes)
+            .and_then(|bytes| bytes.checked_add(new_bytes))
+            .ok_or(AllocationError)?;
+        let mut old = mem::replace(&mut self.crypto, replacement);
+        self.crypto.append(&mut old);
+        drop(old);
+        allocation.absorb(replacement_allocation);
+        allocation.resize(retained_bytes)?;
+        Ok(())
+    }
+
+    pub(super) fn queue_crypto(&mut self, frame: frame::Crypto, front: bool) {
+        if self.reserve_crypto(1).is_err() {
+            self.allocation_failed = true;
+            return;
+        }
+        if front {
+            self.crypto.push_front(frame);
+        } else {
+            self.crypto.push_back(frame);
+        }
+    }
+
+    fn reserve_merge(&mut self, rhs: &Self) -> Result<(), AllocationError> {
+        if self.allocation_failed || rhs.allocation_failed {
+            return Err(AllocationError);
+        }
+        if self.allocation.is_none()
+            && let Some(allocation) = &rhs.allocation
+        {
+            self.allocation = Some(Allocation {
+                budget: allocation.budget.clone(),
+                bytes: 0,
+            });
+        }
+        self.sync_allocation()?;
+        reserve_control_vec(
+            &mut self.reset_stream,
+            self.allocation.as_mut(),
+            rhs.reset_stream.len(),
+        )?;
+        reserve_control_vec(
+            &mut self.stop_sending,
+            self.allocation.as_mut(),
+            rhs.stop_sending.len(),
+        )?;
+        reserve_control_vec(
+            &mut self.retire_cids,
+            self.allocation.as_mut(),
+            rhs.retire_cids.len(),
+        )?;
+        reserve_control_vec(
+            &mut self.new_tokens,
+            self.allocation.as_mut(),
+            rhs.new_tokens.len(),
+        )?;
+        reserve_control_vec(
+            &mut self.reset_stream_at,
+            self.allocation.as_mut(),
+            rhs.reset_stream_at.len(),
+        )?;
+        reserve_control_vec(
+            &mut self.new_cids.cids,
+            self.allocation.as_mut(),
+            rhs.new_cids.cids.len(),
+        )?;
+        reserve_control_vec(
+            &mut self.reach_out.frames,
+            self.allocation.as_mut(),
+            rhs.reach_out.frames.len(),
+        )?;
+        self.reserve_crypto(rhs.crypto.len())?;
+        if let Some(allocation) = &mut self.allocation {
+            let extra = [
+                self.max_stream_data
+                    .len()
+                    .checked_add(rhs.max_stream_data.len())
+                    .and_then(|len| len.checked_mul(btree_entry_lease::<StreamId, ()>())),
+                self.path_abandon
+                    .len()
+                    .checked_add(rhs.path_abandon.len())
+                    .and_then(|len| {
+                        len.checked_mul(btree_entry_lease::<PathId, TransportErrorCode>())
+                    }),
+                self.path_status
+                    .len()
+                    .checked_add(rhs.path_status.len())
+                    .and_then(|len| len.checked_mul(btree_entry_lease::<PathId, ()>())),
+                self.path_cids_blocked
+                    .len()
+                    .checked_add(rhs.path_cids_blocked.len())
+                    .and_then(|len| len.checked_mul(btree_entry_lease::<PathId, VarInt>())),
+                self.add_address
+                    .len()
+                    .checked_add(rhs.add_address.len())
+                    .and_then(|len| len.checked_mul(btree_entry_lease::<AddAddress, ()>())),
+                self.remove_address
+                    .len()
+                    .checked_add(rhs.remove_address.len())
+                    .and_then(|len| len.checked_mul(btree_entry_lease::<RemoveAddress, ()>())),
+            ]
+            .into_iter()
+            .try_fold(0_usize, |total, bytes| total.checked_add(bytes?))
+            .ok_or(AllocationError)?;
+            allocation.resize(allocation.bytes.checked_add(extra).ok_or(AllocationError)?)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
         let Self {
             max_data,
@@ -657,6 +1195,7 @@ impl Retransmits {
             remove_address,
             reach_out,
             reset_stream_at,
+            ..
         } = &self;
         !max_data
             && !max_stream_id.iter().any(|x| *x)
@@ -686,6 +1225,10 @@ impl Retransmits {
 
 impl ::std::ops::BitOrAssign for Retransmits {
     fn bitor_assign(&mut self, rhs: Self) {
+        if self.reserve_merge(&rhs).is_err() {
+            self.allocation_failed = true;
+            return;
+        }
         let Self {
             max_data,
             max_stream_id,
@@ -708,7 +1251,14 @@ impl ::std::ops::BitOrAssign for Retransmits {
             remove_address,
             mut reach_out,
             reset_stream_at,
+            allocation,
+            allocation_failed,
         } = rhs;
+        let _rhs_allocation = allocation;
+        if allocation_failed {
+            self.allocation_failed = true;
+            return;
+        }
 
         // We reduce in-stream head-of-line blocking by queueing retransmits before other data for
         // STREAM and CRYPTO frames.
@@ -737,12 +1287,18 @@ impl ::std::ops::BitOrAssign for Retransmits {
         self.remove_address.extend(remove_address.iter().copied());
         self.reach_out.append(&mut reach_out);
         self.reset_stream_at.extend_from_slice(&reset_stream_at);
+        if self.sync_allocation().is_err() {
+            self.allocation_failed = true;
+        }
     }
 }
 
 impl ::std::ops::BitOrAssign<ThinRetransmits> for Retransmits {
     fn bitor_assign(&mut self, rhs: ThinRetransmits) {
-        let ThinRetransmits { retransmits } = rhs;
+        let ThinRetransmits {
+            retransmits,
+            box_allocation: _box_allocation,
+        } = rhs;
         if let Some(retransmits) = retransmits {
             self.bitor_assign(*retransmits)
         }
@@ -787,7 +1343,7 @@ impl PendingNewCids {
     pub(super) fn pop(&mut self) -> Option<IssuedCid> {
         if !mem::replace(&mut self.sorted, true) {
             self.cids
-                .sort_by_key(|cid| cmp::Reverse((cid.path_id, cid.sequence)));
+                .sort_unstable_by_key(|cid| cmp::Reverse((cid.path_id, cid.sequence)));
         }
         self.cids.pop()
     }
@@ -877,9 +1433,10 @@ impl FromIterator<frame::ReachOut> for PendingReachOutFrames {
 }
 
 /// A variant of `Retransmits` which only allocates storage when required
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub(super) struct ThinRetransmits {
     retransmits: Option<Box<Retransmits>>,
+    box_allocation: Option<Allocation>,
 }
 
 impl ThinRetransmits {
@@ -904,11 +1461,22 @@ impl ThinRetransmits {
     /// Returns a mutable reference to the stored retransmits
     ///
     /// This function will allocate a backing storage if required.
-    pub(super) fn get_or_create(&mut self) -> &mut Retransmits {
+    pub(super) fn get_or_create(
+        &mut self,
+        budget: Option<&Arc<BufferBudget>>,
+    ) -> Result<&mut Retransmits, AllocationError> {
         if self.retransmits.is_none() {
-            self.retransmits = Some(Box::default());
+            let allocation = budget
+                .map(|budget| budget.acquire(mem::size_of::<Retransmits>()))
+                .transpose()?;
+            let retransmits = match budget {
+                Some(budget) => Retransmits::with_budget(budget.clone()),
+                None => Retransmits::default(),
+            };
+            self.retransmits = Some(Box::new(retransmits));
+            self.box_allocation = allocation;
         }
-        self.retransmits.as_deref_mut().unwrap()
+        Ok(self.retransmits.as_deref_mut().unwrap())
     }
 }
 
@@ -1611,7 +2179,7 @@ mod test {
     fn sent_packet_size() {
         // The tracking state of sent packets should be minimal, and not grow
         // over time.
-        assert!(size_of::<SentPacket>() <= 128);
+        assert!(size_of::<SentPacket>() <= 128 + 2 * size_of::<Option<Allocation>>());
     }
 
     #[test]

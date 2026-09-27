@@ -528,7 +528,7 @@ impl<'a> Chunks<'a> {
             let (_, max_stream_data) = rs.max_stream_data(self.streams.stream_receive_window);
             should_transmit |= max_stream_data.0;
             if max_stream_data.0 {
-                self.pending.max_stream_data.insert(self.id);
+                self.pending.queue_max_stream_data(self.id);
             }
             // Return the stream to storage for future use
             self.streams

@@ -163,7 +163,7 @@ impl RecvStream<'_> {
 
         let (read_credits, stop_sending) = stream.stop()?;
         if stop_sending.should_transmit() {
-            self.pending.stop_sending.push(frame::StopSending {
+            self.pending.queue_stop_sending(frame::StopSending {
                 id: self.id,
                 error_code,
             });
@@ -389,7 +389,7 @@ impl<'a> SendStream<'a> {
         // credit based on the final offset communicated in the RESET_STREAM frame we send.
         self.state.unacked_data -= stream.pending.unacked();
         stream.reset();
-        self.pending.reset_stream.push((self.id, error_code));
+        self.pending.queue_reset_stream((self.id, error_code));
 
         // Don't reopen an already-closed stream we haven't forgotten yet
         Ok(())
@@ -445,8 +445,7 @@ impl<'a> SendStream<'a> {
 
         if queue_frame {
             self.pending
-                .reset_stream_at
-                .push((self.id, committed_reliable));
+                .queue_reset_stream_at((self.id, committed_reliable));
         }
         Ok(())
     }
