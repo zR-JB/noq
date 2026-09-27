@@ -1156,16 +1156,16 @@ impl StreamsState {
         self.send_window = send_window;
     }
 
-    /// Set the receive_window and returns whether the receive_window has been
-    /// expanded or shrunk: true if expanded, false if shrunk.
+    /// Set the receive_window, returning whether the peer was granted more credit
     pub(crate) fn set_receive_window(&mut self, receive_window: VarInt) -> bool {
         let receive_window: u64 = receive_window.into();
         let mut expanded = false;
         if receive_window > self.receive_window {
-            self.local_max_data = self
-                .local_max_data
-                .saturating_add(receive_window - self.receive_window);
-            expanded = true;
+            let diff = receive_window - self.receive_window;
+            let paid = diff.min(self.receive_window_shrink_debt);
+            self.receive_window_shrink_debt -= paid;
+            self.local_max_data = self.local_max_data.saturating_add(diff - paid);
+            expanded = diff > paid;
         } else {
             let diff = self.receive_window - receive_window;
             self.receive_window_shrink_debt = self.receive_window_shrink_debt.saturating_add(diff);

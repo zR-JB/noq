@@ -1859,6 +1859,29 @@ fn conn_flow_control() {
 }
 
 #[test]
+fn receive_window_cycles_keep_peer_credit_bounded() {
+    let _guard = subscribe();
+    const WINDOW: u32 = 16 * 1024;
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(TransportConfig {
+            receive_window: WINDOW.into(),
+            ..TransportConfig::default()
+        })
+        .connect();
+    for _ in 0..4 {
+        pair.set_receive_window(Server, (WINDOW / 2).into());
+        pair.set_receive_window(Server, WINDOW.into());
+        pair.drive();
+    }
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let msg = vec![0; 4 * WINDOW as usize];
+    assert_eq!(
+        pair.send_stream(Client, stream).write(&msg),
+        Ok(WINDOW as usize)
+    );
+}
+
+#[test]
 fn stop_opens_bidi() {
     let _guard = subscribe();
     let mut pair = Pair::default();
