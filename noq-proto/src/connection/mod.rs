@@ -559,7 +559,6 @@ impl Connection {
         SendStream {
             id,
             state: &mut self.streams,
-            pending: &mut self.spaces[SpaceId::Data].pending,
             conn_state: &self.state,
         }
     }
@@ -1557,7 +1556,7 @@ impl Connection {
                 .ok();
             let allocation = allocation.filter(|_| {
                 let pending = !self.spaces[space_id].pending.is_empty(&self.streams)
-                    || space_id == SpaceId::Data && self.streams.can_send_max_stream_data();
+                    || space_id == SpaceId::Data && self.streams.can_send_control();
                 let probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
                 let reserve = if pending {
                     Retransmits::first_control_bytes()
@@ -2948,7 +2947,7 @@ impl Connection {
     /// Whether there are any pending retransmits
     pub fn has_pending_retransmits(&self) -> bool {
         !self.spaces[SpaceId::Data].pending.is_empty(&self.streams)
-            || self.streams.can_send_max_stream_data()
+            || self.streams.can_send_control()
     }
 
     /// Look up whether we're the client or server of this Connection
@@ -3394,6 +3393,9 @@ impl Connection {
             }
             for (id, reliable_size) in retransmits.reset_stream_at.iter() {
                 self.streams.reset_at_acked(*id, *reliable_size);
+            }
+            for frame in retransmits.stop_sending.iter() {
+                self.streams.stop_sending_acked(frame.id);
             }
         }
 
@@ -7253,7 +7255,7 @@ impl Connection {
 
         // Other stream control frames are checked in PacketSpace::can_send.
         let other = self.streams.can_send_stream_data()
-            || self.streams.can_send_max_stream_data()
+            || self.streams.can_send_control()
             || self.datagrams.outgoing.can_send_1rtt(max_size);
 
         // All `false` fields are set in PacketSpace::can_send.
