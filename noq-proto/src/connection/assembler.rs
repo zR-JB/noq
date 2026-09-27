@@ -544,7 +544,7 @@ mod test {
             bytes: vec![7; length],
             alive: alive.clone(),
         });
-        let budget = BufferBudget::for_receive(1024 * 1024);
+        let budget = BufferBudget::for_receive(1024 * 1024, None);
         let mut assembler = Assembler::new(budget.clone());
         assembler.insert(0, bytes, length).unwrap();
         assembler.defragment().unwrap();
@@ -585,7 +585,7 @@ mod test {
 
     #[test]
     fn delivered_backing_keeps_shared_budget_until_last_clone() {
-        let budget = BufferBudget::for_receive(1);
+        let budget = BufferBudget::for_receive(1, None);
         let length = MIN_BUFFER_BYTES * 3 / 4;
         let mut assembler = Assembler::new(budget.clone());
         assembler
@@ -618,7 +618,7 @@ mod test {
 
     #[test]
     fn defragment_charges_old_and_new_backing_together() {
-        let budget = BufferBudget::for_receive(1);
+        let budget = BufferBudget::for_receive(1, None);
         let length = MIN_BUFFER_BYTES / 2 + 1;
         let mut assembler = Assembler::new(budget.clone());
         assembler
@@ -632,7 +632,7 @@ mod test {
 
     #[test]
     fn assemble_ordered() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         assert_matches!(next(&mut x, 32), None);
         x.insert(0, Bytes::from_static(b"123"), 3).unwrap();
         assert_matches!(next(&mut x, 1), Some(ref y) if &y[..] == b"1");
@@ -648,7 +648,7 @@ mod test {
 
     #[test]
     fn assemble_unordered() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.ensure_ordering(false).unwrap();
         x.insert(3, Bytes::from_static(b"456"), 3).unwrap();
         assert_matches!(next(&mut x, 32), None);
@@ -660,7 +660,7 @@ mod test {
 
     #[test]
     fn assemble_duplicate() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"123"), 3).unwrap();
         x.insert(0, Bytes::from_static(b"123"), 3).unwrap();
         assert_matches!(next(&mut x, 32), Some(ref y) if &y[..] == b"123");
@@ -669,7 +669,7 @@ mod test {
 
     #[test]
     fn assemble_duplicate_compact() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"123"), 3).unwrap();
         x.insert(0, Bytes::from_static(b"123"), 3).unwrap();
         x.defragment().unwrap();
@@ -679,7 +679,7 @@ mod test {
 
     #[test]
     fn assemble_contained() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"12345"), 5).unwrap();
         x.insert(1, Bytes::from_static(b"234"), 3).unwrap();
         assert_matches!(next(&mut x, 32), Some(ref y) if &y[..] == b"12345");
@@ -688,7 +688,7 @@ mod test {
 
     #[test]
     fn assemble_contained_compact() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"12345"), 5).unwrap();
         x.insert(1, Bytes::from_static(b"234"), 3).unwrap();
         x.defragment().unwrap();
@@ -698,7 +698,7 @@ mod test {
 
     #[test]
     fn assemble_contains() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(1, Bytes::from_static(b"234"), 3).unwrap();
         x.insert(0, Bytes::from_static(b"12345"), 5).unwrap();
         assert_matches!(next(&mut x, 32), Some(ref y) if &y[..] == b"12345");
@@ -707,7 +707,7 @@ mod test {
 
     #[test]
     fn assemble_contains_compact() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(1, Bytes::from_static(b"234"), 3).unwrap();
         x.insert(0, Bytes::from_static(b"12345"), 5).unwrap();
         x.defragment().unwrap();
@@ -717,7 +717,7 @@ mod test {
 
     #[test]
     fn assemble_overlapping() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"123"), 3).unwrap();
         x.insert(1, Bytes::from_static(b"234"), 3).unwrap();
         assert_matches!(next(&mut x, 32), Some(ref y) if &y[..] == b"123");
@@ -727,7 +727,7 @@ mod test {
 
     #[test]
     fn assemble_overlapping_compact() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"123"), 4).unwrap();
         x.insert(1, Bytes::from_static(b"234"), 4).unwrap();
         x.defragment().unwrap();
@@ -737,7 +737,7 @@ mod test {
 
     #[test]
     fn assemble_complex() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"1"), 1).unwrap();
         x.insert(2, Bytes::from_static(b"3"), 1).unwrap();
         x.insert(4, Bytes::from_static(b"5"), 1).unwrap();
@@ -748,7 +748,7 @@ mod test {
 
     #[test]
     fn assemble_complex_compact() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"1"), 1).unwrap();
         x.insert(2, Bytes::from_static(b"3"), 1).unwrap();
         x.insert(4, Bytes::from_static(b"5"), 1).unwrap();
@@ -760,7 +760,7 @@ mod test {
 
     #[test]
     fn assemble_old() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"1234"), 4).unwrap();
         assert_matches!(next(&mut x, 32), Some(ref y) if &y[..] == b"1234");
         x.insert(0, Bytes::from_static(b"1234"), 4).unwrap();
@@ -769,7 +769,7 @@ mod test {
 
     #[test]
     fn compact() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"abc"), 4).unwrap();
         x.insert(3, Bytes::from_static(b"def"), 4).unwrap();
         x.insert(9, Bytes::from_static(b"jkl"), 4).unwrap();
@@ -787,7 +787,7 @@ mod test {
 
     #[test]
     fn defrag_with_missing_prefix() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(3, Bytes::from_static(b"def"), 3).unwrap();
         x.defragment().unwrap();
         assert_eq!(
@@ -798,7 +798,7 @@ mod test {
 
     #[test]
     fn defrag_read_chunk() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(3, Bytes::from_static(b"def"), 4).unwrap();
         x.insert(0, Bytes::from_static(b"abc"), 4).unwrap();
         x.insert(7, Bytes::from_static(b"hij"), 4).unwrap();
@@ -816,7 +816,7 @@ mod test {
 
     #[test]
     fn unordered_happy_path() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.ensure_ordering(false).unwrap();
         x.insert(0, Bytes::from_static(b"abc"), 3).unwrap();
         assert_eq!(
@@ -834,7 +834,7 @@ mod test {
 
     #[test]
     fn unordered_dedup() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.ensure_ordering(false).unwrap();
         x.insert(3, Bytes::from_static(b"def"), 3).unwrap();
         assert_eq!(
@@ -876,7 +876,7 @@ mod test {
 
     #[test]
     fn chunks_dedup() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(3, Bytes::from_static(b"def"), 3).unwrap();
         assert_eq!(x.read(usize::MAX, true), None);
         x.insert(0, Bytes::from_static(b"a"), 1).unwrap();
@@ -909,7 +909,7 @@ mod test {
 
     #[test]
     fn ordered_eager_discard() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"abc"), 3).unwrap();
         assert_eq!(x.data.len(), 1);
         assert_eq!(
@@ -927,7 +927,7 @@ mod test {
 
     #[test]
     fn ordered_insert_unordered_read() {
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"abc"), 3).unwrap();
         x.insert(0, Bytes::from_static(b"abc"), 3).unwrap();
         x.ensure_ordering(false).unwrap();
@@ -942,7 +942,7 @@ mod test {
     fn no_duplicate_after_mode_switch() {
         // Regression test: bytes read in ordered mode should not be returned again in unordered
         // mode
-        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         x.insert(0, Bytes::from_static(b"a"), 1).unwrap();
         x.insert(0, Bytes::from_static(b"a"), 1).unwrap(); // duplicate
         assert_eq!(
@@ -1056,7 +1056,7 @@ mod proptests {
         #[strategy(proptest::collection::vec(any::<Op>(), 1..100))] ops: Vec<Op>,
     ) {
         let data = make_data();
-        let mut asm = Assembler::new(BufferBudget::for_receive(1024 * 1024));
+        let mut asm = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
         let mut reference = RefState::new();
 
         for op in ops {

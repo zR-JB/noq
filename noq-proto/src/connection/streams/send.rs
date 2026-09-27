@@ -439,7 +439,7 @@ mod tests {
 
     /// A `Send` with `data` bytes written and ready to be reset.
     fn writer(data: &[u8]) -> Box<Send> {
-        let mut send = Send::new(VarInt::MAX, BufferBudget::new(u64::MAX));
+        let mut send = Send::new(VarInt::MAX, BufferBudget::new(u64::MAX, None));
         let mut source = ByteSlice::from_slice(data);
         send.write(&mut source, data.len() as u64).unwrap();
         assert_eq!(send.offset(), data.len() as u64);

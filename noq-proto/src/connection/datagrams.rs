@@ -464,7 +464,10 @@ fn release_empty_queue(queue: &mut VecDeque<Datagram>, allocation: &mut Allocati
 #[cfg(test)]
 impl Default for DatagramState {
     fn default() -> Self {
-        Self::new(BufferBudget::new(u64::MAX), BufferBudget::new(u64::MAX))
+        Self::new(
+            BufferBudget::new(u64::MAX, None),
+            BufferBudget::new(u64::MAX, None),
+        )
     }
 }
 
@@ -474,8 +477,8 @@ mod tests {
 
     #[test]
     fn delivered_datagrams_keep_aggregate_backing_credit() {
-        let budget = BufferBudget::new(64 * 1024);
-        let mut state = DatagramState::new(budget.clone(), BufferBudget::new(64 * 1024));
+        let budget = BufferBudget::new(64 * 1024, None);
+        let mut state = DatagramState::new(budget.clone(), BufferBudget::new(64 * 1024, None));
         let source = Bytes::from(vec![7; 1024 * 1024]);
         let mut retained = Vec::new();
         for _ in 0..100 {

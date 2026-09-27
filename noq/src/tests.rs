@@ -1265,34 +1265,73 @@ async fn on_closed_endpoint_drop() {
         .expect("client task panicked");
 }
 
+#[derive(Debug)]
+struct Budget {
+    limit: AtomicUsize,
+    used: AtomicUsize,
+}
+
+impl Budget {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            limit: AtomicUsize::new(usize::MAX),
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    fn endpoint(self: &Arc<Self>, factory: &EndpointFactory) -> Endpoint {
+        let mut transport = TransportConfig::default();
+        transport.shared_budget(Some(self.clone()));
+        factory.endpoint_with_config("budgeted", transport)
+    }
+}
+
+impl proto::SharedBudget for Budget {
+    fn try_charge(&self, bytes: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes)
+                    .filter(|&used| used <= self.limit.load(Ordering::Relaxed))
+            })
+            .is_ok()
+    }
+
+    fn refund(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn connecting_weak_handle_survives_cancellation() {
-    let endpoint = endpoint();
+async fn cancelled_handshake_keeps_shared_charge_until_transport_destruction() {
+    let budget = Budget::new();
+    let endpoint = budget.endpoint(&EndpointFactory::new());
     let stalled = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let connecting = endpoint
         .connect(stalled.local_addr().unwrap(), "localhost")
         .unwrap();
-    let weak = connecting.weak_handle().unwrap();
-    assert!(weak.is_alive());
+    assert!(budget.used() > 0);
     drop(connecting);
-    assert!(weak.is_alive());
+    assert!(budget.used() > 0);
     tokio::time::timeout(Duration::from_secs(30), endpoint.wait_idle())
         .await
         .unwrap();
-    assert!(!weak.is_alive());
+    assert_eq!(budget.used(), 0);
 }
 
 #[tokio::test]
 async fn send_buffered_bytes_survive_window_shrink_and_stream_ownership() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        let endpoint = endpoint();
-        let mut connecting = endpoint
+        let budget = Budget::new();
+        let endpoint = budget.endpoint(&EndpointFactory::new());
+        let connecting = endpoint
             .connect(endpoint.local_addr().unwrap(), "localhost")
             .unwrap();
-        let weak = connecting.weak_handle().unwrap();
         let server = async { endpoint.accept().await.unwrap().await.unwrap() };
-        let (client, server) = tokio::join!(&mut connecting, server);
-        assert!(connecting.weak_handle().is_none());
+        let (client, server) = tokio::join!(connecting, server);
         let client = client.unwrap();
         let mut stream = client.open_uni().await.unwrap();
         stream.write_all(&[42; 4096]).await.unwrap();
@@ -1303,9 +1342,9 @@ async fn send_buffered_bytes_survive_window_shrink_and_stream_ownership() {
         drop(client);
         drop(server);
         endpoint.wait_idle().await;
-        assert!(weak.is_alive());
+        assert!(budget.used() > 0);
         drop(stream);
-        assert!(!weak.is_alive());
+        assert_eq!(budget.used(), 0);
     })
     .await
     .unwrap();
@@ -1314,14 +1353,14 @@ async fn send_buffered_bytes_survive_window_shrink_and_stream_ownership() {
 #[tokio::test]
 async fn receive_backing_outlives_connection_handles() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        let endpoint = endpoint();
+        let budget = Budget::new();
+        let endpoint = budget.endpoint(&EndpointFactory::new());
         let connecting = endpoint
             .connect(endpoint.local_addr().unwrap(), "localhost")
             .unwrap();
         let accepting = async { endpoint.accept().await.unwrap().await.unwrap() };
         let (client, server) = tokio::join!(connecting, accepting);
         let client = client.unwrap();
-        let weak = server.weak_handle();
         let mut send = client.open_uni().await.unwrap();
         send.write_all(&[42; 4096]).await.unwrap();
         send.finish().unwrap();
@@ -1329,18 +1368,16 @@ async fn receive_backing_outlives_connection_handles() {
         let chunk = recv.read_chunk(4096).await.unwrap().unwrap();
         let retained = chunk.slice(..1);
         drop(chunk);
-        assert!(weak.has_receive_allocations());
         client.close(0u32.into(), b"done");
         drop(send);
         drop(recv);
         drop(client);
         drop(server);
         endpoint.wait_idle().await;
-        assert!(weak.upgrade().is_none());
-        assert!(weak.has_receive_allocations());
+        assert!(budget.used() > 0);
         assert_eq!(retained.as_ref(), &[42]);
         drop(retained);
-        assert!(!weak.has_receive_allocations());
+        assert_eq!(budget.used(), 0);
     })
     .await
     .unwrap();
@@ -1349,28 +1386,79 @@ async fn receive_backing_outlives_connection_handles() {
 #[tokio::test]
 async fn receive_datagram_backing_outlives_connection_handles() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        let endpoint = endpoint();
+        let budget = Budget::new();
+        let endpoint = budget.endpoint(&EndpointFactory::new());
         let connecting = endpoint
             .connect(endpoint.local_addr().unwrap(), "localhost")
             .unwrap();
         let accepting = async { endpoint.accept().await.unwrap().await.unwrap() };
         let (client, server) = tokio::join!(connecting, accepting);
         let client = client.unwrap();
-        let weak = server.weak_handle();
         client.send_datagram(Bytes::from(vec![42; 1024])).unwrap();
         let datagram = server.read_datagram().await.unwrap();
         let retained = datagram.slice(..1);
         drop(datagram);
-        assert!(weak.has_receive_allocations());
         client.close(0u32.into(), b"done");
         drop(client);
         drop(server);
         endpoint.wait_idle().await;
-        assert!(weak.upgrade().is_none());
-        assert!(weak.has_receive_allocations());
+        assert!(budget.used() > 0);
         assert_eq!(retained.as_ref(), &[42]);
         drop(retained);
-        assert!(!weak.has_receive_allocations());
+        assert_eq!(budget.used(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn shared_budget_refusal_closes_only_the_requesting_connection() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let budget = Budget::new();
+        let factory = EndpointFactory::new();
+        let server = budget.endpoint(&factory);
+        let client = factory.endpoint("client");
+        let address = server.local_addr().unwrap();
+        let mut connections = Vec::new();
+        for _ in 0..2 {
+            let (client, server) =
+                tokio::join!(client.connect(address, "localhost").unwrap(), async {
+                    server.accept().await.unwrap().await.unwrap()
+                });
+            connections.push((client.unwrap(), server));
+        }
+        let (sibling, sibling_server) = connections.pop().unwrap();
+        let (attacked, attacked_server) = connections.pop().unwrap();
+        budget
+            .limit
+            .store(budget.used() + 16 * 1024, Ordering::Relaxed);
+        let mut unread = attacked.open_uni().await.unwrap();
+        let _ = unread.write_all(&[7; 64 * 1024]).await;
+        match attacked_server.closed().await {
+            ConnectionError::TransportError(error) => {
+                assert_eq!(error.code, proto::TransportErrorCode::INTERNAL_ERROR)
+            }
+            error => panic!("unexpected close: {error:?}"),
+        }
+        assert!(sibling.close_reason().is_none());
+        budget.limit.store(usize::MAX, Ordering::Relaxed);
+        let mut send = sibling.open_uni().await.unwrap();
+        send.write_all(b"live").await.unwrap();
+        send.finish().unwrap();
+        let mut recv = sibling_server.accept_uni().await.unwrap();
+        assert_eq!(recv.read_to_end(4).await.unwrap(), b"live");
+        sibling.close(0u32.into(), b"done");
+        drop((
+            unread,
+            attacked,
+            attacked_server,
+            sibling,
+            sibling_server,
+            recv,
+            send,
+        ));
+        tokio::join!(server.wait_idle(), client.wait_idle());
+        assert_eq!(budget.used(), 0);
     })
     .await
     .unwrap();

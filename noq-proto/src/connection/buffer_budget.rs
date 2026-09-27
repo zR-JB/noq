@@ -1,11 +1,11 @@
 use crate::{TransportError, range_set::ArrayRangeSet};
 use bytes::Bytes;
 use std::{
-    mem,
+    fmt, mem,
     ops::Range,
     sync::{
-        Arc, Weak,
-        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     },
 };
 
@@ -13,14 +13,24 @@ pub(super) const COPY_BLOCK_BYTES: usize = 16 * 1024;
 
 pub(super) const MIN_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Byte budget shared by connections; a refused charge closes only the requesting connection
+pub trait SharedBudget: Send + Sync + fmt::Debug {
+    /// Charges `bytes` if they fit
+    fn try_charge(&self, bytes: usize) -> bool;
+    /// Returns previously charged bytes
+    fn refund(&self, bytes: usize);
+}
+
 #[derive(Debug)]
 pub(super) struct BufferBudget {
     limit: AtomicUsize,
     used: AtomicUsize,
+    shared: Option<Arc<dyn SharedBudget>>,
+    refused: AtomicBool,
 }
 
 impl BufferBudget {
-    pub(super) fn new(limit: u64) -> Arc<Self> {
+    pub(super) fn new(limit: u64, shared: Option<&Arc<dyn SharedBudget>>) -> Arc<Self> {
         Arc::new(Self {
             limit: AtomicUsize::new(
                 usize::try_from(limit)
@@ -28,11 +38,13 @@ impl BufferBudget {
                     .max(MIN_BUFFER_BYTES),
             ),
             used: AtomicUsize::new(0),
+            shared: shared.cloned(),
+            refused: AtomicBool::new(false),
         })
     }
 
-    pub(super) fn for_receive(window: u64) -> Arc<Self> {
-        Self::new(window.saturating_mul(3))
+    pub(super) fn for_receive(window: u64, shared: Option<&Arc<dyn SharedBudget>>) -> Arc<Self> {
+        Self::new(window.saturating_mul(3), shared)
     }
 
     pub(super) fn set_limit(&self, limit: u64) {
@@ -50,6 +62,10 @@ impl BufferBudget {
             .saturating_sub(self.used())
     }
 
+    pub(super) fn refused(&self) -> bool {
+        self.refused.load(AtomicOrdering::Relaxed)
+    }
+
     pub(super) fn used(&self) -> usize {
         self.used.load(AtomicOrdering::Relaxed)
     }
@@ -61,26 +77,27 @@ impl BufferBudget {
                     .filter(|&next| next <= self.limit.load(AtomicOrdering::Relaxed))
             })
             .map_err(|_| AllocationError)?;
+        if let Some(shared) = &self.shared
+            && bytes != 0
+            && !shared.try_charge(bytes)
+        {
+            self.used.fetch_sub(bytes, AtomicOrdering::Relaxed);
+            self.refused.store(true, AtomicOrdering::Relaxed);
+            return Err(AllocationError);
+        }
         Ok(Allocation {
             budget: self.clone(),
             bytes,
         })
     }
-}
 
-#[doc(hidden)]
-#[derive(Debug, Clone)]
-pub struct ReceiveAllocationHandle(Weak<BufferBudget>);
-
-impl ReceiveAllocationHandle {
-    pub(super) fn new(budget: &Arc<BufferBudget>) -> Self {
-        Self(Arc::downgrade(budget))
-    }
-
-    pub fn has_allocations(&self) -> bool {
-        self.0
-            .upgrade()
-            .is_some_and(|budget| budget.used.load(AtomicOrdering::Relaxed) != 0)
+    fn release(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, AtomicOrdering::Relaxed);
+        if let Some(shared) = &self.shared
+            && bytes != 0
+        {
+            shared.refund(bytes);
+        }
     }
 }
 
@@ -106,9 +123,7 @@ impl Allocation {
             self.bytes = bytes;
             extra.bytes = 0;
         } else {
-            self.budget
-                .used
-                .fetch_sub(self.bytes - bytes, AtomicOrdering::Relaxed);
+            self.budget.release(self.bytes - bytes);
             self.bytes = bytes;
         }
         Ok(())
@@ -117,9 +132,7 @@ impl Allocation {
 
 impl Drop for Allocation {
     fn drop(&mut self) {
-        self.budget
-            .used
-            .fetch_sub(self.bytes, AtomicOrdering::Relaxed);
+        self.budget.release(self.bytes);
     }
 }
 

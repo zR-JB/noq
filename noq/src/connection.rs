@@ -45,11 +45,6 @@ pub struct Connecting {
 }
 
 impl Connecting {
-    /// Track handshake, stream ownership, and draining; returns `None` after completion.
-    pub fn weak_handle(&self) -> Option<WeakConnectionHandle> {
-        self.conn.as_ref().map(ConnectionRef::weak_handle)
-    }
-
     pub(crate) fn new(
         handle: ConnectionHandle,
         conn: proto::Connection,
@@ -61,7 +56,6 @@ impl Connecting {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
 
-        let receive_allocations = conn.receive_allocation_handle();
         let conn = ConnectionRef(Arc::new(Arc::new(ConnectionInner {
             state: Mutex::new(State::new(
                 conn,
@@ -74,7 +68,6 @@ impl Connecting {
                 runtime.clone(),
             )),
             shared: Shared::default(),
-            receive_allocations,
         })));
 
         let driver = ConnectionDriver(conn.clone());
@@ -917,14 +910,6 @@ impl Connection {
             .send_buffered_bytes()
     }
 
-    /// Retained send backing and buffer metadata, including stream data behind ACK gaps.
-    pub fn send_allocated_bytes(&self) -> u64 {
-        self.0
-            .lock_without_waking("send_allocated_bytes")
-            .inner
-            .send_allocated_bytes()
-    }
-
     /// See [`proto::TransportConfig::send_window()`]
     pub fn set_send_window(&self, send_window: u64) {
         let mut conn = self.0.lock_and_wake("set_send_window");
@@ -1418,7 +1403,7 @@ impl ConnectionRef {
     }
 
     pub(crate) fn weak_handle(&self) -> WeakConnectionHandle {
-        WeakConnectionHandle(Arc::downgrade(&self.0), self.0.receive_allocations.clone())
+        WeakConnectionHandle(Arc::downgrade(&self.0))
     }
 }
 
@@ -1458,7 +1443,6 @@ pub(crate) struct ConnectionInner {
     /// Kept private intentionally, use [`Self::lock_and_wake`].
     state: Mutex<State>,
     pub(crate) shared: Shared,
-    receive_allocations: proto::ReceiveAllocationHandle,
 }
 
 impl ConnectionInner {
@@ -1508,19 +1492,14 @@ impl Drop for WakeGuard<'_> {
     }
 }
 
-/// A weak handle to connection internals and receive allocation lifetime.
+/// A weak handle to connection internals
 #[derive(Debug, Clone)]
-pub struct WeakConnectionHandle(Weak<Arc<ConnectionInner>>, proto::ReceiveAllocationHandle);
+pub struct WeakConnectionHandle(Weak<Arc<ConnectionInner>>);
 
 impl WeakConnectionHandle {
     /// Returns `true` if the [`Connection`] associated with this handle is still alive.
     pub fn is_alive(&self) -> bool {
         self.0.upgrade().is_some()
-    }
-
-    /// Whether receive allocations remain owned, including bytes returned to the application.
-    pub fn has_receive_allocations(&self) -> bool {
-        self.1.has_allocations()
     }
 
     /// Upgrade the handle to a full `Connection`

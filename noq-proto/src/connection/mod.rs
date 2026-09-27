@@ -57,7 +57,7 @@ mod assembler;
 pub use assembler::Chunk;
 mod buffer_budget;
 mod packet_map;
-pub use buffer_budget::ReceiveAllocationHandle;
+pub use buffer_budget::SharedBudget;
 
 mod cid_state;
 use cid_state::CidState;
@@ -333,7 +333,8 @@ impl Connection {
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
         let mut rng = StdRng::from_seed(rng_seed);
-        let packet_budget = buffer_budget::BufferBudget::new(config.send_window);
+        let shared = config.shared_budget.as_ref();
+        let packet_budget = buffer_budget::BufferBudget::new(config.send_window, shared);
         let mut initial_space =
             PacketSpace::new(now, SpaceId::Initial, &mut rng, packet_budget.clone());
         let mut handshake_space =
@@ -374,6 +375,7 @@ impl Connection {
             config.send_window,
             config.receive_window,
             config.stream_receive_window,
+            shared,
         );
         let datagrams = DatagramState::new(streams.receive_budget(), streams.send_budget());
         let mut this = Self {
@@ -384,6 +386,7 @@ impl Connection {
                 side,
                 &mut rng,
                 config.crypto_buffer_size,
+                shared,
             ),
             handshake_cid: local_cid,
             remote_handshake_cid: remote_cid,
@@ -506,11 +509,6 @@ impl Connection {
     #[must_use]
     pub fn poll_endpoint_events(&mut self) -> Option<EndpointEvent> {
         self.endpoint_events.pop_front().map(EndpointEvent)
-    }
-
-    #[doc(hidden)]
-    pub fn receive_allocation_handle(&self) -> ReceiveAllocationHandle {
-        ReceiveAllocationHandle::new(&self.streams.reassembly)
     }
 
     /// Provide control over streams
@@ -1057,6 +1055,7 @@ impl Connection {
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
         if self.streams.allocation_failed()
+            || self.packet_budget.refused()
             || self
                 .spaces
                 .iter()
@@ -3039,8 +3038,8 @@ impl Connection {
             .admission_blocked()
     }
 
-    /// Retained send backing and buffer metadata, including stream data behind ACK gaps.
-    pub fn send_allocated_bytes(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn send_allocated_bytes(&self) -> u64 {
         self.streams.transmit.used() as u64
     }
 
@@ -3048,6 +3047,11 @@ impl Connection {
     pub fn set_send_window(&mut self, send_window: u64) {
         self.streams.set_send_window(send_window);
         self.packet_budget.set_limit(send_window);
+    }
+
+    /// See [`TransportConfig::shared_budget()`]
+    pub fn shared_budget(&self) -> Option<&Arc<dyn SharedBudget>> {
+        self.config.shared_budget.as_ref()
     }
 
     /// See [`TransportConfig::receive_window()`]

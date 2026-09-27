@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    ConnectionId, Duration, INITIAL_MTU, Instant, MAX_UDP_PAYLOAD, Side, VarInt,
+    ConnectionId, Duration, INITIAL_MTU, Instant, MAX_UDP_PAYLOAD, SharedBudget, Side, VarInt,
     VarIntBoundsExceeded, address_discovery, congestion, connection::qlog::QlogSink,
 };
 #[cfg(feature = "qlog")]
@@ -34,6 +34,7 @@ pub struct TransportConfig {
     pub(crate) stream_receive_window: VarInt,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
+    pub(crate) shared_budget: Option<Arc<dyn SharedBudget>>,
     pub(crate) send_fairness: bool,
 
     pub(crate) packet_threshold: u32,
@@ -150,6 +151,12 @@ impl TransportConfig {
     /// every connection uses the entire window.
     pub fn send_window(&mut self, value: u64) -> &mut Self {
         self.send_window = value;
+        self
+    }
+
+    /// Budget that every connection buffer charges while it holds bytes
+    pub fn shared_budget(&mut self, value: Option<Arc<dyn SharedBudget>>) -> &mut Self {
+        self.shared_budget = value;
         self
     }
 
@@ -561,6 +568,7 @@ impl Default for TransportConfig {
             stream_receive_window: STREAM_RWND.into(),
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
+            shared_budget: None,
             send_fairness: true,
 
             packet_threshold: 3,
@@ -613,6 +621,7 @@ impl fmt::Debug for TransportConfig {
             stream_receive_window,
             receive_window,
             send_window,
+            shared_budget,
             send_fairness,
             packet_threshold,
             time_threshold,
@@ -650,6 +659,7 @@ impl fmt::Debug for TransportConfig {
             .field("stream_receive_window", stream_receive_window)
             .field("receive_window", receive_window)
             .field("send_window", send_window)
+            .field("shared_budget", shared_budget)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)

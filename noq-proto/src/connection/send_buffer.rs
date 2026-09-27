@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn fragment_with_length() {
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         const MSG: &[u8] = b"Hello, world!";
         buf.write(MSG);
         // 0 byte offset => 19 bytes left => 13 byte data isn't enough
@@ -708,7 +708,7 @@ mod tests {
 
     #[test]
     fn fragment_without_length() {
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         const MSG: &[u8] = b"Hello, world with some extra data!";
         buf.write(MSG);
         // 0 byte offset => 19 bytes left => can be filled by 34 bytes payload
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn reserves_encoded_offset() {
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
 
         // Pretend we have more than 1 GB of data in the buffer
         let chunk: Bytes = Bytes::from_static(&[0; 1024 * 1024]);
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn sparse_acks_never_allocate_with_exhausted_storage() {
-        let budget = BufferBudget::new(64 * 1024);
+        let budget = BufferBudget::new(64 * 1024, None);
         let mut buf = SendBuffer::new(budget.clone());
         let data = vec![7; 64 * 1024];
         while let Ok((length, allocation)) = buf.prepare_write(data.len()) {
@@ -817,7 +817,7 @@ mod tests {
 
     #[test]
     fn sparse_losses_retransmit_with_exhausted_storage() {
-        let budget = BufferBudget::new(64 * 1024);
+        let budget = BufferBudget::new(64 * 1024, None);
         let mut buf = SendBuffer::new(budget.clone());
         let data = vec![7; 64 * 1024];
         while let Ok((length, allocation)) = buf.prepare_write(data.len()) {
@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn backing_charge_survives_ack_gap_and_truncation() {
-        let budget = BufferBudget::new(64 * 1024);
+        let budget = BufferBudget::new(64 * 1024, None);
         let mut buf = SendBuffer::new(budget.clone());
         let source = Bytes::from(vec![0x5a; 1024 * 1024]);
         buf.write(source.slice(0..4000));
@@ -869,7 +869,7 @@ mod tests {
             buf.freeze()
         }
 
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         let msg: Bytes = dup(b"Hello, world!");
         let msg_len: u64 = msg.len() as u64;
 
@@ -904,7 +904,7 @@ mod tests {
 
     #[test]
     fn retransmit() {
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         const MSG: &[u8] = b"Hello, world with extra data!";
         buf.write(MSG);
         // Transmit two frames
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn ack() {
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         const MSG: &[u8] = b"Hello, world!";
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(16), (0..8, true));
@@ -932,7 +932,7 @@ mod tests {
 
     #[test]
     fn reordered_ack() {
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         const MSG: &[u8] = b"Hello, world with extra data!";
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(16), (0..16, false));
@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn truncate_basic() {
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         const MSG: &[u8] = b"Hello, world!"; // 13 bytes, coalesced into last_segment
         buf.write(MSG);
         assert_eq!(buf.offset(), 13);
@@ -968,7 +968,7 @@ mod tests {
 
     #[test]
     fn truncate_multiple_segments() {
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         // Segments larger than MAX_COMBINE are stored as standalone segments.
         buf.write(Bytes::from(vec![1u8; 2000]));
         buf.write(Bytes::from(vec![2u8; 2000]));
@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn truncate_after_ack_and_below_front() {
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         const MSG: &[u8] = b"abcdefghij"; // 10 bytes
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(64), (0..10, true));
@@ -1014,7 +1014,7 @@ mod tests {
 
     #[test]
     fn truncate_drops_retransmits_and_unacked() {
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         const MSG: &[u8] = b"Hello, world with extra data!"; // 29 bytes
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(64), (0..29, true));
@@ -1039,14 +1039,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "Requested range is outside of buffered data")]
     fn send_buffer_get_out_of_range() {
-        let data = SendBufferData::new(BufferBudget::new(u64::MAX));
+        let data = SendBufferData::new(BufferBudget::new(u64::MAX, None));
         data.get(0..1);
     }
 
     #[test]
     #[should_panic(expected = "Requested range is outside of buffered data")]
     fn send_buffer_get_into_out_of_range() {
-        let data = SendBufferData::new(BufferBudget::new(u64::MAX));
+        let data = SendBufferData::new(BufferBudget::new(u64::MAX, None));
         let mut buf = Vec::new();
         data.get_into(0..1, &mut buf);
     }
@@ -1096,7 +1096,7 @@ mod proptests {
         #[strategy(proptest::collection::vec(any::<Op>(), 1..100))] ops: Vec<Op>,
     ) {
         let _guard = subscribe();
-        let mut sb = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut sb = SendBuffer::new(BufferBudget::new(u64::MAX, None));
         // all data written to the send buffer
         let mut buf = Vec::new();
         // max offset that has been returned by poll_transmit
@@ -1196,7 +1196,7 @@ pub mod send_buffer_benches {
     /// Pathological case: many segments, get from end
     pub fn get_into_many_segments(criterion: &mut Criterion) {
         let mut group = criterion.benchmark_group("get_into_many_segments");
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
 
         const SEGMENTS: u64 = 10000;
         const SEGMENT_SIZE: u64 = 10;
@@ -1221,7 +1221,7 @@ pub mod send_buffer_benches {
     /// Get segments in the old way, using a loop of get calls
     pub fn get_loop_many_segments(criterion: &mut Criterion) {
         let mut group = criterion.benchmark_group("get_loop_many_segments");
-        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX));
+        let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
 
         const SEGMENTS: u64 = 10000;
         const SEGMENT_SIZE: u64 = 10;

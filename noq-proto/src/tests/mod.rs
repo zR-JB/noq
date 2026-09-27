@@ -6,7 +6,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -5387,10 +5387,69 @@ fn regression_initial_coalescing_large_cid() {
     pair.drive_client(); // this used to try to build a packet without enough datagram space
 }
 
+#[derive(Debug)]
+struct Budget {
+    limit: AtomicUsize,
+    used: AtomicUsize,
+}
+
+impl Budget {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            limit: AtomicUsize::new(usize::MAX),
+            used: AtomicUsize::new(0),
+        })
+    }
+
+    fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+}
+
+impl crate::SharedBudget for Budget {
+    fn try_charge(&self, bytes: usize) -> bool {
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes)
+                    .filter(|&used| used <= self.limit.load(Ordering::Relaxed))
+            })
+            .is_ok()
+    }
+
+    fn refund(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn shared_budget_refusal_on_send_closes_the_connection() {
+    let budget = Budget::new();
+    let mut builder = ConnPair::builder();
+    builder
+        .client_transport_cfg
+        .shared_budget(Some(budget.clone()));
+    let mut pair = builder.connect();
+    budget.limit.store(budget.used() + 1024, Ordering::Relaxed);
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    assert_matches!(
+        pair.send_stream(Client, stream).write(&[0; 64 * 1024]),
+        Err(WriteError::Blocked)
+    );
+    pair.drive_client();
+    while !matches!(pair.conn_mut(Client).poll().expect("close event"),
+        Event::ConnectionLost { reason: ConnectionError::TransportError(ref error) }
+        if error.code == TransportErrorCode::INTERNAL_ERROR)
+    {}
+}
+
 #[test]
 fn close_reason_backing_survives_connection_handles() {
-    let mut pair = ConnPair::default();
-    let allocation = pair.conn(Server).receive_allocation_handle();
+    let budget = Budget::new();
+    let mut builder = ConnPair::builder();
+    builder
+        .server_transport_cfg
+        .shared_budget(Some(budget.clone()));
+    let mut pair = builder.connect();
     let mut arena = vec![0; 1024 * 1024];
     arena[..4].copy_from_slice(b"done");
     let reason = Bytes::from(arena).slice(..4);
@@ -5411,9 +5470,9 @@ fn close_reason_backing_survives_connection_handles() {
     assert_eq!(reason, b"done"[..]);
     assert!(pair.conn(Server).receive_buffer_allocated_bytes() < 1024);
     drop(pair);
-    assert!(allocation.has_allocations());
+    assert!(budget.used() > 0);
     drop(reason);
-    assert!(!allocation.has_allocations());
+    assert_eq!(budget.used(), 0);
 }
 
 #[test]

@@ -39,7 +39,7 @@ use rustc_hash::FxHashMap;
     any(feature = "aws-lc-rs", feature = "ring"),
 ))]
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::{Notify, Semaphore, futures::Notified, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, futures::Notified, mpsc};
 use tracing::{Instrument, Span, trace};
 use udp::{BATCH_SIZE, RecvMeta};
 
@@ -743,6 +743,22 @@ const PACKET_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 struct ConnectionSender {
     events: mpsc::UnboundedSender<ConnectionEvent>,
     packet_budget: Arc<Semaphore>,
+    shared: Option<Arc<dyn proto::SharedBudget>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PacketCharge {
+    _permit: OwnedSemaphorePermit,
+    shared: Option<Arc<dyn proto::SharedBudget>>,
+    bytes: usize,
+}
+
+impl Drop for PacketCharge {
+    fn drop(&mut self) {
+        if let Some(shared) = &self.shared {
+            shared.refund(self.bytes);
+        }
+    }
 }
 
 impl std::ops::Deref for ConnectionSender {
@@ -755,19 +771,32 @@ impl std::ops::Deref for ConnectionSender {
 
 impl ConnectionSender {
     fn send_proto(&self, event: proto::ConnectionEvent) {
-        let permit = if let Some(bytes) = event.packet_storage_size() {
-            let Ok(bytes) = u32::try_from(bytes.saturating_add(mem::size_of::<ConnectionEvent>()))
-            else {
+        let charge = if let Some(bytes) = event.packet_storage_size() {
+            let bytes = bytes.saturating_add(mem::size_of::<ConnectionEvent>());
+            let Some(permit) = u32::try_from(bytes).ok().and_then(|permits| {
+                self.packet_budget
+                    .clone()
+                    .try_acquire_many_owned(permits)
+                    .ok()
+            }) else {
                 return;
             };
-            let Ok(permit) = self.packet_budget.clone().try_acquire_many_owned(bytes) else {
+            if self
+                .shared
+                .as_ref()
+                .is_some_and(|shared| !shared.try_charge(bytes))
+            {
                 return;
-            };
-            Some(permit)
+            }
+            Some(PacketCharge {
+                _permit: permit,
+                shared: self.shared.clone(),
+                bytes,
+            })
         } else {
             None
         };
-        let _ = self.events.send(ConnectionEvent::Proto(event, permit));
+        let _ = self.events.send(ConnectionEvent::Proto(event, charge));
     }
 }
 
@@ -813,6 +842,7 @@ impl ConnectionSet {
             ConnectionSender {
                 events: send,
                 packet_budget: Arc::new(Semaphore::new(PACKET_QUEUE_BYTES)),
+                shared: conn.shared_budget().cloned(),
             },
         );
         self.active_connections += 1;
