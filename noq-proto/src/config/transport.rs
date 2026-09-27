@@ -160,6 +160,11 @@ impl TransportConfig {
         self
     }
 
+    /// Bytes each connection precharges to its shared budget, including all peer stream state
+    pub fn connection_floor_bytes(&self) -> usize {
+        crate::connection::connection_floor_bytes(self)
+    }
+
     /// Whether to implement fair queuing for send streams having the same priority.
     ///
     /// When enabled, connections schedule data from outgoing streams having the same priority in a

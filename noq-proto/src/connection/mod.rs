@@ -57,7 +57,7 @@ mod assembler;
 pub use assembler::Chunk;
 mod buffer_budget;
 mod packet_map;
-pub use buffer_budget::{CONNECTION_FLOOR_BYTES, PacketCharge, PacketQueue, SharedBudget};
+pub use buffer_budget::{PacketCharge, PacketQueue, SharedBudget};
 
 mod cid_state;
 use cid_state::CidState;
@@ -8127,6 +8127,15 @@ impl SentFrames {
         }
         Ok(())
     }
+}
+
+/// Floors of the packet metadata, packet queue, crypto, send and receive pools, and stream state
+pub(crate) fn connection_floor_bytes(config: &TransportConfig) -> usize {
+    StreamsState::floor_bytes(
+        config.max_concurrent_bidi_streams,
+        config.max_concurrent_uni_streams,
+    )
+    .saturating_add(5 * buffer_budget::MIN_BUFFER_BYTES)
 }
 
 /// Computes the negotiated idle timeout based on the transport parameters.

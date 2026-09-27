@@ -5179,7 +5179,7 @@ fn packet_metadata_pressure_acknowledges_when_congestion_blocked() -> TestResult
 
 #[test]
 fn packet_metadata_pressure_samples_rtt_from_tracked_packets() -> TestResult {
-    let max_rtt = bidirectional_metadata_pressure(6, 5)?.max_rtt;
+    let max_rtt = bidirectional_metadata_pressure(8, 5)?.max_rtt;
     assert!(max_rtt < Duration::from_millis(200), "{max_rtt:?}");
     Ok(())
 }
@@ -5286,12 +5286,13 @@ fn bidirectional_metadata_pressure(
 fn packet_metadata_pressure_preserves_one_way_delivery() -> TestResult {
     let mut transport = TransportConfig::default();
     transport.send_window(64 * 1024);
-    transport.max_concurrent_uni_streams(65_536u32.into());
-    let mut pair = ConnPair::builder()
+    let mut builder = ConnPair::builder()
         .with_transport_cfg(transport)
-        .with_latency(Duration::from_millis(50))
-        .connect();
-    let (healthy_client, healthy_server) = Pair::connect(&mut pair);
+        .with_latency(Duration::from_millis(50));
+    builder
+        .server_transport_cfg
+        .max_concurrent_uni_streams(65_536u32.into());
+    let mut pair = builder.connect();
     let stream = pair.streams(Client).open(Dir::Uni).unwrap();
     let total = 2 * 1024 * 1024;
     let mut remaining = total;
@@ -5328,39 +5329,9 @@ fn packet_metadata_pressure_preserves_one_way_delivery() -> TestResult {
     assert_eq!(pair.conn(Client).send_buffered_bytes(), 0);
     assert!(pair.conn(Client).send_allocated_bytes() <= 64 * 1024);
     pair.drive_client();
-    loop {
-        if let Event::ConnectionLost {
-            reason: ConnectionError::TransportError(error),
-        } = pair
-            .conn_mut(Client)
-            .poll()
-            .expect("allocation close event")
-        {
-            assert_eq!(error.code, TransportErrorCode::INTERNAL_ERROR);
-            break;
-        }
+    while let Some(event) = pair.poll(Client) {
+        assert!(!matches!(event, Event::ConnectionLost { .. }), "{event:?}");
     }
-    let stream = pair
-        .client_conn_mut(healthy_client)
-        .streams()
-        .open(Dir::Uni)
-        .unwrap();
-    let mut send = pair.client_conn_mut(healthy_client).send_stream(stream);
-    assert_eq!(send.write(b"sibling").unwrap(), 7);
-    send.finish().unwrap();
-    pair.drive();
-    assert_eq!(
-        pair.server_conn_mut(healthy_server)
-            .streams()
-            .accept(Dir::Uni),
-        Some(stream)
-    );
-    let mut received = 0;
-    recv_bytes(
-        pair.server_conn_mut(healthy_server).recv_stream(stream),
-        &mut received,
-    );
-    assert_eq!(received, 7);
     Ok(())
 }
 
@@ -5569,6 +5540,53 @@ fn exhausted_shared_budget_blocks_sends_and_refuses_new_connections() -> TestRes
             reason: ConnectionError::ConnectionClosed(_)
         })
     );
+    Ok(())
+}
+
+#[test]
+fn exhausted_shared_budget_admits_new_peer_streams() -> TestResult {
+    let _guard = subscribe();
+    let budget = Budget::new();
+    let mut builder = ConnPair::builder();
+    builder
+        .server_transport_cfg
+        .shared_budget(Some(budget.clone()));
+    let floor = builder.server_transport_cfg.connection_floor_bytes();
+    let mut pair = builder.connect();
+    assert_eq!(budget.used(), floor);
+    let unread = pair.streams(Client).open(Dir::Uni).unwrap();
+    let mut remaining = 128 * 1024;
+    while remaining > 0 {
+        send_bytes(pair.send_stream(Client, unread), &mut remaining)?;
+        pair.step();
+    }
+    pair.drive();
+    assert!(pair.conn(Server).receive_buffer_allocated_bytes() > 64 * 1024);
+    budget.limit.store(budget.used(), Ordering::Relaxed);
+
+    let finished = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, finished).finish()?;
+    let stopped = pair.streams(Client).open(Dir::Bi).unwrap();
+    pair.recv_stream(Client, stopped).stop(VarInt(7))?;
+    pair.drive();
+
+    while let Some(event) = pair.poll(Server) {
+        assert!(!matches!(event, Event::ConnectionLost { .. }), "{event:?}");
+    }
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(unread));
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(finished));
+    let mut recv = pair.recv_stream(Server, finished);
+    let mut chunks = recv.read(true)?;
+    assert_matches!(chunks.next(usize::MAX), Ok(None));
+    let _ = chunks.finalize();
+    assert_eq!(pair.streams(Server).accept(Dir::Bi), Some(stopped));
+    assert_matches!(
+        pair.send_stream(Server, stopped).write(b"late"),
+        Err(WriteError::Stopped(VarInt(7)))
+    );
+    assert!(pair.streams(Server).open(Dir::Uni).is_some());
+    pair.set_max_concurrent_streams(Server, Dir::Uni, 1000u32.into());
+    assert_eq!(pair.max_concurrent_streams(Server, Dir::Uni), 100);
     Ok(())
 }
 

@@ -15,10 +15,7 @@ pub(super) const MIN_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(super) const PACKET_QUEUE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Floor each connection precharges to its [`SharedBudget`] and fills before charging it again
-pub const CONNECTION_FLOOR_BYTES: usize = 5 * MIN_BUFFER_BYTES;
-
-/// Byte budget shared by connections beyond their [`CONNECTION_FLOOR_BYTES`]
+/// Byte budget shared by connections beyond their floors
 pub trait SharedBudget: Send + Sync + fmt::Debug {
     /// Charges `bytes` if they fit
     fn try_charge(&self, bytes: usize) -> bool;
@@ -37,8 +34,16 @@ pub(super) struct BufferBudget {
 
 impl BufferBudget {
     pub(super) fn new(limit: u64, shared: Option<&Arc<dyn SharedBudget>>) -> Arc<Self> {
+        Self::with_floor(limit, shared, MIN_BUFFER_BYTES)
+    }
+
+    pub(super) fn with_floor(
+        limit: u64,
+        shared: Option<&Arc<dyn SharedBudget>>,
+        floor: usize,
+    ) -> Arc<Self> {
         let floor = match shared {
-            Some(shared) if shared.try_charge(MIN_BUFFER_BYTES) => MIN_BUFFER_BYTES,
+            Some(shared) if shared.try_charge(floor) => floor,
             _ => 0,
         };
         Arc::new(Self {

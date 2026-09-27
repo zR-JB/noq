@@ -8,14 +8,16 @@ use std::{
 use tracing::{debug, trace};
 
 use super::{
-    PendingStreamsQueue, Recv, ResetAtOutcome, Retransmits, Send, SendState, ShouldTransmit,
-    StreamEvent, StreamHalf,
+    PendingStream, PendingStreamsQueue, Recv, ResetAtOutcome, Retransmits, Send, SendState,
+    ShouldTransmit, StreamEvent, StreamHalf,
 };
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     connection::{
         PacketBuilder,
-        buffer_budget::{Allocation, AllocationError, BufferBudget, SharedBudget},
+        buffer_budget::{
+            Allocation, AllocationError, BufferBudget, MIN_BUFFER_BYTES, SharedBudget,
+        },
         packet_map::btree_entry_lease,
         spaces::{ControlKind, reserve_control_vec},
         stats::FrameStats,
@@ -60,38 +62,36 @@ impl StreamEvents {
         if self.allocation_failed || self.values.contains(&event) {
             return;
         }
-        let result = (|| {
-            if self.values.len() == self.values.capacity() {
-                let capacity = self
-                    .values
-                    .len()
-                    .checked_add(1)
-                    .ok_or(AllocationError)?
-                    .max(self.values.capacity().saturating_mul(2))
-                    .max(4);
-                let mut allocation = self.allocation.budget.acquire(
-                    capacity
-                        .checked_mul(mem::size_of::<StreamEvent>())
-                        .ok_or(AllocationError)?,
-                )?;
-                let mut values = VecDeque::new();
-                values
-                    .try_reserve_exact(capacity)
-                    .map_err(|_| AllocationError)?;
-                let bytes = values
-                    .capacity()
-                    .checked_mul(mem::size_of::<StreamEvent>())
-                    .ok_or(AllocationError)?;
-                allocation.resize(bytes)?;
-                values.append(&mut self.values);
-                self.values = values;
-                self.allocation.absorb(allocation);
-                self.allocation.resize(bytes)?;
-            }
+        let reserved = self.reserve(self.values.len() + 1);
+        if reserved.is_ok() {
             self.values.push_back(event);
-            Ok::<_, AllocationError>(())
-        })();
-        self.allocation_failed |= result.is_err();
+        }
+        self.allocation_failed |= reserved.is_err();
+    }
+
+    fn reserve(&mut self, total: usize) -> Result<(), AllocationError> {
+        if total <= self.values.capacity() {
+            return Ok(());
+        }
+        let capacity = total.max(self.values.capacity().saturating_mul(2)).max(4);
+        let mut allocation = self.allocation.budget.acquire(
+            capacity
+                .checked_mul(mem::size_of::<StreamEvent>())
+                .ok_or(AllocationError)?,
+        )?;
+        let mut values = VecDeque::new();
+        values
+            .try_reserve_exact(capacity)
+            .map_err(|_| AllocationError)?;
+        let bytes = values
+            .capacity()
+            .checked_mul(mem::size_of::<StreamEvent>())
+            .ok_or(AllocationError)?;
+        allocation.resize(bytes)?;
+        values.append(&mut self.values);
+        self.values = values;
+        self.allocation.absorb(allocation);
+        self.allocation.resize(bytes)
     }
 
     fn pop_front(&mut self) -> Option<StreamEvent> {
@@ -122,6 +122,7 @@ pub struct StreamsState {
     pub(super) allocation_failed: bool,
     pub(super) reassembly: Arc<BufferBudget>,
     pub(in crate::connection) transmit: Arc<BufferBudget>,
+    slots: Arc<BufferBudget>,
     pub(super) next: [u64; 2],
     /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
     /// connection so far, per direction
@@ -213,25 +214,28 @@ impl StreamsState {
     ) -> Self {
         let reassembly = BufferBudget::for_receive(receive_window.into(), shared);
         let transmit = BufferBudget::new(send_window, shared);
-        Self {
+        let floor = Self::floor_bytes(max_remote_bi, max_remote_uni);
+        let slots =
+            BufferBudget::with_floor(send_window.saturating_add(floor as u64), shared, floor);
+        let mut this = Self {
             side,
             send: BTreeMap::new(),
             recv: BTreeMap::new(),
             send_allocation: Allocation {
-                budget: transmit.clone(),
+                budget: slots.clone(),
                 bytes: 0,
             },
             recv_allocation: Allocation {
-                budget: reassembly.clone(),
+                budget: slots.clone(),
                 bytes: 0,
             },
             blocked_allocation: Allocation {
-                budget: transmit.clone(),
+                budget: slots.clone(),
                 bytes: 0,
             },
             allocation_failed: false,
-            reassembly: reassembly.clone(),
-            transmit: transmit.clone(),
+            reassembly,
+            transmit,
             next: [0, 0],
             max: [0, 0],
             max_remote: [max_remote_bi.into(), max_remote_uni.into()],
@@ -243,8 +247,8 @@ impl StreamsState {
             opened: [false, false],
             next_reported_remote: [0, 0],
             send_streams: 0,
-            pending: PendingStreamsQueue::new(transmit),
-            events: StreamEvents::new(reassembly),
+            pending: PendingStreamsQueue::new(slots.clone()),
+            events: StreamEvents::new(slots.clone()),
             connection_blocked: Vec::new(),
             send_control: BTreeSet::new(),
             recv_control: BTreeSet::new(),
@@ -263,7 +267,17 @@ impl StreamsState {
             receive_window_shrink_debt: 0,
             streams_blocked: [false, false],
             peer_reset_stream_at: false,
-        }
+            slots,
+        };
+        this.allocation_failed = this.charge_streams(0, 0).is_err();
+        debug_assert!(this.slots.used() <= floor - MIN_BUFFER_BYTES);
+        this
+    }
+
+    pub(crate) fn floor_bytes(max_remote_bi: VarInt, max_remote_uni: VarInt) -> usize {
+        let bi = usize::try_from(max_remote_bi.into_inner()).unwrap_or(usize::MAX);
+        let uni = usize::try_from(max_remote_uni.into_inner()).unwrap_or(usize::MAX);
+        slot_bytes(bi, bi.saturating_add(uni)).saturating_add(MIN_BUFFER_BYTES)
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
@@ -1137,7 +1151,19 @@ impl StreamsState {
 
     pub(crate) fn set_max_concurrent(&mut self, dir: Dir, count: VarInt) {
         self.flow_control_adjusted = true;
-        self.max_concurrent_remote_count[dir as usize] = count.into();
+        let previous = mem::replace(
+            &mut self.max_concurrent_remote_count[dir as usize],
+            count.into(),
+        );
+        if self.charge_streams(0, 0).is_err() {
+            debug!(
+                ?dir,
+                "stream limit kept: no memory for the state of more streams"
+            );
+            self.max_concurrent_remote_count[dir as usize] = previous;
+            self.refund_streams();
+            return;
+        }
         self.ensure_remote_streams(dir);
     }
 
@@ -1191,39 +1217,20 @@ impl StreamsState {
             || self.events.allocation_failed
             || self.reassembly.floorless()
             || self.transmit.floorless()
+            || self.slots.floorless()
     }
 
-    fn reserve_streams(&mut self, send: usize, recv: usize) -> Result<(), AllocationError> {
-        if self.allocation_failed {
-            return Err(AllocationError);
-        }
-        let result = (|| {
-            let send_count = self.send.len().checked_add(send).ok_or(AllocationError)?;
-            self.pending.reserve(send_count)?;
-            reserve_control_vec(
-                &mut self.connection_blocked,
-                Some(&mut self.blocked_allocation),
-                send_count,
-            )?;
-            self.send_allocation.resize(
-                self.send
-                    .len()
-                    .checked_add(send)
-                    .and_then(|len| len.checked_mul(send_stream_lease()))
-                    .ok_or(AllocationError)?,
-            )?;
-            self.recv_allocation.resize(
-                self.recv
-                    .len()
-                    .checked_add(recv)
-                    .and_then(|len| len.checked_mul(recv_stream_lease()))
-                    .ok_or(AllocationError)?,
-            )
-        })();
-        if result.is_err() {
-            self.allocation_failed = true;
-        }
-        result
+    fn charge_streams(&mut self, send: usize, recv: usize) -> Result<(), AllocationError> {
+        let (send, recv) = self.slot_counts(send, recv);
+        self.pending.reserve(send)?;
+        let blocked = send.saturating_sub(self.connection_blocked.len());
+        reserve_control_vec(
+            &mut self.connection_blocked,
+            Some(&mut self.blocked_allocation),
+            blocked,
+        )?;
+        self.events.reserve(event_slots(send, recv))?;
+        self.resize_leases(send, recv)
     }
 
     fn refund_streams(&mut self) {
@@ -1233,19 +1240,47 @@ impl StreamsState {
         if self.recv.is_empty() {
             self.recv = BTreeMap::new();
         }
-        self.send_allocation
-            .resize(self.send.len() * send_stream_lease())
+        let (send, recv) = self.slot_counts(0, 0);
+        self.resize_leases(send, recv)
             .expect("releasing stream states");
-        self.recv_allocation
-            .resize(self.recv.len() * recv_stream_lease())
-            .expect("releasing stream states");
+    }
+
+    fn slot_counts(&self, send: usize, recv: usize) -> (usize, usize) {
+        let local = |id: &&StreamId| id.initiator() == self.side;
+        let bi = self.remote_slots(Dir::Bi);
+        (
+            (self.send.keys().filter(local).count() + send).saturating_add(bi),
+            (self.recv.keys().filter(local).count() + recv)
+                .saturating_add(bi)
+                .saturating_add(self.remote_slots(Dir::Uni)),
+        )
+    }
+
+    fn remote_slots(&self, dir: Dir) -> usize {
+        let slots = self.allocated_remote_count[dir as usize]
+            .max(self.max_concurrent_remote_count[dir as usize]);
+        usize::try_from(slots).unwrap_or(usize::MAX)
+    }
+
+    fn resize_leases(&mut self, send: usize, recv: usize) -> Result<(), AllocationError> {
+        self.send_allocation.resize(
+            send.checked_mul(send_stream_lease())
+                .ok_or(AllocationError)?,
+        )?;
+        self.recv_allocation.resize(
+            recv.checked_mul(recv_stream_lease())
+                .ok_or(AllocationError)?,
+        )
     }
 
     /// Insert `(id, None)` placeholders for a locally-initiated stream into `send` (and `recv`
     /// for bidi). Called from `Streams::open`; the caller guarantees the id is fresh.
     pub(super) fn insert_local(&mut self, id: StreamId) -> Result<(), AllocationError> {
         debug_assert_eq!(id.initiator(), self.side);
-        self.reserve_streams(1, usize::from(id.dir() == Dir::Bi))?;
+        if let Err(error) = self.charge_streams(1, usize::from(id.dir() == Dir::Bi)) {
+            self.refund_streams();
+            return Err(error);
+        }
         assert!(self.send.insert(id, None).is_none());
         if id.dir() == Dir::Bi {
             assert!(self.recv.insert(id, None).is_none());
@@ -1253,11 +1288,8 @@ impl StreamsState {
         Ok(())
     }
 
-    /// Allocate any new remote streams when a packet arrives for a stream id.
-    /// Any streams above `next_remote` are considered in the default state, avoiding allocations.
-    /// Once we receive a packet for a new remote stream, we advance `next_remote` and allocate
-    /// actual state. If there's a gap, we insert `None` placeholders for the missing streams.
-    /// Returns `true` if `id` was a newly allocated remote stream.
+    /// Creates remote streams up to `id` when the peer first uses it, with `None` placeholders for
+    /// gaps; their state was charged when the peer was allowed them. Returns whether `id` is new.
     fn ensure_remote(&mut self, id: StreamId) -> bool {
         let dir = id.dir();
         let dir_idx = dir as usize;
@@ -1273,14 +1305,6 @@ impl StreamsState {
             return false;
         }
 
-        let count =
-            usize::try_from(id.index() + 1 - self.next_remote[dir_idx]).unwrap_or(usize::MAX);
-        if self
-            .reserve_streams(if dir == Dir::Bi { count } else { 0 }, count)
-            .is_err()
-        {
-            return false;
-        }
         // Create all of the streams between the largest opened and this stream.
         for i in self.next_remote[dir_idx]..=id.index() {
             let id = StreamId::new(!self.side, dir, i);
@@ -1363,6 +1387,27 @@ impl StreamsState {
             Dir::Bi => self.initial_max_stream_data_bidi_remote,
         }
     }
+}
+
+/// Upper bound of the state charged for `send` and `recv` streams; queues hold at least 4
+fn slot_bytes(send: usize, recv: usize) -> usize {
+    let queues = send
+        .max(4)
+        .saturating_mul(mem::size_of::<PendingStream>() + mem::size_of::<StreamId>())
+        .saturating_add(
+            event_slots(send, recv)
+                .max(4)
+                .saturating_mul(mem::size_of::<StreamEvent>()),
+        );
+    send.saturating_mul(send_stream_lease())
+        .saturating_add(recv.saturating_mul(recv_stream_lease()))
+        .saturating_add(queues)
+}
+
+/// `Readable` per receive stream, `Writable`, `Stopped`, `Finished` per send stream, `Available`
+fn event_slots(send: usize, recv: usize) -> usize {
+    recv.saturating_add(send.saturating_mul(3))
+        .saturating_add(2)
 }
 
 fn send_stream_lease() -> usize {
@@ -1524,10 +1569,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(
-            receiver.reassembly.used(),
-            receiver.recv_allocation.bytes + receiver.events.allocation.bytes
-        );
+        assert_eq!(receiver.reassembly.used(), 0);
         let mut pending = Retransmits::default();
         for id in [first, second] {
             let mut recv = RecvStream {
@@ -1649,7 +1691,7 @@ mod tests {
             recv.read(false).unwrap().next(1),
             Err(ReadError::Reset(_))
         ));
-        assert_eq!(budget.used(), receiver.events.allocation.bytes);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
@@ -2611,11 +2653,8 @@ mod tests {
             (1024 * 1024u32).into(),
             None,
         );
-        // No slots allocated until a stream is actually received.
         assert!(client.recv.is_empty());
         assert!(client.send.is_empty());
-        assert_eq!(client.recv_allocation.bytes, 0);
-        assert_eq!(client.send_allocation.bytes, 0);
     }
 
     #[test]

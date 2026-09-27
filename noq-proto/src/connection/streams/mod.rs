@@ -531,19 +531,14 @@ impl PendingStreamsQueue {
         });
     }
 
-    fn reserve(&mut self, additional: usize) -> Result<(), AllocationError> {
+    fn reserve(&mut self, total: usize) -> Result<(), AllocationError> {
         if self.allocation_failed {
             return Err(AllocationError);
         }
-        let needed = self
-            .streams
-            .len()
-            .checked_add(additional)
-            .ok_or(AllocationError)?;
-        if needed <= self.streams.capacity() {
+        if total <= self.streams.capacity() {
             return Ok(());
         }
-        let capacity = needed.max(self.streams.capacity().saturating_mul(2)).max(4);
+        let capacity = total.max(self.streams.capacity().saturating_mul(2)).max(4);
         let mut allocation = self.allocation.budget.acquire(
             capacity
                 .checked_mul(mem::size_of::<PendingStream>())
@@ -579,7 +574,7 @@ impl PendingStreamsQueue {
         if self.allocation_failed {
             return;
         }
-        if self.reserve(1).is_err() {
+        if self.reserve(self.streams.len() + 1).is_err() {
             self.allocation_failed = true;
             return;
         }
@@ -597,10 +592,7 @@ impl PendingStreamsQueue {
 
     fn clear(&mut self) {
         self.next = None;
-        self.streams = BinaryHeap::new();
-        self.allocation
-            .resize(0)
-            .expect("releasing pending streams");
+        self.streams.clear();
     }
 
     fn iter(&self) -> impl Iterator<Item = &PendingStream> {
