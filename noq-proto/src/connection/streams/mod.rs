@@ -1,13 +1,15 @@
 use std::{
-    collections::{BinaryHeap, hash_map},
-    io,
+    collections::{BinaryHeap, btree_map},
+    io, mem,
+    sync::Arc,
 };
 
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::trace;
 
-use super::spaces::Retransmits;
+use super::buffer_budget::{Allocation, AllocationError, BufferBudget};
+use super::spaces::{Retransmits, reserve_control_vec};
 use crate::{
     Dir, StreamId, VarInt,
     connection::streams::state::{StreamRecv, get_or_insert_recv, get_or_insert_send},
@@ -53,9 +55,9 @@ impl<'a> Streams<'a> {
             return None;
         }
 
+        let id = StreamId::new(self.state.side, dir, self.state.next[dir as usize]);
+        self.state.insert_local(id).ok()?;
         self.state.next[dir as usize] += 1;
-        let id = StreamId::new(self.state.side, dir, self.state.next[dir as usize] - 1);
-        self.state.insert_local(id);
         self.state.send_streams += 1;
         Some(id)
     }
@@ -153,8 +155,8 @@ impl RecvStream<'_> {
     /// attempts to operate on a stream will yield `ClosedStream` errors.
     pub fn stop(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
         let mut entry = match self.state.recv.entry(self.id) {
-            hash_map::Entry::Occupied(s) => s,
-            hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
+            btree_map::Entry::Occupied(s) => s,
+            btree_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
         };
         let stream = get_or_insert_recv(
             self.state.stream_receive_window,
@@ -204,7 +206,7 @@ impl RecvStream<'_> {
     /// After returning `Ok(Some(_))` once, stream state will be discarded and all future calls will
     /// return `Err(ClosedStream)`.
     pub fn received_reset(&mut self) -> Result<Option<VarInt>, ClosedStream> {
-        let hash_map::Entry::Occupied(entry) = self.state.recv.entry(self.id) else {
+        let btree_map::Entry::Occupied(entry) = self.state.recv.entry(self.id) else {
             return Err(ClosedStream { _private: () });
         };
         let Some(s) = entry.get().as_ref().and_then(|s| s.as_open_recv()) else {
@@ -303,7 +305,17 @@ impl<'a> SendStream<'a> {
             );
             if !stream.connection_blocked {
                 stream.connection_blocked = true;
-                self.state.connection_blocked.push(self.id);
+                if reserve_control_vec(
+                    &mut self.state.connection_blocked,
+                    Some(&mut self.state.blocked_allocation),
+                    1,
+                )
+                .is_ok()
+                {
+                    self.state.connection_blocked.push(self.id);
+                } else {
+                    self.state.allocation_failed = true;
+                }
             }
             return Err(WriteError::Blocked);
         }
@@ -313,7 +325,17 @@ impl<'a> SendStream<'a> {
             Err(WriteError::Blocked) => {
                 if !stream.connection_blocked {
                     stream.connection_blocked = true;
-                    self.state.connection_blocked.push(self.id);
+                    if reserve_control_vec(
+                        &mut self.state.connection_blocked,
+                        Some(&mut self.state.blocked_allocation),
+                        1,
+                    )
+                    .is_ok()
+                    {
+                        self.state.connection_blocked.push(self.id);
+                    } else {
+                        self.state.allocation_failed = true;
+                    }
                 }
                 return Err(WriteError::Blocked);
             }
@@ -488,6 +510,8 @@ impl<'a> SendStream<'a> {
 /// A queue of streams with pending outgoing data, sorted by priority
 struct PendingStreamsQueue {
     streams: BinaryHeap<PendingStream>,
+    allocation: Allocation,
+    allocation_failed: bool,
     /// The next stream to write out. This is `Some` when `TransportConfig::send_fairness(false)`
     /// and writing a stream is interrupted while the stream still has some pending data. See
     /// `reinsert_pending()`.
@@ -499,9 +523,11 @@ struct PendingStreamsQueue {
 }
 
 impl PendingStreamsQueue {
-    fn new() -> Self {
+    fn new(budget: Arc<BufferBudget>) -> Self {
         Self {
             streams: BinaryHeap::new(),
+            allocation: Allocation { budget, bytes: 0 },
+            allocation_failed: false,
             next: None,
             recency: u64::MAX,
         }
@@ -518,6 +544,39 @@ impl PendingStreamsQueue {
         });
     }
 
+    fn reserve(&mut self, additional: usize) -> Result<(), AllocationError> {
+        if self.allocation_failed {
+            return Err(AllocationError);
+        }
+        let needed = self
+            .streams
+            .len()
+            .checked_add(additional)
+            .ok_or(AllocationError)?;
+        if needed <= self.streams.capacity() {
+            return Ok(());
+        }
+        let capacity = needed.max(self.streams.capacity().saturating_mul(2)).max(4);
+        let mut allocation = self.allocation.budget.acquire(
+            capacity
+                .checked_mul(mem::size_of::<PendingStream>())
+                .ok_or(AllocationError)?,
+        )?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(capacity)
+            .map_err(|_| AllocationError)?;
+        let bytes = values
+            .capacity()
+            .checked_mul(mem::size_of::<PendingStream>())
+            .ok_or(AllocationError)?;
+        allocation.resize(bytes)?;
+        values.extend(mem::take(&mut self.streams).into_vec());
+        self.streams = BinaryHeap::from(values);
+        self.allocation.absorb(allocation);
+        self.allocation.resize(bytes)
+    }
+
     /// Push a pending stream ID with the given priority, queued after any already-queued streams
     /// for the priority
     fn push_pending(&mut self, id: StreamId, priority: i32) {
@@ -530,6 +589,13 @@ impl PendingStreamsQueue {
         // This is enough to implement round-robin scheduling for streams that are still pending
         // even after being handled, as in that case they are removed from the `BinaryHeap`,
         // handled, and then immediately reinserted.
+        if self.allocation_failed {
+            return;
+        }
+        if self.reserve(1).is_err() {
+            self.allocation_failed = true;
+            return;
+        }
         self.recency -= 1;
         self.streams.push(PendingStream {
             priority,
@@ -544,7 +610,10 @@ impl PendingStreamsQueue {
 
     fn clear(&mut self) {
         self.next = None;
-        self.streams.clear();
+        self.streams = BinaryHeap::new();
+        self.allocation
+            .resize(0)
+            .expect("releasing pending streams");
     }
 
     fn iter(&self) -> impl Iterator<Item = &PendingStream> {

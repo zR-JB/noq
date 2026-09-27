@@ -1105,7 +1105,7 @@ fn poll_open<'a>(
     mut notify: Pin<&mut Notified<'a>>,
     dir: Dir,
 ) -> Poll<Result<(ConnectionRef, StreamId, bool), ConnectionError>> {
-    let mut state = conn.lock_without_waking("poll_open");
+    let mut state = conn.lock_and_wake("poll_open");
     if let Some(ref e) = state.error {
         return Poll::Ready(Err(e.clone()));
     } else if let Some(id) = state.inner.streams().open(dir) {

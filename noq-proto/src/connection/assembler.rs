@@ -44,10 +44,6 @@ impl Assembler {
         }
     }
 
-    pub(super) fn reinit(&mut self) {
-        *self = Self::new(self.allocation.budget.clone());
-    }
-
     fn reserve(&mut self, count: usize) -> Result<(), AllocationError> {
         if count <= self.data.capacity() {
             return Ok(());
@@ -598,7 +594,7 @@ mod test {
         let delivered = assembler.read(usize::MAX, true).unwrap().bytes;
         let tail = delivered.slice(length - 1..);
         drop(delivered);
-        assembler.reinit();
+        assembler = Assembler::new(assembler.allocation.budget.clone());
         assert_eq!(
             budget.used(),
             length + mem::size_of::<OwnedBacking>() + mem::size_of::<AtomicUsize>()

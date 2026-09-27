@@ -5177,10 +5177,12 @@ fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
 fn packet_metadata_pressure_preserves_one_way_delivery() -> TestResult {
     let mut transport = TransportConfig::default();
     transport.send_window(64 * 1024);
+    transport.max_concurrent_uni_streams(65_536u32.into());
     let mut pair = ConnPair::builder()
         .with_transport_cfg(transport)
         .with_latency(Duration::from_millis(50))
         .connect();
+    let (healthy_client, healthy_server) = Pair::connect(&mut pair);
     let stream = pair.streams(Client).open(Dir::Uni).unwrap();
     let total = 2 * 1024 * 1024;
     let mut remaining = total;
@@ -5202,6 +5204,54 @@ fn packet_metadata_pressure_preserves_one_way_delivery() -> TestResult {
     }
     assert_eq!(remaining, 0);
     assert_eq!(received, total);
+    let mut created = 0;
+    while let Some(stream) = pair.streams(Client).open(Dir::Uni) {
+        pair.send_stream(Client, stream).finish().unwrap();
+        pair.drive_client();
+        pair.server.inbound.clear();
+        created += 1;
+        assert!(
+            created < 4096,
+            "peer stream credit bypassed retained state admission"
+        );
+    }
+    assert!(created > 0);
+    assert_eq!(pair.conn(Client).send_buffered_bytes(), 0);
+    assert!(pair.conn(Client).send_allocated_bytes() <= 64 * 1024);
+    pair.drive_client();
+    loop {
+        if let Event::ConnectionLost {
+            reason: ConnectionError::TransportError(error),
+        } = pair
+            .conn_mut(Client)
+            .poll()
+            .expect("allocation close event")
+        {
+            assert_eq!(error.code, TransportErrorCode::INTERNAL_ERROR);
+            break;
+        }
+    }
+    let stream = pair
+        .client_conn_mut(healthy_client)
+        .streams()
+        .open(Dir::Uni)
+        .unwrap();
+    let mut send = pair.client_conn_mut(healthy_client).send_stream(stream);
+    assert_eq!(send.write(b"sibling").unwrap(), 7);
+    send.finish().unwrap();
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(healthy_server)
+            .streams()
+            .accept(Dir::Uni),
+        Some(stream)
+    );
+    let mut received = 0;
+    recv_bytes(
+        pair.server_conn_mut(healthy_server).recv_stream(stream),
+        &mut received,
+    );
+    assert_eq!(received, 7);
     Ok(())
 }
 

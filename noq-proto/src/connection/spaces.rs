@@ -654,7 +654,7 @@ pub(in crate::connection) enum ControlKind {
     RemoveAddress,
 }
 
-fn reserve_control_vec<T>(
+pub(super) fn reserve_control_vec<T>(
     values: &mut Vec<T>,
     allocation: Option<&mut Allocation>,
     additional: usize,

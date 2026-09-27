@@ -1320,13 +1320,13 @@ impl TestEndpoint {
 
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
+            self.timeout = None;
             for (ch, conn) in self.connections.iter_mut() {
-                if self.timeout.is_some_and(|x| x <= now) {
-                    self.timeout = None;
+                if conn.poll_timeout().is_some_and(|x| x <= now) {
                     conn.handle_timeout(now);
                 }
 
-                for (_, mut events) in self.conn_events.drain() {
+                if let Some(mut events) = self.conn_events.remove(ch) {
                     for event in events.drain(..) {
                         conn.handle_event(event);
                     }
@@ -1340,7 +1340,7 @@ impl TestEndpoint {
                     self.outbound.extend(split_transmit(transmit, &buf[..size]));
                     buf.clear();
                 }
-                self.timeout = conn.poll_timeout();
+                self.timeout = min_opt(self.timeout, conn.poll_timeout());
             }
 
             if endpoint_events.is_empty() {

@@ -1,11 +1,10 @@
 use std::{
-    collections::{VecDeque, hash_map},
+    collections::{BTreeMap, VecDeque, btree_map},
     convert::TryFrom,
     mem,
     sync::Arc,
 };
 
-use rustc_hash::FxHashMap;
 use tracing::{debug, trace};
 
 use super::{
@@ -15,54 +14,99 @@ use super::{
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     connection::{
-        PacketBuilder, buffer_budget::BufferBudget, spaces::ControlKind, stats::FrameStats,
+        PacketBuilder,
+        buffer_budget::{Allocation, AllocationError, BufferBudget},
+        packet_map::btree_entry_lease,
+        spaces::{ControlKind, reserve_control_vec},
+        stats::FrameStats,
     },
     frame::{self, FrameStruct},
     transport_parameters::TransportParameters,
 };
 
-/// Wrapper around `Recv` that facilitates reusing `Recv` instances
 #[derive(Debug)]
-pub(super) enum StreamRecv {
-    /// A `Recv` that is ready to be opened
-    Free(Box<Recv>),
-    /// A `Recv` that has been opened
-    Open(Box<Recv>),
-}
+pub(super) struct StreamRecv(pub(super) Box<Recv>);
 
 impl StreamRecv {
-    /// Returns a reference to the inner `Recv` if the stream is open
     pub(super) fn as_open_recv(&self) -> Option<&Recv> {
-        match self {
-            Self::Open(r) => Some(r),
-            _ => None,
-        }
+        Some(&self.0)
     }
 
-    // Returns a mutable reference to the inner `Recv` if the stream is open
     pub(super) fn as_open_recv_mut(&mut self) -> Option<&mut Recv> {
-        match self {
-            Self::Open(r) => Some(r),
-            _ => None,
-        }
+        Some(&mut self.0)
     }
 
-    // Returns the inner `Recv`
     pub(super) fn into_inner(self) -> Box<Recv> {
-        match self {
-            Self::Free(r) | Self::Open(r) => r,
+        self.0
+    }
+}
+
+struct StreamEvents {
+    values: VecDeque<StreamEvent>,
+    allocation: Allocation,
+    allocation_failed: bool,
+}
+
+impl StreamEvents {
+    fn new(budget: Arc<BufferBudget>) -> Self {
+        Self {
+            values: VecDeque::new(),
+            allocation: Allocation { budget, bytes: 0 },
+            allocation_failed: false,
         }
     }
 
-    // Reinitialize the stream so the inner `Recv` can be reused
-    pub(super) fn free(self, initial_max_data: u64) -> Self {
-        match self {
-            Self::Free(_) => unreachable!("Self::Free on reinit()"),
-            Self::Open(mut recv) => {
-                recv.reinit(initial_max_data);
-                Self::Free(recv)
-            }
+    fn push_back(&mut self, event: StreamEvent) {
+        if self.allocation_failed || self.values.contains(&event) {
+            return;
         }
+        let result = (|| {
+            if self.values.len() == self.values.capacity() {
+                let capacity = self
+                    .values
+                    .len()
+                    .checked_add(1)
+                    .ok_or(AllocationError)?
+                    .max(self.values.capacity().saturating_mul(2))
+                    .max(4);
+                let mut allocation = self.allocation.budget.acquire(
+                    capacity
+                        .checked_mul(mem::size_of::<StreamEvent>())
+                        .ok_or(AllocationError)?,
+                )?;
+                let mut values = VecDeque::new();
+                values
+                    .try_reserve_exact(capacity)
+                    .map_err(|_| AllocationError)?;
+                let bytes = values
+                    .capacity()
+                    .checked_mul(mem::size_of::<StreamEvent>())
+                    .ok_or(AllocationError)?;
+                allocation.resize(bytes)?;
+                values.append(&mut self.values);
+                self.values = values;
+                self.allocation.absorb(allocation);
+                self.allocation.resize(bytes)?;
+            }
+            self.values.push_back(event);
+            Ok::<_, AllocationError>(())
+        })();
+        self.allocation_failed |= result.is_err();
+    }
+
+    fn pop_front(&mut self) -> Option<StreamEvent> {
+        self.values.pop_front()
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.values = VecDeque::new();
+        self.allocation.resize(0).expect("releasing stream events");
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
     }
 }
 
@@ -70,9 +114,12 @@ impl StreamRecv {
 pub struct StreamsState {
     pub(super) side: Side,
     // Set of streams that are currently open, or could be immediately opened by the peer
-    pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
-    pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
-    pub(super) free_recv: Vec<StreamRecv>,
+    pub(super) send: BTreeMap<StreamId, Option<Box<Send>>>,
+    pub(super) recv: BTreeMap<StreamId, Option<StreamRecv>>,
+    send_allocation: Allocation,
+    recv_allocation: Allocation,
+    pub(super) blocked_allocation: Allocation,
+    pub(super) allocation_failed: bool,
     pub(in crate::connection) reassembly: Arc<BufferBudget>,
     pub(in crate::connection) transmit: Arc<BufferBudget>,
     pub(super) next: [u64; 2],
@@ -108,7 +155,7 @@ pub struct StreamsState {
     /// Streams with outgoing data queued, sorted by priority
     pub(super) pending: PendingStreamsQueue,
 
-    events: VecDeque<StreamEvent>,
+    events: StreamEvents,
     /// Streams blocked on connection-level flow control or stream window space
     ///
     /// Streams are only added to this list when a write fails.
@@ -159,13 +206,27 @@ impl StreamsState {
         receive_window: VarInt,
         stream_receive_window: VarInt,
     ) -> Self {
+        let reassembly = BufferBudget::for_receive(receive_window.into());
+        let transmit = BufferBudget::new(send_window);
         Self {
             side,
-            send: FxHashMap::default(),
-            recv: FxHashMap::default(),
-            free_recv: Vec::new(),
-            reassembly: BufferBudget::for_receive(receive_window.into()),
-            transmit: BufferBudget::new(send_window),
+            send: BTreeMap::new(),
+            recv: BTreeMap::new(),
+            send_allocation: Allocation {
+                budget: transmit.clone(),
+                bytes: 0,
+            },
+            recv_allocation: Allocation {
+                budget: reassembly.clone(),
+                bytes: 0,
+            },
+            blocked_allocation: Allocation {
+                budget: transmit.clone(),
+                bytes: 0,
+            },
+            allocation_failed: false,
+            reassembly: reassembly.clone(),
+            transmit: transmit.clone(),
             next: [0, 0],
             max: [0, 0],
             max_remote: [max_remote_bi.into(), max_remote_uni.into()],
@@ -177,8 +238,8 @@ impl StreamsState {
             opened: [false, false],
             next_reported_remote: [0, 0],
             send_streams: 0,
-            pending: PendingStreamsQueue::new(),
-            events: VecDeque::new(),
+            pending: PendingStreamsQueue::new(transmit),
+            events: StreamEvents::new(reassembly),
             connection_blocked: Vec::new(),
             max_data: 0,
             receive_window: receive_window.into(),
@@ -250,6 +311,7 @@ impl StreamsState {
         self.send_streams = 0;
         self.data_sent = 0;
         self.connection_blocked.clear();
+        self.refund_streams();
     }
 
     /// Process incoming stream frame
@@ -487,8 +549,8 @@ impl StreamsState {
 
     pub(crate) fn reset_acked(&mut self, id: StreamId) {
         match self.send.entry(id) {
-            hash_map::Entry::Vacant(_) => {}
-            hash_map::Entry::Occupied(e) => {
+            btree_map::Entry::Vacant(_) => {}
+            btree_map::Entry::Occupied(e) => {
                 if let Some(SendState::ResetSent) = e.get().as_ref().map(|s| s.state) {
                     e.remove_entry();
                     self.stream_freed(id, StreamHalf::Send);
@@ -507,7 +569,7 @@ impl StreamsState {
     /// Acknowledgements of a frame whose reliable size has since been reduced are ignored, so that
     /// the smallest reliable size is retransmitted until it is itself acknowledged.
     pub(crate) fn reset_at_acked(&mut self, id: StreamId, reliable_size: VarInt) {
-        let hash_map::Entry::Occupied(mut e) = self.send.entry(id) else {
+        let btree_map::Entry::Occupied(mut e) = self.send.entry(id) else {
             return;
         };
         let Some(stream) = e.get_mut().as_mut() else {
@@ -782,8 +844,8 @@ impl StreamsState {
         mut frame: frame::StreamMeta,
     ) -> Result<(), TransportError> {
         let mut entry = match self.send.entry(frame.id) {
-            hash_map::Entry::Vacant(_) => return Ok(()),
-            hash_map::Entry::Occupied(e) => e,
+            btree_map::Entry::Vacant(_) => return Ok(()),
+            btree_map::Entry::Occupied(e) => e,
         };
 
         let Some(stream) = entry.get_mut().as_mut() else {
@@ -923,7 +985,17 @@ impl StreamsState {
                     // window. In order to get unblocked when the window relaxes
                     // it needs to be in the connection blocked list.
                     ss.connection_blocked = true;
-                    self.connection_blocked.push(id);
+                    if reserve_control_vec(
+                        &mut self.connection_blocked,
+                        Some(&mut self.blocked_allocation),
+                        1,
+                    )
+                    .is_ok()
+                    {
+                        self.connection_blocked.push(id);
+                    } else {
+                        self.allocation_failed = true;
+                    }
                 }
             }
         } else if id.initiator() == self.side && self.is_local_unopened(id) {
@@ -1062,15 +1134,85 @@ impl StreamsState {
         expanded
     }
 
+    pub(in crate::connection) fn allocation_failed(&self) -> bool {
+        self.allocation_failed || self.pending.allocation_failed || self.events.allocation_failed
+    }
+
+    fn reserve_streams(&mut self, send: usize, recv: usize) -> Result<(), AllocationError> {
+        if self.allocation_failed {
+            return Err(AllocationError);
+        }
+        let result = (|| {
+            let send_count = self.send.len().checked_add(send).ok_or(AllocationError)?;
+            self.pending.reserve(send_count)?;
+            reserve_control_vec(
+                &mut self.connection_blocked,
+                Some(&mut self.blocked_allocation),
+                send_count,
+            )?;
+            self.send_allocation.resize(
+                self.send
+                    .len()
+                    .checked_add(send)
+                    .and_then(|len| {
+                        len.checked_mul(
+                            btree_entry_lease::<StreamId, Option<Box<Send>>>()
+                                + mem::size_of::<Send>(),
+                        )
+                    })
+                    .ok_or(AllocationError)?,
+            )?;
+            self.recv_allocation.resize(
+                self.recv
+                    .len()
+                    .checked_add(recv)
+                    .and_then(|len| {
+                        len.checked_mul(
+                            btree_entry_lease::<StreamId, Option<StreamRecv>>()
+                                + mem::size_of::<Recv>(),
+                        )
+                    })
+                    .ok_or(AllocationError)?,
+            )
+        })();
+        if result.is_err() {
+            self.allocation_failed = true;
+        }
+        result
+    }
+
+    fn refund_streams(&mut self) {
+        if self.send.is_empty() {
+            self.send = BTreeMap::new();
+        }
+        if self.recv.is_empty() {
+            self.recv = BTreeMap::new();
+        }
+        self.send_allocation
+            .resize(
+                self.send.len()
+                    * (btree_entry_lease::<StreamId, Option<Box<Send>>>() + mem::size_of::<Send>()),
+            )
+            .expect("releasing stream states");
+        self.recv_allocation
+            .resize(
+                self.recv.len()
+                    * (btree_entry_lease::<StreamId, Option<StreamRecv>>()
+                        + mem::size_of::<Recv>()),
+            )
+            .expect("releasing stream states");
+    }
+
     /// Insert `(id, None)` placeholders for a locally-initiated stream into `send` (and `recv`
     /// for bidi). Called from `Streams::open`; the caller guarantees the id is fresh.
-    pub(super) fn insert_local(&mut self, id: StreamId) {
+    pub(super) fn insert_local(&mut self, id: StreamId) -> Result<(), AllocationError> {
         debug_assert_eq!(id.initiator(), self.side);
+        self.reserve_streams(1, usize::from(id.dir() == Dir::Bi))?;
         assert!(self.send.insert(id, None).is_none());
         if id.dir() == Dir::Bi {
-            let recv = self.free_recv.pop();
-            assert!(self.recv.insert(id, recv).is_none());
+            assert!(self.recv.insert(id, None).is_none());
         }
+        Ok(())
     }
 
     /// Allocate any new remote streams when a packet arrives for a stream id.
@@ -1093,11 +1235,18 @@ impl StreamsState {
             return false;
         }
 
+        let count =
+            usize::try_from(id.index() + 1 - self.next_remote[dir_idx]).unwrap_or(usize::MAX);
+        if self
+            .reserve_streams(if dir == Dir::Bi { count } else { 0 }, count)
+            .is_err()
+        {
+            return false;
+        }
         // Create all of the streams between the largest opened and this stream.
         for i in self.next_remote[dir_idx]..=id.index() {
             let id = StreamId::new(!self.side, dir, i);
-            let recv = self.free_recv.pop();
-            assert!(self.recv.insert(id, recv).is_none());
+            assert!(self.recv.insert(id, None).is_none());
             if dir == Dir::Bi {
                 assert!(self.send.insert(id, None).is_none());
             }
@@ -1153,10 +1302,11 @@ impl StreamsState {
         if half == StreamHalf::Send {
             self.send_streams -= 1;
         }
+        self.refund_streams();
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
-        self.free_recv.push(recv.free(self.stream_receive_window));
+        drop(recv);
         self.stream_freed(id, StreamHalf::Recv);
     }
 
@@ -1186,11 +1336,7 @@ pub(super) fn get_or_insert_recv(
     reassembly: Arc<BufferBudget>,
 ) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv {
     move |opt| {
-        *opt = opt.take().map(|s| match s {
-            StreamRecv::Free(recv) => StreamRecv::Open(recv),
-            s => s,
-        });
-        opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data, reassembly.clone())))
+        opt.get_or_insert_with(|| StreamRecv(Recv::new(initial_max_data, reassembly.clone())))
             .as_open_recv_mut()
             .unwrap()
     }
@@ -1320,7 +1466,10 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(receiver.reassembly.used(), 0);
+        assert_eq!(
+            receiver.reassembly.used(),
+            receiver.recv_allocation.bytes + receiver.events.allocation.bytes
+        );
         let mut pending = Retransmits::default();
         for id in [first, second] {
             let mut recv = RecvStream {
@@ -1440,7 +1589,7 @@ mod tests {
             recv.read(false).unwrap().next(1),
             Err(ReadError::Reset(_))
         ));
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.used(), receiver.events.allocation.bytes);
     }
 
     #[test]
@@ -1826,6 +1975,7 @@ mod tests {
             stream
                 .state
                 .events
+                .values
                 .contains(&StreamEvent::Stopped { id, error_code })
         );
         stream.state.events.clear();
@@ -2403,8 +2553,8 @@ mod tests {
         // No slots allocated until a stream is actually received.
         assert!(client.recv.is_empty());
         assert!(client.send.is_empty());
-        assert_eq!(client.recv.capacity(), 0);
-        assert_eq!(client.send.capacity(), 0);
+        assert_eq!(client.recv_allocation.bytes, 0);
+        assert_eq!(client.send_allocation.bytes, 0);
     }
 
     #[test]
