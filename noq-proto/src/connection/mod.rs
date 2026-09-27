@@ -2743,6 +2743,7 @@ impl Connection {
     ///
     /// [`StreamEvent::Finished`]: crate::StreamEvent::Finished
     pub fn close(&mut self, now: Instant, error_code: VarInt, reason: Bytes) {
+        let reason = Self::owned_close_reason(reason, &self.streams.receive_budget());
         self.close_inner(
             now,
             Close::Application(frame::ApplicationClose { error_code, reason }),
@@ -2754,6 +2755,26 @@ impl Connection {
         let error = TransportError::INTERNAL_ERROR("buffer allocation limit");
         self.close_inner(now, Close::Connection(error.clone().into()));
         error
+    }
+
+    fn owned_close_reason(reason: Bytes, budget: &Arc<buffer_budget::BufferBudget>) -> Bytes {
+        if reason.is_empty() {
+            return Bytes::new();
+        }
+        let Ok(mut backing) = buffer_budget::OwnedBacking::new(reason.len(), budget) else {
+            return Bytes::new();
+        };
+        backing.bytes.extend_from_slice(&reason);
+        backing.finish()
+    }
+
+    fn owned_peer_close(&self, mut close: Close) -> Close {
+        let reason = match &mut close {
+            Close::Connection(close) => &mut close.reason,
+            Close::Application(close) => &mut close.reason,
+        };
+        *reason = Self::owned_close_reason(mem::take(reason), &self.streams.receive_budget());
+        close
     }
 
     fn close_buffer_limit(&mut self, now: Instant) {
@@ -5065,6 +5086,7 @@ impl Connection {
                 // in Initial or Handshake packets. An application close (0x1d) falls through to the
                 // catch-all arm below.
                 Frame::Close(reason @ Close::Connection(_)) => {
+                    let reason = self.owned_peer_close(reason);
                     self.state
                         .move_to_draining(Some(reason.into()), &mut self.endpoint_events);
                     return Ok(());
@@ -5191,7 +5213,7 @@ impl Connection {
                 }
                 Frame::Padding | Frame::Ping => {}
                 Frame::Close(reason) => {
-                    close = Some(reason);
+                    close = Some(self.owned_peer_close(reason));
                 }
                 Frame::PathChallenge(challenge) => {
                     self.spaces[SpaceKind::Data]
