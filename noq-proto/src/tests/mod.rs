@@ -5125,6 +5125,41 @@ fn initial_tail_loss_probe() {
 }
 
 #[test]
+fn congestion_blocked_ack_defers_ping() {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    let mut congestion = crate::congestion::CubicConfig::default();
+    congestion.initial_window(16 * 1024);
+    transport.congestion_controller_factory(Arc::new(congestion));
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(transport)
+        .disable_mtud_discovery()
+        .connect();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream)
+        .write(&[0; 64 * 1024])
+        .unwrap();
+    pair.drive_client();
+    pair.server.inbound.clear();
+    for _ in 0..2 {
+        pair.ping(Server);
+        pair.drive_server();
+    }
+    pair.ping(Client);
+    let before = pair.stats(Client);
+    pair.drive_client();
+    let after = pair.stats(Client);
+    assert!(
+        after.frame_tx.acks > before.frame_tx.acks,
+        "ACK held while congestion blocked"
+    );
+    assert_eq!(after.frame_tx.ping, before.frame_tx.ping);
+    assert_eq!(after.udp_tx.datagrams, before.udp_tx.datagrams + 1);
+    pair.drive();
+    assert!(pair.stats(Client).frame_tx.ping > before.frame_tx.ping);
+}
+
+#[test]
 fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
     bidirectional_metadata_pressure(17, 19)
 }

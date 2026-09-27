@@ -1556,6 +1556,7 @@ impl Connection {
                 can_send.space_specific = false;
             }
             let needs_loss_probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
+            let mut probe_ping = false;
             let space_will_send = {
                 if scheduling_info.is_abandoned {
                     // If this path is abandoned then we might still have to send
@@ -1605,9 +1606,8 @@ impl Connection {
                 };
             }
 
-            // Congestion control applies when starting a new datagram, not when coalescing into
-            // one. A full window still lets due ACKs out untracked: ACK-only packets are not
-            // congestion controlled (RFC 9002 §7).
+            // Only new datagrams are congestion controlled; due ACKs leave a full window untracked
+            // since ACK-only packets are not congestion controlled (RFC 9002 §7).
             if transmit.datagram_remaining_mut() == 0 {
                 let mut path_blocked =
                     self.path_congestion_check(space_id, path_id, transmit, &can_send, now);
@@ -1648,6 +1648,7 @@ impl Connection {
 
                 if needs_loss_probe {
                     // Without packet metadata a PING still elicits the ACK that frees it
+                    probe_ping = !track;
                     if track {
                         let request_immediate_ack =
                             space_id == SpaceId::Data && self.peer_supports_ack_frequency();
@@ -1656,8 +1657,6 @@ impl Connection {
                             request_immediate_ack,
                             &mut self.streams,
                         );
-                    } else {
-                        self.spaces[space_id].for_path(path_id).pending_ping = true;
                     }
 
                     self.spaces[space_id].for_path(path_id).loss_probes -= 1; // needs_loss_probe ensures loss_probes > 0
@@ -1714,6 +1713,9 @@ impl Connection {
                 };
             };
             last_packet_number = Some(builder.packet_number);
+            if probe_ping {
+                builder.write_frame(frame::Ping, &mut self.path_stats.get_mut(path_id).frame_tx);
+            }
 
             if space_id == SpaceId::Initial
                 && (self.side.is_client() || can_send.is_ack_eliciting() || needs_loss_probe)
@@ -1838,6 +1840,15 @@ impl Connection {
                     Timer::PerPath(*path_id, PathTimer::MaxAckDelay),
                     self.qlog.with_time(now),
                 );
+            }
+
+            if !builder.track {
+                // Later datagrams would inherit this short one's size as their segment size
+                let last_pn = builder.packet_number;
+                builder.finish_and_track(now, self, path_id, pad_datagram);
+                return PollPathSpaceStatus::Send {
+                    last_packet_number: last_pn,
+                };
             }
 
             // Now we need to finish the packet.  Before we do so we need to know if we will
@@ -6352,13 +6363,6 @@ impl Connection {
             }
         }
 
-        // PING
-        if !scheduling_info.is_abandoned
-            && mem::replace(&mut space.for_path(path_id).pending_ping, false)
-        {
-            builder.write_frame(frame::Ping, stats);
-        }
-
         if !builder.track {
             return;
         }
@@ -6372,6 +6376,13 @@ impl Connection {
             && mem::replace(&mut space.pending.handshake_done, false)
         {
             builder.write_frame(frame::HandshakeDone, stats);
+        }
+
+        // PING
+        if !scheduling_info.is_abandoned
+            && mem::replace(&mut space.for_path(path_id).pending_ping, false)
+        {
+            builder.write_frame(frame::Ping, stats);
         }
 
         // IMMEDIATE_ACK
