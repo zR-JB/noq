@@ -1188,8 +1188,10 @@ pub mod send_buffer_benches {
     //!
     //! These are defined here and re-exported via `bench_exports` in lib.rs,
     //! so we can access the private `SendBuffer` struct.
+    use std::collections::VecDeque;
+
     use bytes::Bytes;
-    use criterion::Criterion;
+    use criterion::{Criterion, Throughput};
 
     use super::{BufferBudget, SendBuffer};
 
@@ -1198,12 +1200,12 @@ pub mod send_buffer_benches {
         let mut group = criterion.benchmark_group("get_into_many_segments");
         let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
 
-        const SEGMENTS: u64 = 10000;
-        const SEGMENT_SIZE: u64 = 10;
+        const SEGMENTS: u64 = 2048;
+        const SEGMENT_SIZE: u64 = 16 * 1024;
         const PACKET_SIZE: u64 = 1200;
         const BYTES: u64 = SEGMENTS * SEGMENT_SIZE;
 
-        // 10000 segments of 10 bytes each = 100KB total (same data size)
+        // Writes above MAX_COMBINE each keep their own segment: 32 MiB in flight
         for i in 0..SEGMENTS {
             buf.write(Bytes::from(vec![i as u8; SEGMENT_SIZE as usize]));
         }
@@ -1211,7 +1213,7 @@ pub mod send_buffer_benches {
         let mut tgt = Vec::with_capacity(PACKET_SIZE as usize);
         group.bench_function("get_into", |b| {
             b.iter(|| {
-                // Get from end (very slow - scans through all 1000 segments)
+                // Get from the end, behind every other segment
                 tgt.clear();
                 buf.get_into(BYTES - PACKET_SIZE..BYTES, std::hint::black_box(&mut tgt));
             });
@@ -1223,12 +1225,12 @@ pub mod send_buffer_benches {
         let mut group = criterion.benchmark_group("get_loop_many_segments");
         let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
 
-        const SEGMENTS: u64 = 10000;
-        const SEGMENT_SIZE: u64 = 10;
+        const SEGMENTS: u64 = 2048;
+        const SEGMENT_SIZE: u64 = 16 * 1024;
         const PACKET_SIZE: u64 = 1200;
         const BYTES: u64 = SEGMENTS * SEGMENT_SIZE;
 
-        // 10000 segments of 10 bytes each = 100KB total (same data size)
+        // Writes above MAX_COMBINE each keep their own segment: 32 MiB in flight
         for i in 0..SEGMENTS {
             buf.write(Bytes::from(vec![i as u8; SEGMENT_SIZE as usize]));
         }
@@ -1236,7 +1238,7 @@ pub mod send_buffer_benches {
         let mut tgt = Vec::with_capacity(PACKET_SIZE as usize);
         group.bench_function("get_loop", |b| {
             b.iter(|| {
-                // Get from end (very slow - scans through all 1000 segments)
+                // Get from the end, behind every other segment
                 tgt.clear();
                 let mut range = BYTES - PACKET_SIZE..BYTES;
                 while range.start < range.end {
@@ -1246,5 +1248,50 @@ pub mod send_buffer_benches {
                 }
             });
         });
+    }
+
+    /// Bulk transfer of 16 KiB writes in 1200-byte frames, each acknowledged once `in_flight`
+    /// newer bytes were sent; with `loss`, every `loss`th frame is retransmitted instead
+    pub fn transfer(criterion: &mut Criterion) {
+        const CHUNK: usize = 16 * 1024;
+        const FRAME: usize = 1200;
+        let mut group = criterion.benchmark_group("transfer");
+        group.throughput(Throughput::Bytes(CHUNK as u64));
+        for (name, in_flight, loss) in [
+            ("1MiB", 1 << 20, 0),
+            ("48MiB", 48 << 20, 0),
+            ("48MiB_1pct_loss", 48 << 20, 100),
+        ] {
+            let mut buf = SendBuffer::new(BufferBudget::new(u64::MAX, None));
+            let chunk = vec![0u8; CHUNK];
+            let mut packet = Vec::with_capacity(FRAME);
+            let mut sent = VecDeque::new();
+            let (mut unacked, mut frames) = (0, 0u64);
+            group.bench_function(name, |b| {
+                b.iter(|| {
+                    buf.write(&chunk[..]);
+                    loop {
+                        let (range, _) = buf.poll_transmit(FRAME);
+                        if range.is_empty() {
+                            break;
+                        }
+                        packet.clear();
+                        buf.get_into(range.clone(), std::hint::black_box(&mut packet));
+                        unacked += range.end - range.start;
+                        sent.push_back(range);
+                    }
+                    while unacked > in_flight {
+                        let range = sent.pop_front().unwrap();
+                        unacked -= range.end - range.start;
+                        frames += 1;
+                        if loss != 0 && frames % loss == 0 {
+                            buf.retransmit(range).unwrap();
+                        } else {
+                            buf.ack(range).unwrap();
+                        }
+                    }
+                });
+            });
+        }
     }
 }
