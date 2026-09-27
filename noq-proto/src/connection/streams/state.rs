@@ -1173,8 +1173,8 @@ impl StreamsState {
         self.allocation_failed
             || self.pending.allocation_failed
             || self.events.allocation_failed
-            || self.reassembly.refused()
-            || self.transmit.refused()
+            || self.reassembly.floorless()
+            || self.transmit.floorless()
     }
 
     fn reserve_streams(&mut self, send: usize, recv: usize) -> Result<(), AllocationError> {

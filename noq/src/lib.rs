@@ -61,15 +61,15 @@ pub(crate) use web_time::{Duration, Instant};
 #[cfg(feature = "bloom")]
 pub use proto::BloomTokenLog;
 pub use proto::{
-    AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosePathError, ClosedPath,
-    ClosedStream, ConfigError, ConnectError, ConnectionClose, ConnectionError, ConnectionId,
-    ConnectionIdGenerator, ConnectionStats, DecryptedInitial, Dir, EcnCodepoint, EndpointConfig,
-    FourTuple, FrameStats, FrameType, IdleTimeout, InvalidCid, MtuDiscoveryConfig,
-    NetworkChangeHint, NoneTokenLog, NoneTokenStore, PathError, PathEvent, PathId, PathStats,
-    PathStatus, ResetStreamAtError, ServerConfig, SetPathStatusError, SharedBudget, Side,
-    StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore,
-    Transmit, TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
-    VarIntBoundsExceeded, congestion, crypto,
+    AckFrequencyConfig, ApplicationClose, CONNECTION_FLOOR_BYTES, Chunk, ClientConfig,
+    ClosePathError, ClosedPath, ClosedStream, ConfigError, ConnectError, ConnectionClose,
+    ConnectionError, ConnectionId, ConnectionIdGenerator, ConnectionStats, DecryptedInitial, Dir,
+    EcnCodepoint, EndpointConfig, FourTuple, FrameStats, FrameType, IdleTimeout, InvalidCid,
+    MtuDiscoveryConfig, NetworkChangeHint, NoneTokenLog, NoneTokenStore, PathError, PathEvent,
+    PathId, PathStats, PathStatus, ResetStreamAtError, ServerConfig, SetPathStatusError,
+    SharedBudget, Side, StdSystemTime, StreamId, TimeSource, TokenLog, TokenMemoryCache,
+    TokenReuseError, TokenStore, Transmit, TransportConfig, TransportErrorCode, UdpStats,
+    ValidationTokenConfig, VarInt, VarIntBoundsExceeded, congestion, crypto,
 };
 #[cfg(feature = "qlog")]
 pub use proto::{QlogConfig, QlogFactory, QlogFileFactory};
@@ -107,7 +107,7 @@ enum ConnectionEvent {
         error_code: VarInt,
         reason: bytes::Bytes,
     },
-    Proto(proto::ConnectionEvent, Option<endpoint::PacketCharge>),
+    Proto(proto::ConnectionEvent, Option<proto::PacketCharge>),
     Rebind(Pin<Box<dyn UdpSender>>),
     LocalAddressChanged(Option<Arc<dyn NetworkChangeHint + Sync + Send>>),
 }
