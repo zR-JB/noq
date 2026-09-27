@@ -124,13 +124,12 @@ where
     }
 
     pub(crate) fn iter_range(&self, range: Range<T>) -> impl Iterator<Item = Range<T>> + '_ {
-        self.iter().filter_map(move |r| {
-            if r.end > range.start && r.start < range.end {
-                Some(r.start.max(range.start)..r.end.min(range.end))
-            } else {
-                None
-            }
-        })
+        let Range { start, end } = range;
+        let first = self.0.partition_point(|r| r.end <= start);
+        self.0[first..]
+            .iter()
+            .take_while(move |r| r.start < end)
+            .map(move |r| r.start.max(start)..r.end.min(end))
     }
 
     pub(crate) fn insert_one(&mut self, x: T) -> bool {
