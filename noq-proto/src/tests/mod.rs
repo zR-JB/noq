@@ -5103,12 +5103,25 @@ fn initial_tail_loss_probe() {
 
 #[test]
 fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
+    bidirectional_metadata_pressure(17, 19)
+}
+
+#[test]
+fn packet_metadata_pressure_preserves_stream_credit() -> TestResult {
+    bidirectional_metadata_pressure(19, 17)
+}
+
+fn bidirectional_metadata_pressure(server_drop: usize, client_drop: usize) -> TestResult {
     let mut transport = TransportConfig::default();
     transport.send_window(64 * 1024);
+    transport.deterministic_packet_numbers(true);
     let mut congestion = crate::congestion::CubicConfig::default();
     congestion.initial_window(128 * 1024);
     transport.congestion_controller_factory(Arc::new(congestion));
-    let mut pair = ConnPair::builder()
+    let mut builder = ConnPair::builder();
+    builder.client_endpoint_cfg.rng_seed(Some([1; 32]));
+    builder.server_endpoint_cfg.rng_seed(Some([2; 32]));
+    let mut pair = builder
         .with_transport_cfg(transport)
         .with_latency(Duration::from_millis(50))
         .connect();
@@ -5162,7 +5175,7 @@ fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
             break;
         }
         steps += 1;
-        idle = !pair.blackhole_step(steps % 17 == 0, steps % 19 == 0);
+        idle = !pair.blackhole_step(steps % server_drop == 0, steps % client_drop == 0);
     }
     assert!(metadata_blocked);
     assert_eq!(client_remaining, 0);

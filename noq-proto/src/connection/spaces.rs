@@ -110,7 +110,7 @@ impl PacketSpace {
         &mut self,
         path_id: PathId,
         request_immediate_ack: bool,
-        streams: &StreamsState,
+        streams: &mut StreamsState,
     ) {
         if request_immediate_ack {
             // The probe should be ACKed without delay (should only be used in the Data space and
@@ -133,7 +133,8 @@ impl PacketSpace {
             if !packet.retransmits.is_empty(streams) {
                 // Remove retransmitted data from the old packet so we don't end up retransmitting
                 // it *again* even if the copy we're sending now gets acknowledged.
-                self.pending |= mem::take(&mut packet.retransmits);
+                self.pending
+                    .requeue(mem::take(&mut packet.retransmits), streams);
                 return;
             }
         }
@@ -1137,32 +1138,21 @@ impl Retransmits {
         self.reserve_crypto(rhs.crypto.len())?;
         if let Some(allocation) = &mut self.allocation {
             let extra = [
-                self.max_stream_data
+                rhs.path_abandon
                     .len()
-                    .checked_add(rhs.max_stream_data.len())
-                    .and_then(|len| len.checked_mul(btree_entry_lease::<StreamId, ()>())),
-                self.path_abandon
+                    .checked_mul(btree_entry_lease::<PathId, TransportErrorCode>()),
+                rhs.path_status
                     .len()
-                    .checked_add(rhs.path_abandon.len())
-                    .and_then(|len| {
-                        len.checked_mul(btree_entry_lease::<PathId, TransportErrorCode>())
-                    }),
-                self.path_status
+                    .checked_mul(btree_entry_lease::<PathId, ()>()),
+                rhs.path_cids_blocked
                     .len()
-                    .checked_add(rhs.path_status.len())
-                    .and_then(|len| len.checked_mul(btree_entry_lease::<PathId, ()>())),
-                self.path_cids_blocked
+                    .checked_mul(btree_entry_lease::<PathId, VarInt>()),
+                rhs.add_address
                     .len()
-                    .checked_add(rhs.path_cids_blocked.len())
-                    .and_then(|len| len.checked_mul(btree_entry_lease::<PathId, VarInt>())),
-                self.add_address
+                    .checked_mul(btree_entry_lease::<AddAddress, ()>()),
+                rhs.remove_address
                     .len()
-                    .checked_add(rhs.add_address.len())
-                    .and_then(|len| len.checked_mul(btree_entry_lease::<AddAddress, ()>())),
-                self.remove_address
-                    .len()
-                    .checked_add(rhs.remove_address.len())
-                    .and_then(|len| len.checked_mul(btree_entry_lease::<RemoveAddress, ()>())),
+                    .checked_mul(btree_entry_lease::<RemoveAddress, ()>()),
             ]
             .into_iter()
             .try_fold(0_usize, |total, bytes| total.checked_add(bytes?))
@@ -1221,10 +1211,18 @@ impl Retransmits {
             && reach_out.is_empty()
             && reset_stream_at.is_empty()
     }
-}
 
-impl ::std::ops::BitOrAssign for Retransmits {
-    fn bitor_assign(&mut self, rhs: Self) {
+    pub(super) fn requeue(&mut self, lost: ThinRetransmits, streams: &mut StreamsState) {
+        let ThinRetransmits {
+            retransmits: Some(rhs),
+            box_allocation: _box_allocation,
+        } = lost
+        else {
+            return;
+        };
+        for &id in &rhs.max_stream_data {
+            streams.queue_max_stream_data(id);
+        }
         if self.reserve_merge(&rhs).is_err() {
             self.allocation_failed = true;
             return;
@@ -1235,7 +1233,7 @@ impl ::std::ops::BitOrAssign for Retransmits {
             streams_blocked,
             reset_stream,
             stop_sending,
-            max_stream_data,
+            max_stream_data: _,
             crypto,
             new_cids,
             retire_cids,
@@ -1253,7 +1251,7 @@ impl ::std::ops::BitOrAssign for Retransmits {
             reset_stream_at,
             allocation,
             allocation_failed,
-        } = rhs;
+        } = *rhs;
         let _rhs_allocation = allocation;
         if allocation_failed {
             self.allocation_failed = true;
@@ -1269,7 +1267,6 @@ impl ::std::ops::BitOrAssign for Retransmits {
         }
         self.reset_stream.extend_from_slice(&reset_stream);
         self.stop_sending.extend_from_slice(&stop_sending);
-        self.max_stream_data.extend(&max_stream_data);
         for crypto in crypto.into_iter().rev() {
             self.crypto.push_front(crypto);
         }
@@ -1290,31 +1287,6 @@ impl ::std::ops::BitOrAssign for Retransmits {
         if self.sync_allocation().is_err() {
             self.allocation_failed = true;
         }
-    }
-}
-
-impl ::std::ops::BitOrAssign<ThinRetransmits> for Retransmits {
-    fn bitor_assign(&mut self, rhs: ThinRetransmits) {
-        let ThinRetransmits {
-            retransmits,
-            box_allocation: _box_allocation,
-        } = rhs;
-        if let Some(retransmits) = retransmits {
-            self.bitor_assign(*retransmits)
-        }
-    }
-}
-
-impl ::std::iter::FromIterator<Self> for Retransmits {
-    fn from_iter<T>(iter: T) -> Self
-    where
-        T: IntoIterator<Item = Self>,
-    {
-        let mut result = Self::default();
-        for packet in iter {
-            result |= packet;
-        }
-        result
     }
 }
 

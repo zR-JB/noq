@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque, btree_map},
+    collections::{BTreeMap, BTreeSet, VecDeque, btree_map},
     convert::TryFrom,
     mem,
     sync::Arc,
@@ -160,6 +160,7 @@ pub struct StreamsState {
     ///
     /// Streams are only added to this list when a write fails.
     pub(super) connection_blocked: Vec<StreamId>,
+    pending_max_stream_data: BTreeSet<StreamId>,
     /// Connection-level flow control budget dictated by the peer
     pub(super) max_data: u64,
     /// The initial receive window
@@ -242,6 +243,7 @@ impl StreamsState {
             pending: PendingStreamsQueue::new(transmit),
             events: StreamEvents::new(reassembly),
             connection_blocked: Vec::new(),
+            pending_max_stream_data: BTreeSet::new(),
             max_data: 0,
             receive_window: receive_window.into(),
             local_max_data: receive_window.into(),
@@ -297,6 +299,7 @@ impl StreamsState {
                 self.send.remove(&id).unwrap();
                 if let Dir::Bi = dir {
                     self.recv.remove(&id).unwrap();
+                    self.pending_max_stream_data.remove(&id);
                 }
             }
             self.next[dir as usize] = 0;
@@ -608,6 +611,18 @@ impl StreamsState {
             .is_some_and(|s| s.can_send_flow_control())
     }
 
+    pub(in crate::connection) fn queue_max_stream_data(&mut self, id: StreamId) {
+        if self.can_send_flow_control(id) {
+            self.pending_max_stream_data.insert(id);
+        }
+    }
+
+    pub(crate) fn can_send_max_stream_data(&self) -> bool {
+        self.pending_max_stream_data
+            .iter()
+            .any(|&id| self.can_send_flow_control(id))
+    }
+
     pub(in crate::connection) fn write_control_frames<'a, 'b>(
         &mut self,
         builder: &mut PacketBuilder<'a, 'b>,
@@ -705,14 +720,12 @@ impl StreamsState {
 
         // MAX_STREAM_DATA
         while builder.frame_space_remaining() > 17
-            && !pending.max_stream_data.is_empty()
+            && !self.pending_max_stream_data.is_empty()
             && builder.reserve_control(ControlKind::MaxStreamData)
         {
-            let id = match pending.max_stream_data.iter().next() {
-                Some(x) => *x,
-                None => break,
+            let Some(id) = self.pending_max_stream_data.pop_first() else {
+                break;
             };
-            pending.max_stream_data.remove(&id);
             let Some(rs) = self
                 .recv
                 .get_mut(&id)
@@ -1179,12 +1192,7 @@ impl StreamsState {
                 self.recv
                     .len()
                     .checked_add(recv)
-                    .and_then(|len| {
-                        len.checked_mul(
-                            btree_entry_lease::<StreamId, Option<StreamRecv>>()
-                                + mem::size_of::<Recv>(),
-                        )
-                    })
+                    .and_then(|len| len.checked_mul(recv_stream_lease()))
                     .ok_or(AllocationError)?,
             )
         })();
@@ -1208,11 +1216,7 @@ impl StreamsState {
             )
             .expect("releasing stream states");
         self.recv_allocation
-            .resize(
-                self.recv.len()
-                    * (btree_entry_lease::<StreamId, Option<StreamRecv>>()
-                        + mem::size_of::<Recv>()),
-            )
+            .resize(self.recv.len() * recv_stream_lease())
             .expect("releasing stream states");
     }
 
@@ -1319,6 +1323,7 @@ impl StreamsState {
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
         drop(recv);
+        self.pending_max_stream_data.remove(&id);
         self.stream_freed(id, StreamHalf::Recv);
     }
 
@@ -1332,6 +1337,12 @@ impl StreamsState {
             Dir::Bi => self.initial_max_stream_data_bidi_remote,
         }
     }
+}
+
+fn recv_stream_lease() -> usize {
+    btree_entry_lease::<StreamId, Option<StreamRecv>>()
+        + mem::size_of::<Recv>()
+        + btree_entry_lease::<StreamId, ()>()
 }
 
 #[inline]

@@ -1535,7 +1535,8 @@ impl Connection {
                 .and_then(|()| self.packet_budget.acquire(ack_metadata_bytes))
                 .ok();
             let allocation = allocation.filter(|_| {
-                let pending = !self.spaces[space_id].pending.is_empty(&self.streams);
+                let pending = !self.spaces[space_id].pending.is_empty(&self.streams)
+                    || space_id == SpaceId::Data && self.streams.can_send_max_stream_data();
                 let probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
                 let reserve = if pending {
                     Retransmits::first_control_bytes()
@@ -1644,7 +1645,7 @@ impl Connection {
                         self.spaces[space_id].queue_tail_loss_probe(
                             path_id,
                             request_immediate_ack,
-                            &self.streams,
+                            &mut self.streams,
                         );
                     } else {
                         self.spaces[space_id].for_path(path_id).pending_ping = true;
@@ -2928,6 +2929,7 @@ impl Connection {
     /// Whether there are any pending retransmits
     pub fn has_pending_retransmits(&self) -> bool {
         !self.spaces[SpaceId::Data].pending.is_empty(&self.streams)
+            || self.streams.can_send_max_stream_data()
     }
 
     /// Look up whether we're the client or server of this Connection
@@ -3676,7 +3678,9 @@ impl Connection {
                         return;
                     }
                 }
-                self.spaces[pn_space].pending |= info.retransmits;
+                self.spaces[pn_space]
+                    .pending
+                    .requeue(info.retransmits, &mut self.streams);
                 let path = self.path_data_mut(path_id);
                 path.pending |= info.path_retransmits;
                 path.mtud.on_non_probe_lost(packet, info.size);
@@ -4835,7 +4839,9 @@ impl Connection {
                         .get_mut(&PathId::ZERO)
                         .unwrap()
                         .remove_in_flight(&info);
-                    self.spaces[SpaceId::Data].pending |= info.retransmits;
+                    self.spaces[SpaceId::Data]
+                        .pending
+                        .requeue(info.retransmits, &mut self.streams);
                 }
                 self.streams.retransmit_all_for_0rtt();
 
@@ -7218,8 +7224,9 @@ impl Connection {
                 .get(&path_id)
                 .is_some_and(|pns| pns.pending_path_responses.has_pending_on_path(network_path));
 
-        // Stream control frames are checked in PacketSpace::can_send, only check data here.
+        // Other stream control frames are checked in PacketSpace::can_send.
         let other = self.streams.can_send_stream_data()
+            || self.streams.can_send_max_stream_data()
             || self
                 .datagrams
                 .outgoing
