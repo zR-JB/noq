@@ -593,6 +593,8 @@ impl StreamsState {
             e.remove_entry();
             self.stream_freed(id, StreamHalf::Send);
             self.events.push_back(StreamEvent::Finished { id });
+        } else {
+            self.send_control.remove(&id);
         }
     }
 
@@ -3738,5 +3740,22 @@ mod tests {
             !server.send.contains_key(&id),
             "current frame ack completes the reliable reset"
         );
+    }
+
+    #[test]
+    fn requeued_reliable_reset_owes_no_frame_once_acknowledged() {
+        let (mut server, id) = send_stream_setup(true);
+        let state = ConnState::established();
+        let mut stream = SendStream {
+            id,
+            state: &mut server,
+            conn_state: &state,
+        };
+        stream.write(b"0123456789").unwrap();
+        stream.reset_at(4u32.into(), 7u32.into()).unwrap();
+        server.queue_send_control(id);
+        server.reset_at_acked(id, VarInt::from_u32(4));
+        assert!(server.send.contains_key(&id));
+        assert!(!server.can_send_control());
     }
 }
