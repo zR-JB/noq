@@ -623,14 +623,8 @@ pub struct Retransmits {
     pub(super) remove_address: BTreeSet<RemoveAddress>,
     /// Round and local addresses to advertise in `REACH_OUT` frames
     pub(super) reach_out: PendingReachOutFrames,
-    /// Streams that need a RESET_STREAM_AT frame (re)transmitted, paired with the reliable size the
-    /// pending/sent frame carries.
-    ///
-    /// The final size, reliable size, and error code of an outgoing frame are reconstructed from
-    /// the live send-stream state when it is written (mirroring how `reset_stream` rebuilds its
-    /// final offset), so the stored reliable size is ignored on (re)transmission. It is retained
-    /// only so that, on acknowledgement, a frame carrying a now-superseded (larger) reliable size
-    /// can be distinguished from the current one (see `reset_at_acked`).
+    /// Sent RESET_STREAM_AT frames with their reliable size, so acknowledging a superseded one is
+    /// ignored (see `reset_at_acked`)
     pub(super) reset_stream_at: Vec<(StreamId, VarInt)>,
     allocation: Option<Allocation>,
     pub(super) allocation_failed: bool,
@@ -1101,16 +1095,6 @@ impl Retransmits {
         }
         self.sync_allocation()?;
         reserve_control_vec(
-            &mut self.reset_stream,
-            self.allocation.as_mut(),
-            rhs.reset_stream.len(),
-        )?;
-        reserve_control_vec(
-            &mut self.stop_sending,
-            self.allocation.as_mut(),
-            rhs.stop_sending.len(),
-        )?;
-        reserve_control_vec(
             &mut self.retire_cids,
             self.allocation.as_mut(),
             rhs.retire_cids.len(),
@@ -1119,11 +1103,6 @@ impl Retransmits {
             &mut self.new_tokens,
             self.allocation.as_mut(),
             rhs.new_tokens.len(),
-        )?;
-        reserve_control_vec(
-            &mut self.reset_stream_at,
-            self.allocation.as_mut(),
-            rhs.reset_stream_at.len(),
         )?;
         reserve_control_vec(
             &mut self.new_cids.cids,
@@ -1221,7 +1200,13 @@ impl Retransmits {
             return;
         };
         for &id in &rhs.max_stream_data {
-            streams.queue_max_stream_data(id);
+            streams.queue_recv_control(id);
+        }
+        for frame in &rhs.stop_sending {
+            streams.queue_recv_control(frame.id);
+        }
+        for &(id, _) in rhs.reset_stream.iter().chain(&rhs.reset_stream_at) {
+            streams.queue_send_control(id);
         }
         if self.reserve_merge(&rhs).is_err() {
             self.allocation_failed = true;
@@ -1231,8 +1216,8 @@ impl Retransmits {
             max_data,
             max_stream_id,
             streams_blocked,
-            reset_stream,
-            stop_sending,
+            reset_stream: _,
+            stop_sending: _,
             max_stream_data: _,
             crypto,
             new_cids,
@@ -1248,7 +1233,7 @@ impl Retransmits {
             add_address,
             remove_address,
             mut reach_out,
-            reset_stream_at,
+            reset_stream_at: _,
             allocation,
             allocation_failed,
         } = *rhs;
@@ -1265,8 +1250,6 @@ impl Retransmits {
             self.max_stream_id[dir as usize] |= max_stream_id[dir as usize];
             self.streams_blocked[dir as usize] |= streams_blocked[dir as usize];
         }
-        self.reset_stream.extend_from_slice(&reset_stream);
-        self.stop_sending.extend_from_slice(&stop_sending);
         for crypto in crypto.into_iter().rev() {
             self.crypto.push_front(crypto);
         }
@@ -1283,7 +1266,6 @@ impl Retransmits {
         self.add_address.extend(add_address.iter().copied());
         self.remove_address.extend(remove_address.iter().copied());
         self.reach_out.append(&mut reach_out);
-        self.reset_stream_at.extend_from_slice(&reset_stream_at);
         if self.sync_allocation().is_err() {
             self.allocation_failed = true;
         }

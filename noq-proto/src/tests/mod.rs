@@ -5488,19 +5488,45 @@ fn close_reason_backing_survives_connection_handles() {
 }
 
 #[test]
-fn pending_control_pressure_closes_connection() {
+fn stream_control_survives_packet_metadata_pressure() {
     let mut pair = ConnPair::default();
-    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
-    let _charged = pair.conn_mut(Client).exhaust_packet_metadata();
-    pair.send_stream(Client, stream)
-        .reset(VarInt::from_u32(42))
+    let reset = pair.streams(Client).open(Dir::Uni).unwrap();
+    let reset_at = pair.streams(Client).open(Dir::Uni).unwrap();
+    let stopped = pair.streams(Server).open(Dir::Uni).unwrap();
+    pair.send_stream(Server, stopped)
+        .write(b"unwanted")
         .unwrap();
+    pair.drive();
+    let charged = pair.conn_mut(Client).exhaust_packet_metadata();
+    pair.send_stream(Client, reset_at)
+        .write(b"reliable")
+        .unwrap();
+    pair.send_stream(Client, reset).reset(VarInt(1)).unwrap();
+    for size in [4, 2] {
+        pair.send_stream(Client, reset_at)
+            .reset_at(VarInt(size), VarInt(2))
+            .unwrap();
+    }
+    pair.recv_stream(Client, stopped).stop(VarInt(3)).unwrap();
     pair.drive_client();
-    assert_matches!(pair.conn_mut(Client).poll(),
-        Some(Event::ConnectionLost { reason: ConnectionError::TransportError(ref error) })
-        if error.code == TransportErrorCode::INTERNAL_ERROR);
-    pair.drive_client();
-    assert_matches!(pair.conn_mut(Client).poll(), None);
+    while let Some(event) = pair.conn_mut(Client).poll() {
+        assert!(!matches!(event, Event::ConnectionLost { .. }), "{event:?}");
+    }
+    drop(charged);
+    pair.drive();
+    for (stream, reliable, code) in [(reset, &b""[..], 1), (reset_at, b"re", 2)] {
+        let mut recv = pair.recv_stream(Server, stream);
+        let mut chunks = recv.read(true).unwrap();
+        if !reliable.is_empty() {
+            assert_matches!(chunks.next(usize::MAX), Ok(Some(chunk)) if chunk.bytes == reliable);
+        }
+        assert_matches!(chunks.next(usize::MAX), Err(ReadError::Reset(c)) if c == VarInt(code));
+        let _ = chunks.finalize();
+    }
+    assert_matches!(
+        pair.send_stream(Server, stopped).write(b"more"),
+        Err(WriteError::Stopped(VarInt(3)))
+    );
 }
 
 #[test]

@@ -160,7 +160,10 @@ pub struct StreamsState {
     ///
     /// Streams are only added to this list when a write fails.
     pub(super) connection_blocked: Vec<StreamId>,
-    pending_max_stream_data: BTreeSet<StreamId>,
+    /// Send streams owing a RESET_STREAM or RESET_STREAM_AT, charged with their stream state
+    send_control: BTreeSet<StreamId>,
+    /// Receive streams owing a STOP_SENDING or MAX_STREAM_DATA, charged with their stream state
+    recv_control: BTreeSet<StreamId>,
     /// Connection-level flow control budget dictated by the peer
     pub(super) max_data: u64,
     /// The initial receive window
@@ -243,7 +246,8 @@ impl StreamsState {
             pending: PendingStreamsQueue::new(transmit),
             events: StreamEvents::new(reassembly),
             connection_blocked: Vec::new(),
-            pending_max_stream_data: BTreeSet::new(),
+            send_control: BTreeSet::new(),
+            recv_control: BTreeSet::new(),
             max_data: 0,
             receive_window: receive_window.into(),
             local_max_data: receive_window.into(),
@@ -297,9 +301,10 @@ impl StreamsState {
                 // counters below.
                 let id = StreamId::new(self.side, dir, i);
                 self.send.remove(&id).unwrap();
+                self.send_control.remove(&id);
                 if let Dir::Bi = dir {
                     self.recv.remove(&id).unwrap();
-                    self.pending_max_stream_data.remove(&id);
+                    self.recv_control.remove(&id);
                 }
             }
             self.next[dir as usize] = 0;
@@ -555,7 +560,7 @@ impl StreamsState {
         match self.send.entry(id) {
             btree_map::Entry::Vacant(_) => {}
             btree_map::Entry::Occupied(e) => {
-                if let Some(SendState::ResetSent) = e.get().as_ref().map(|s| s.state) {
+                if e.get().as_ref().is_some_and(|s| s.is_reset()) {
                     e.remove_entry();
                     self.stream_freed(id, StreamHalf::Send);
                 }
@@ -611,16 +616,53 @@ impl StreamsState {
             .is_some_and(|s| s.can_send_flow_control())
     }
 
-    pub(in crate::connection) fn queue_max_stream_data(&mut self, id: StreamId) {
-        if self.can_send_flow_control(id) {
-            self.pending_max_stream_data.insert(id);
+    fn recv_needs_control(&self, id: StreamId) -> bool {
+        self.recv
+            .get(&id)
+            .and_then(|s| s.as_ref())
+            .and_then(|s| s.as_open_recv())
+            .is_some_and(|s| s.needs_control())
+    }
+
+    pub(in crate::connection) fn queue_recv_control(&mut self, id: StreamId) {
+        if self.recv_needs_control(id) {
+            self.recv_control.insert(id);
         }
     }
 
-    pub(crate) fn can_send_max_stream_data(&self) -> bool {
-        self.pending_max_stream_data
-            .iter()
-            .any(|&id| self.can_send_flow_control(id))
+    pub(in crate::connection) fn queue_send_control(&mut self, id: StreamId) {
+        let needs_reset = self
+            .send
+            .get(&id)
+            .and_then(|s| s.as_ref())
+            .is_some_and(|s| s.is_reset() || s.reset_at.as_ref().is_some_and(|r| !r.frame_acked));
+        if needs_reset {
+            self.send_control.insert(id);
+        }
+    }
+
+    pub(crate) fn can_send_control(&self) -> bool {
+        !self.send_control.is_empty()
+            || self
+                .recv_control
+                .iter()
+                .any(|&id| self.recv_needs_control(id))
+    }
+
+    pub(crate) fn stop_sending_acked(&mut self, id: StreamId) {
+        let Some(rs) = self
+            .recv
+            .get_mut(&id)
+            .and_then(|s| s.as_mut())
+            .and_then(|s| s.as_open_recv_mut())
+        else {
+            return;
+        };
+        rs.stop_sending = None;
+        if rs.stop_complete() {
+            let rs = self.recv.remove(&id).flatten().unwrap();
+            self.stream_recv_freed(id, rs);
+        }
     }
 
     pub(in crate::connection) fn write_control_frames<'a, 'b>(
@@ -629,70 +671,48 @@ impl StreamsState {
         pending: &mut Retransmits,
         stats: &mut FrameStats,
     ) {
-        // RESET_STREAM
-        while builder.frame_space_remaining() > frame::ResetStream::SIZE_BOUND
-            && !pending.reset_stream.is_empty()
-            && builder.reserve_control(ControlKind::ResetStream)
-        {
-            let Some((id, error_code)) = pending.reset_stream.pop() else {
-                break;
-            };
-            let Some(stream) = self.send.get_mut(&id).and_then(|s| s.as_mut()) else {
-                continue;
-            };
-            let frame = frame::ResetStream {
-                id,
-                error_code,
-                final_offset: VarInt::try_from(stream.offset()).expect("impossibly large offset"),
-            };
-            builder.write_frame(frame, stats);
-        }
-
-        // RESET_STREAM_AT
+        // RESET_STREAM and RESET_STREAM_AT, rebuilt from the stream's current state
         while builder.frame_space_remaining() > frame::ResetStreamAt::SIZE_BOUND
-            && !pending.reset_stream_at.is_empty()
-            && builder.reserve_control(ControlKind::ResetStreamAt)
+            && let Some(&id) = self.send_control.first()
         {
-            // The stored reliable size is only used for acknowledgement tracking; the frame is
-            // always (re)built from the stream's current (smallest) reliable size below.
-            let Some((id, _)) = pending.reset_stream_at.pop() else {
-                break;
-            };
-            let Some(stream) = self.send.get_mut(&id).and_then(|s| s.as_mut()) else {
+            let Some(stream) = self.send.get(&id).and_then(|s| s.as_ref()) else {
+                self.send_control.pop_first();
                 continue;
             };
-            // The reliable reset may have been superseded or already completed and freed.
-            let Some(reset_at) = stream.reset_at.as_ref() else {
-                continue;
-            };
-            // The reliable size is the current send-buffer end (the buffer was truncated to it);
-            // the final size and error code are fixed for the lifetime of the reliable reset.
-            let frame = frame::ResetStreamAt {
-                id,
-                error_code: reset_at.error_code,
-                final_offset: VarInt::try_from(reset_at.final_size)
-                    .expect("impossibly large offset"),
-                reliable_size: VarInt::try_from(stream.pending.offset())
-                    .expect("impossibly large offset"),
-            };
-            builder.write_frame(frame, stats);
-        }
-
-        // STOP_SENDING
-        while builder.frame_space_remaining() > frame::StopSending::SIZE_BOUND
-            && !pending.stop_sending.is_empty()
-            && builder.reserve_control(ControlKind::StopSending)
-        {
-            let Some(frame) = pending.stop_sending.pop() else {
+            let (kind, frame): (_, frame::EncodableFrame<'_>) =
+                match (stream.state, &stream.reset_at) {
+                    (SendState::ResetSent { error_code }, _) => (
+                        ControlKind::ResetStream,
+                        frame::ResetStream {
+                            id,
+                            error_code,
+                            final_offset: VarInt::try_from(stream.offset())
+                                .expect("impossibly large offset"),
+                        }
+                        .into(),
+                    ),
+                    (_, Some(reset_at)) if !reset_at.frame_acked => (
+                        ControlKind::ResetStreamAt,
+                        frame::ResetStreamAt {
+                            id,
+                            error_code: reset_at.error_code,
+                            final_offset: VarInt::try_from(reset_at.final_size)
+                                .expect("impossibly large offset"),
+                            // The send buffer was truncated to the current reliable size
+                            reliable_size: VarInt::try_from(stream.pending.offset())
+                                .expect("impossibly large offset"),
+                        }
+                        .into(),
+                    ),
+                    _ => {
+                        self.send_control.pop_first();
+                        continue;
+                    }
+                };
+            if !builder.reserve_control(kind) {
                 break;
-            };
-            // We may need to transmit STOP_SENDING even for streams whose state we have discarded,
-            // because we are able to discard local state for stopped streams immediately upon
-            // receiving FIN, even if the peer still has arbitrarily large amounts of data to
-            // (re)transmit due to loss or unconventional sending strategy. We could fine-tune this
-            // a little by dropping the frame if we specifically know the stream's been reset by the
-            // peer, but we discard that information as soon as the application consumes it, so it
-            // can't be relied upon regardless.
+            }
+            self.send_control.pop_first();
             builder.write_frame(frame, stats);
         }
 
@@ -718,29 +738,36 @@ impl StreamsState {
             builder.write_frame(frame::MaxData(max), stats);
         }
 
-        // MAX_STREAM_DATA
-        while builder.frame_space_remaining() > 17
-            && !self.pending_max_stream_data.is_empty()
-            && builder.reserve_control(ControlKind::MaxStreamData)
+        // STOP_SENDING and MAX_STREAM_DATA
+        while builder.frame_space_remaining() > frame::StopSending::SIZE_BOUND
+            && let Some(&id) = self.recv_control.first()
         {
-            let Some(id) = self.pending_max_stream_data.pop_first() else {
-                break;
-            };
             let Some(rs) = self
                 .recv
                 .get_mut(&id)
                 .and_then(|s| s.as_mut())
                 .and_then(|s| s.as_open_recv_mut())
             else {
+                self.recv_control.pop_first();
                 continue;
             };
-            if !rs.can_send_flow_control() {
-                continue;
+            if let Some(error_code) = rs.stop_sending {
+                if !builder.reserve_control(ControlKind::StopSending) {
+                    break;
+                }
+                self.recv_control.pop_first();
+                builder.write_frame(frame::StopSending { id, error_code }, stats);
+            } else if rs.can_send_flow_control() {
+                if !builder.reserve_control(ControlKind::MaxStreamData) {
+                    break;
+                }
+                self.recv_control.pop_first();
+                let (max, _) = rs.max_stream_data(self.stream_receive_window);
+                rs.record_sent_max_stream_data(max);
+                builder.write_frame(frame::MaxStreamData { id, offset: max }, stats);
+            } else {
+                self.recv_control.pop_first();
             }
-
-            let (max, _) = rs.max_stream_data(self.stream_receive_window);
-            rs.record_sent_max_stream_data(max);
-            builder.write_frame(frame::MaxStreamData { id, offset: max }, stats);
         }
 
         // MAX_STREAMS
@@ -1180,12 +1207,7 @@ impl StreamsState {
                 self.send
                     .len()
                     .checked_add(send)
-                    .and_then(|len| {
-                        len.checked_mul(
-                            btree_entry_lease::<StreamId, Option<Box<Send>>>()
-                                + mem::size_of::<Send>(),
-                        )
-                    })
+                    .and_then(|len| len.checked_mul(send_stream_lease()))
                     .ok_or(AllocationError)?,
             )?;
             self.recv_allocation.resize(
@@ -1210,10 +1232,7 @@ impl StreamsState {
             self.recv = BTreeMap::new();
         }
         self.send_allocation
-            .resize(
-                self.send.len()
-                    * (btree_entry_lease::<StreamId, Option<Box<Send>>>() + mem::size_of::<Send>()),
-            )
+            .resize(self.send.len() * send_stream_lease())
             .expect("releasing stream states");
         self.recv_allocation
             .resize(self.recv.len() * recv_stream_lease())
@@ -1315,15 +1334,20 @@ impl StreamsState {
                 self.ensure_remote_streams(id.dir());
             }
         }
-        if half == StreamHalf::Send {
-            self.send_streams -= 1;
+        match half {
+            StreamHalf::Send => {
+                self.send_streams -= 1;
+                self.send_control.remove(&id);
+            }
+            StreamHalf::Recv => {
+                self.recv_control.remove(&id);
+            }
         }
         self.refund_streams();
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
         drop(recv);
-        self.pending_max_stream_data.remove(&id);
         self.stream_freed(id, StreamHalf::Recv);
     }
 
@@ -1337,6 +1361,12 @@ impl StreamsState {
             Dir::Bi => self.initial_max_stream_data_bidi_remote,
         }
     }
+}
+
+fn send_stream_lease() -> usize {
+    btree_entry_lease::<StreamId, Option<Box<Send>>>()
+        + mem::size_of::<Send>()
+        + btree_entry_lease::<StreamId, ()>()
 }
 
 fn recv_stream_lease() -> usize {
@@ -1873,7 +1903,7 @@ mod tests {
         };
 
         recv.stop(0u32.into()).unwrap();
-        assert_eq!(recv.pending.stop_sending.len(), 1);
+        assert!(recv.state.recv_control.contains(&id));
         assert!(!recv.pending.max_data);
 
         assert!(recv.stop(0u32.into()).is_err());
@@ -1897,6 +1927,11 @@ mod tests {
             ShouldTransmit(false)
         );
         assert_eq!(client.local_max_data - initial_max, 48);
+        assert!(
+            client.recv.contains_key(&id),
+            "STOP_SENDING is unacknowledged"
+        );
+        client.stop_sending_acked(id);
         assert!(!client.recv.contains_key(&id));
     }
 
@@ -1955,7 +1990,7 @@ mod tests {
         };
 
         recv.stop(0u32.into()).unwrap();
-        assert_eq!(pending.stop_sending.len(), 1);
+        assert!(client.recv_control.contains(&id));
         assert!(!pending.max_data);
 
         // Server complies
@@ -1984,7 +2019,7 @@ mod tests {
             ..TransportParameters::default()
         });
 
-        let (mut pending, state) = (Retransmits::default(), ConnState::established());
+        let state = ConnState::established();
         let id = Streams {
             state: &mut server,
             conn_state: &state,
@@ -1995,7 +2030,6 @@ mod tests {
         let mut stream = SendStream {
             id,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
 
@@ -2046,7 +2080,7 @@ mod tests {
             ..TransportParameters::default()
         });
 
-        let (mut pending, state) = (Retransmits::default(), ConnState::established());
+        let state = ConnState::established();
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
@@ -2059,7 +2093,6 @@ mod tests {
         let mut mid = SendStream {
             id: id_mid,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         mid.write(b"mid").unwrap();
@@ -2067,7 +2100,6 @@ mod tests {
         let mut low = SendStream {
             id: id_low,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         low.set_priority(-1).unwrap();
@@ -2076,7 +2108,6 @@ mod tests {
         let mut high = SendStream {
             id: id_high,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         high.set_priority(1).unwrap();
@@ -2101,7 +2132,7 @@ mod tests {
             ..TransportParameters::default()
         });
 
-        let (mut pending, state) = (Retransmits::default(), ConnState::established());
+        let state = ConnState::established();
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
@@ -2113,7 +2144,6 @@ mod tests {
         let mut mid = SendStream {
             id: id_mid,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         assert_eq!(mid.write(b"mid").unwrap(), 3);
@@ -2122,7 +2152,6 @@ mod tests {
         let mut high = SendStream {
             id: id_high,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         high.set_priority(1).unwrap();
@@ -2135,7 +2164,6 @@ mod tests {
         let mut high = SendStream {
             id: id_high,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         high.set_priority(-1).unwrap();
@@ -2168,7 +2196,7 @@ mod tests {
                 ..TransportParameters::default()
             });
 
-            let (mut pending, state) = (Retransmits::default(), ConnState::established());
+            let state = ConnState::established();
             let mut streams = Streams {
                 state: &mut server,
                 conn_state: &state,
@@ -2182,7 +2210,6 @@ mod tests {
             let mut stream_a = SendStream {
                 id: id_a,
                 state: &mut server,
-                pending: &mut pending,
                 conn_state: &state,
             };
             stream_a.write(&[b'a'; 100]).unwrap();
@@ -2190,7 +2217,6 @@ mod tests {
             let mut stream_b = SendStream {
                 id: id_b,
                 state: &mut server,
-                pending: &mut pending,
                 conn_state: &state,
             };
             stream_b.write(&[b'b'; 100]).unwrap();
@@ -2198,7 +2224,6 @@ mod tests {
             let mut stream_c = SendStream {
                 id: id_c,
                 state: &mut server,
-                pending: &mut pending,
                 conn_state: &state,
             };
             stream_c.write(&[b'c'; 100]).unwrap();
@@ -2246,7 +2271,7 @@ mod tests {
             ..TransportParameters::default()
         });
 
-        let (mut pending, state) = (Retransmits::default(), ConnState::established());
+        let state = ConnState::established();
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
@@ -2260,7 +2285,6 @@ mod tests {
         let mut stream_a = SendStream {
             id: id_a,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         stream_a.write(&[b'a'; 100]).unwrap();
@@ -2268,7 +2292,6 @@ mod tests {
         let mut stream_b = SendStream {
             id: id_b,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         stream_b.write(&[b'b'; 100]).unwrap();
@@ -2284,7 +2307,6 @@ mod tests {
         let mut stream_c = SendStream {
             id: id_c,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         stream_c.set_priority(1).unwrap();
@@ -2334,7 +2356,12 @@ mod tests {
             pending: &mut pending,
         };
         stream.stop(0u32.into()).unwrap();
-        assert!(client.recv.get_mut(&id).is_none(), "stream is freed");
+        assert!(
+            client.recv.contains_key(&id),
+            "STOP_SENDING is unacknowledged"
+        );
+        client.stop_sending_acked(id);
+        assert!(!client.recv.contains_key(&id), "stream is freed");
     }
 
     // Verify that a stream that's been reset doesn't cause the appearance of pending data
@@ -2347,7 +2374,7 @@ mod tests {
             initial_max_stream_data_uni: 42u32.into(),
             ..TransportParameters::default()
         });
-        let (mut pending, state) = (Retransmits::default(), ConnState::established());
+        let state = ConnState::established();
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
@@ -2357,13 +2384,12 @@ mod tests {
         let mut stream = SendStream {
             id,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         stream.write(b"hello").unwrap();
         stream.reset(0u32.into()).unwrap();
 
-        assert_eq!(pending.reset_stream, &[(id, 0u32.into())]);
+        assert!(server.send_control.contains(&id));
         assert!(!server.can_send_stream_data());
     }
 
@@ -2408,6 +2434,7 @@ mod tests {
             pending: &mut pending,
         };
         stream.stop(0u32.into()).unwrap();
+        client.stop_sending_acked(StreamId::new(Side::Server, Dir::Uni, 127));
 
         // Open stream 128
         assert_eq!(
@@ -2503,6 +2530,7 @@ mod tests {
             pending: &mut pending,
         };
         stream.stop(0u32.into()).unwrap();
+        client.stop_sending_acked(StreamId::new(Side::Server, Dir::Uni, 127));
 
         // Try to open stream 128, still exceeding limit
         assert_eq!(
@@ -2667,6 +2695,7 @@ mod tests {
         }
         .stop(0u32.into())
         .unwrap();
+        client.stop_sending_acked(id);
         assert!(!client.recv.contains_key(&id));
 
         // A stray retransmit for the freed stream must be dropped without resurrecting state.
@@ -2827,12 +2856,10 @@ mod tests {
         }
         .open(Dir::Uni)
         .unwrap();
-        let mut pending = Retransmits::default();
         let data = vec![7; 64 * 1024];
         let mut stream = SendStream {
             id,
             state: &mut sender,
-            pending: &mut pending,
             conn_state: &conn_state,
         };
         while stream.write(&data).is_ok() {}
@@ -2930,7 +2957,6 @@ mod tests {
         assert_eq!(server.write_limit(), initial_send_window);
         assert_eq!(server.poll(), None);
 
-        let mut retransmits = Retransmits::default();
         let conn_state = ConnState::established();
 
         let stream_id = Streams {
@@ -2943,7 +2969,6 @@ mod tests {
         let mut stream = SendStream {
             id: stream_id,
             state: &mut server,
-            pending: &mut retransmits,
             conn_state: &conn_state,
         };
 
@@ -3010,7 +3035,6 @@ mod tests {
         assert_eq!(server.write_limit(), initial_send_window);
         assert_eq!(server.poll(), None);
 
-        let mut retransmits = Retransmits::default();
         let conn_state = ConnState::established();
 
         let stream_id = Streams {
@@ -3023,7 +3047,6 @@ mod tests {
         let mut stream = SendStream {
             id: stream_id,
             state: &mut server,
-            pending: &mut retransmits,
             conn_state: &conn_state,
         };
 
@@ -3635,12 +3658,10 @@ mod tests {
     fn reliable_reset_send_emits_prefix_without_fin_and_queues_frame() {
         let (mut server, id) = send_stream_setup(true);
         let state = ConnState::established();
-        let mut pending = Retransmits::default();
         {
             let mut stream = SendStream {
                 id,
                 state: &mut server,
-                pending: &mut pending,
                 conn_state: &state,
             };
             stream.write(b"0123456789").unwrap(); // 10 bytes
@@ -3649,7 +3670,7 @@ mod tests {
 
         // The stream is queued for a RESET_STREAM_AT frame carrying the reliable size, and still
         // has reliable data to send.
-        assert_eq!(pending.reset_stream_at, &[(id, VarInt::from_u32(4))]);
+        assert!(server.send_control.contains(&id));
         assert!(server.can_send_stream_data());
 
         // Only the reliable prefix [0, 4) is sent, and never with a FIN (the frame ends the stream).
@@ -3666,11 +3687,9 @@ mod tests {
     fn reset_at_requires_peer_support() {
         let (mut server, id) = send_stream_setup(false);
         let state = ConnState::established();
-        let mut pending = Retransmits::default();
         let mut stream = SendStream {
             id,
             state: &mut server,
-            pending: &mut pending,
             conn_state: &state,
         };
         stream.write(b"hello").unwrap();
@@ -3684,12 +3703,10 @@ mod tests {
     fn reduced_reliable_reset_ignores_stale_frame_ack() {
         let (mut server, id) = send_stream_setup(true);
         let state = ConnState::established();
-        let mut pending = Retransmits::default();
         {
             let mut stream = SendStream {
                 id,
                 state: &mut server,
-                pending: &mut pending,
                 conn_state: &state,
             };
             stream.write(b"0123456789").unwrap();

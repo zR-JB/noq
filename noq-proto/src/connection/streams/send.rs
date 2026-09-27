@@ -62,7 +62,7 @@ impl Send {
 
     /// Whether the stream has been reset
     pub(super) fn is_reset(&self) -> bool {
-        matches!(self.state, SendState::ResetSent)
+        matches!(self.state, SendState::ResetSent { .. })
     }
 
     pub(super) fn finish(&mut self) -> Result<(), FinishError> {
@@ -135,7 +135,7 @@ impl Send {
                     Ok(false)
                 }
             }
-            SendState::ResetSent => Err(ResetStreamAtError::ClosedStream),
+            SendState::ResetSent { .. } => Err(ResetStreamAtError::ClosedStream),
         }
     }
 
@@ -180,10 +180,10 @@ impl Send {
     }
 
     /// Update stream state due to a reset sent by the local application
-    pub(super) fn reset(&mut self) {
+    pub(super) fn reset(&mut self, error_code: VarInt) {
         use SendState::*;
         if let DataSent { .. } | Ready = self.state {
-            self.state = ResetSent;
+            self.state = ResetSent { error_code };
         }
     }
 
@@ -414,7 +414,7 @@ pub(super) enum SendState {
     /// Stream was finished; now sending retransmits only
     DataSent { finish_acked: bool },
     /// Sent RESET
-    ResetSent,
+    ResetSent { error_code: VarInt },
 }
 
 /// Reasons why attempting to finish a stream might fail
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn reset_at_after_full_reset_is_rejected() {
         let mut send = writer(b"0123456789");
-        send.reset();
+        send.reset(0u32.into());
         assert_eq!(
             send.reset_at(4u32.into(), 0u32.into()),
             Err(ResetStreamAtError::ClosedStream)

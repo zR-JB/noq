@@ -20,6 +20,8 @@ pub(super) struct Recv {
     sent_max_stream_data: u64,
     pub(super) end: u64,
     pub(super) stopped: bool,
+    /// Error code of a STOP_SENDING the peer has not acknowledged
+    pub(super) stop_sending: Option<VarInt>,
 }
 
 impl Recv {
@@ -30,6 +32,7 @@ impl Recv {
             sent_max_stream_data: initial_max_data,
             end: 0,
             stopped: false,
+            stop_sending: None,
         })
     }
 
@@ -59,10 +62,7 @@ impl Recv {
 
         let new_bytes = self.credit_consumed_by(end, received, max_data)?;
 
-        // Stopped streams don't need to wait for the actual data, they just need to know
-        // how much there was.
         if frame.fin
-            && !self.stopped
             && let RecvState::Recv { ref mut size } = self.state
         {
             *size = Some(end);
@@ -76,7 +76,7 @@ impl Recv {
                 .insert(frame.offset, frame.data, payload_len)?;
         }
 
-        Ok((new_bytes, frame.fin && self.stopped))
+        Ok((new_bytes, self.stop_complete()))
     }
 
     pub(super) fn stop(&mut self) -> Result<(u64, ShouldTransmit), ClosedStream> {
@@ -148,6 +148,16 @@ impl Recv {
         // Stream-level flow control is redundant if the sender has already sent the whole stream,
         // and moot if we no longer want data on this stream.
         self.final_offset_unknown() && !self.stopped
+    }
+
+    /// Whether a stopped stream no longer needs state: its size is known and STOP_SENDING settled
+    pub(super) fn stop_complete(&self) -> bool {
+        self.stopped && self.stop_sending.is_none() && !self.final_offset_unknown()
+    }
+
+    /// Whether a STOP_SENDING or MAX_STREAM_DATA frame is due
+    pub(super) fn needs_control(&self) -> bool {
+        self.stop_sending.is_some() || self.can_send_flow_control()
     }
 
     /// Whether data is still being accepted from the peer
@@ -520,7 +530,7 @@ impl<'a> Chunks<'a> {
             // Return the stream to storage for future use
             self.streams.recv.insert(self.id, Some(StreamRecv(rs)));
             if max_stream_data.0 {
-                self.streams.queue_max_stream_data(self.id);
+                self.streams.queue_recv_control(self.id);
             }
         }
 

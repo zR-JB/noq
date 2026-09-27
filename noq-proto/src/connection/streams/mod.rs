@@ -13,7 +13,6 @@ use super::spaces::{Retransmits, reserve_control_vec};
 use crate::{
     Dir, StreamId, VarInt,
     connection::streams::state::{StreamRecv, get_or_insert_recv, get_or_insert_send},
-    frame,
 };
 
 mod recv;
@@ -165,18 +164,17 @@ impl RecvStream<'_> {
 
         let (read_credits, stop_sending) = stream.stop()?;
         if stop_sending.should_transmit() {
-            self.pending.queue_stop_sending(frame::StopSending {
-                id: self.id,
-                error_code,
-            });
+            stream.stop_sending = Some(error_code);
         }
 
-        // We need to keep stopped streams around until they're finished or reset so we can update
-        // connection-level flow control to account for discarded data. Otherwise, we can discard
-        // state immediately.
-        if !stream.final_offset_unknown() {
+        // Stopped streams stay until finished or reset, so connection-level flow control accounts
+        // for discarded data, and until STOP_SENDING is acknowledged, so its retransmission is
+        // bounded by the stream limit.
+        if stream.stop_complete() {
             let recv = entry.remove().expect("must have recv when stopping");
             self.state.stream_recv_freed(self.id, recv);
+        } else {
+            self.state.queue_recv_control(self.id);
         }
 
         if self.state.add_read_credits(read_credits).should_transmit() {
@@ -234,23 +232,16 @@ impl RecvStream<'_> {
 pub struct SendStream<'a> {
     pub(super) id: StreamId,
     pub(super) state: &'a mut StreamsState,
-    pub(super) pending: &'a mut Retransmits,
     pub(super) conn_state: &'a super::State,
 }
 
 #[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
 impl<'a> SendStream<'a> {
     #[cfg(fuzzing)]
-    pub fn new(
-        id: StreamId,
-        state: &'a mut StreamsState,
-        pending: &'a mut Retransmits,
-        conn_state: &'a super::State,
-    ) -> Self {
+    pub fn new(id: StreamId, state: &'a mut StreamsState, conn_state: &'a super::State) -> Self {
         Self {
             id,
             state,
-            pending,
             conn_state,
         }
     }
@@ -401,7 +392,7 @@ impl<'a> SendStream<'a> {
             ))
             .ok_or(ClosedStream { _private: () })?;
 
-        if matches!(stream.state, SendState::ResetSent) || stream.reset_at.is_some() {
+        if stream.is_reset() || stream.reset_at.is_some() {
             // Redundant reset call, or a reliable reset (RESET_STREAM_AT) is already in progress.
             return Err(ClosedStream { _private: () });
         }
@@ -410,8 +401,8 @@ impl<'a> SendStream<'a> {
         // send. We leave flow control alone because the peer's responsible for issuing additional
         // credit based on the final offset communicated in the RESET_STREAM frame we send.
         self.state.unacked_data -= stream.pending.unacked();
-        stream.reset();
-        self.pending.queue_reset_stream((self.id, error_code));
+        stream.reset(error_code);
+        self.state.queue_send_control(self.id);
 
         // Don't reopen an already-closed stream we haven't forgotten yet
         Ok(())
@@ -459,15 +450,11 @@ impl<'a> SendStream<'a> {
         // on the final size communicated in the RESET_STREAM_AT frame.
         let unacked_before = stream.pending.unacked();
         let queue_frame = stream.reset_at(reliable_size, error_code)?;
-        // The committed reliable size is the (possibly clamped) truncated send-buffer end.
-        let committed_reliable =
-            VarInt::try_from(stream.pending.offset()).expect("offset fits in varint");
         let unacked_after = stream.pending.unacked();
         self.state.unacked_data -= unacked_before - unacked_after;
 
         if queue_frame {
-            self.pending
-                .queue_reset_stream_at((self.id, committed_reliable));
+            self.state.queue_send_control(self.id);
         }
         Ok(())
     }
