@@ -451,8 +451,11 @@ impl Connection {
         }
         if side.is_client() {
             // Kick off the connection
-            this.write_crypto();
-            this.init_0rtt(now);
+            if let Err(error) = this.write_crypto() {
+                this.close_inner(now, Close::Connection(error.into()));
+            } else {
+                this.init_0rtt(now);
+            }
         }
         this.qlog
             .emit_tuple_assigned(PathId::ZERO, network_path, now);
@@ -2690,7 +2693,7 @@ impl Connection {
 
     #[doc(hidden)]
     pub fn close_for_reassembly_limit(&mut self, now: Instant) -> TransportError {
-        let error = TransportError::INTERNAL_ERROR("receive reassembly allocation limit");
+        let error = TransportError::INTERNAL_ERROR("buffer allocation limit");
         self.close_inner(now, Close::Connection(error.clone().into()));
         error
     }
@@ -4162,9 +4165,7 @@ impl Connection {
         crypto_space
             .crypto_stream
             .insert(crypto.offset, crypto.data.clone(), payload_len)
-            .map_err(|_| {
-                TransportError::CRYPTO_BUFFER_EXCEEDED("receive reassembly allocation limit")
-            })?;
+            .map_err(|_| TransportError::CRYPTO_BUFFER_EXCEEDED("buffer allocation limit"))?;
         while let Some(chunk) = crypto_space.crypto_stream.read(usize::MAX, true) {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
             if self.crypto_state.session.read_handshake(&chunk.bytes)? {
@@ -4175,7 +4176,7 @@ impl Connection {
         Ok(())
     }
 
-    fn write_crypto(&mut self) {
+    fn write_crypto(&mut self) -> Result<(), TransportError> {
         loop {
             let space = self.highest_space;
             let mut outgoing = Vec::new();
@@ -4199,7 +4200,9 @@ impl Connection {
                 }
             }
             let offset = self.crypto_state.spaces[space].crypto_offset;
-            let outgoing = Bytes::from(outgoing);
+            let outgoing =
+                buffer_budget::OwnedBacking::from_owned(outgoing, &self.streams.send_budget())?
+                    .finish();
             if let Some(hs) = self.state.as_handshake_mut()
                 && space == SpaceKind::Initial
                 && offset == 0
@@ -4214,6 +4217,7 @@ impl Connection {
                 data: outgoing,
             });
         }
+        Ok(())
     }
 
     /// Switch to stronger cryptography during handshake
@@ -4995,7 +4999,7 @@ impl Connection {
                 .set_immediate_ack_required();
         }
 
-        self.write_crypto();
+        self.write_crypto()?;
         Ok(())
     }
 

@@ -142,6 +142,22 @@ impl OwnedBacking {
         })
     }
 
+    pub(super) fn from_owned(
+        bytes: Vec<u8>,
+        budget: &Arc<BufferBudget>,
+    ) -> Result<Self, AllocationError> {
+        let allocation = budget.acquire(
+            bytes
+                .capacity()
+                .checked_add(Self::OVERHEAD_BYTES)
+                .ok_or(AllocationError)?,
+        )?;
+        Ok(Self {
+            bytes,
+            _allocation: allocation,
+        })
+    }
+
     pub(super) fn from_reserved(data: &[u8], capacity: usize, mut allocation: Allocation) -> Self {
         let mut bytes = Vec::with_capacity(capacity);
         bytes.extend_from_slice(data);

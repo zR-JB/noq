@@ -5320,3 +5320,22 @@ fn packet_pressure_ack_avoids_untracked_mtu_padding() {
     assert_eq!(pair.client.outbound.len(), 1);
     assert!(pair.client.outbound[0].0.size < usize::from(pair.conn(Client).current_mtu()));
 }
+
+#[test]
+fn crypto_backing_credit_survives_loss_and_handshake_cleanup() {
+    let mut pair = Pair::default();
+    let client = pair.begin_connect(client_config());
+    let allocated = pair.client_conn_mut(client).send_allocated_bytes();
+    assert!(allocated > 0);
+    pair.blackhole_step(true, false);
+    pair.blackhole_step(true, false);
+    assert_eq!(
+        pair.client_conn_mut(client).send_allocated_bytes(),
+        allocated
+    );
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+    assert_eq!(pair.client_conn_mut(client).send_allocated_bytes(), 0);
+    assert_eq!(pair.server_conn_mut(server).send_allocated_bytes(), 0);
+}
