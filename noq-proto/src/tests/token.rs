@@ -55,54 +55,63 @@ fn oversized_cached_initial_token() {
     }
 }
 
+/// Answers a client's first Initial with a Retry, sent from that Initial's DCID if `echo_dcid`.
+fn client_after_retry(token_len: usize, echo_dcid: bool) -> (Connection, Instant) {
+    let address = "[::1]:4433".parse().unwrap();
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
+    let now = Instant::now();
+    let (_, mut conn) = endpoint
+        .connect(now, client_config(), address, "localhost")
+        .unwrap();
+    let mut buf = Vec::new();
+    let _ = conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).unwrap();
+    let mut bytes = BytesMut::new();
+    bytes.extend_from_slice(&buf);
+    let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
+        &mut Cursor::new(bytes),
+        &FixedLengthConnectionIdParser::new(0),
+        DEFAULT_SUPPORTED_VERSIONS,
+        false,
+    )
+    .unwrap() else {
+        panic!("expected an Initial packet")
+    };
+    let header = Header::Retry {
+        src_cid: match echo_dcid {
+            true => initial.dst_cid,
+            false => ConnectionId::new(&[1; 20]),
+        },
+        dst_cid: initial.src_cid,
+        version: initial.version,
+    };
+    let mut retry = Vec::new();
+    header.encode(&mut retry);
+    retry.resize(retry.len() + token_len, 0);
+    let tag = server_config()
+        .crypto
+        .retry_tag(initial.version, initial.dst_cid, &retry);
+    retry.extend_from_slice(&tag);
+    let Some(DatagramEvent::ConnectionEvent(_, event)) = endpoint.handle(
+        now,
+        FourTuple::new(address, None),
+        None,
+        BytesMut::from(&retry[..]),
+        &mut buf,
+    ) else {
+        panic!("Retry must be routed to the client connection")
+    };
+    conn.handle_event(event);
+    (conn, now)
+}
+
 #[test]
 fn oversized_retry_token() {
     let _guard = subscribe();
     for (token_len, fits) in [(64, true), (1140, false), (1200, false)] {
-        let address = "[::1]:4433".parse().unwrap();
-        let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
-        let now = Instant::now();
-        let (_, mut conn) = endpoint
-            .connect(now, client_config(), address, "localhost")
-            .unwrap();
-        let mut buf = Vec::new();
-        let _ = conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).unwrap();
-        let mut bytes = BytesMut::new();
-        bytes.extend_from_slice(&buf);
-        let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
-            &mut Cursor::new(bytes),
-            &FixedLengthConnectionIdParser::new(0),
-            DEFAULT_SUPPORTED_VERSIONS,
-            false,
-        )
-        .unwrap() else {
-            panic!("expected an Initial packet")
-        };
-        let header = Header::Retry {
-            src_cid: ConnectionId::new(&[1; 20]),
-            dst_cid: initial.src_cid,
-            version: initial.version,
-        };
-        let mut retry = Vec::new();
-        header.encode(&mut retry);
-        retry.resize(retry.len() + token_len, 0);
-        let tag = server_config()
-            .crypto
-            .retry_tag(initial.version, initial.dst_cid, &retry);
-        retry.extend_from_slice(&tag);
-        let Some(DatagramEvent::ConnectionEvent(_, event)) = endpoint.handle(
-            now,
-            FourTuple::new(address, None),
-            None,
-            BytesMut::from(&retry[..]),
-            &mut buf,
-        ) else {
-            panic!("Retry must be routed to the client connection")
-        };
-        conn.handle_event(event);
+        let (mut conn, now) = client_after_retry(token_len, false);
         let now = now + Duration::from_secs(1);
         let crypto_before = conn.stats().frame_tx.crypto;
-        buf.clear();
+        let mut buf = Vec::new();
         assert_eq!(conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).is_some(), fits);
         if fits {
             assert!(conn.stats().frame_tx.crypto > crypto_before);
@@ -116,6 +125,19 @@ fn oversized_retry_token() {
             assert!(conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).is_none());
             assert!(buf.is_empty());
         }
+    }
+}
+
+#[test]
+fn retry_from_initial_dcid_is_discarded() {
+    let _guard = subscribe();
+    for echo_dcid in [false, true] {
+        let (mut conn, now) = client_after_retry(64, echo_dcid);
+        let mut buf = Vec::new();
+        assert_eq!(
+            conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).is_some(),
+            !echo_dcid
+        );
     }
 }
 
