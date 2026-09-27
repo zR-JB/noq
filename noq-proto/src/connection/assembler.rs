@@ -9,14 +9,14 @@ use std::{
     },
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 
 use crate::{TransportError, range_set::ArrayRangeSet};
 
 const COPY_BLOCK_BYTES: usize = 16 * 1024;
-const MIN_REASSEMBLY_METADATA_BYTES: usize = 4096;
+const MIN_REASSEMBLY_BYTES: usize = 64 * 1024;
 
-/// Heap metadata is capped at the configured byte window, with a 4 KiB floor.
+/// Metadata and owned backing share three byte windows, with a 64 KiB floor.
 #[derive(Debug)]
 pub(super) struct ReassemblyBudget {
     limit: AtomicUsize,
@@ -29,7 +29,8 @@ impl ReassemblyBudget {
             limit: AtomicUsize::new(
                 usize::try_from(limit)
                     .unwrap_or(usize::MAX)
-                    .max(MIN_REASSEMBLY_METADATA_BYTES),
+                    .saturating_mul(3)
+                    .max(MIN_REASSEMBLY_BYTES),
             ),
             used: AtomicUsize::new(0),
         })
@@ -39,7 +40,8 @@ impl ReassemblyBudget {
         self.limit.store(
             usize::try_from(limit)
                 .unwrap_or(usize::MAX)
-                .max(MIN_REASSEMBLY_METADATA_BYTES),
+                .saturating_mul(3)
+                .max(MIN_REASSEMBLY_BYTES),
             AtomicOrdering::Relaxed,
         );
     }
@@ -90,6 +92,47 @@ impl Drop for Allocation {
         self.budget
             .used
             .fetch_sub(self.bytes, AtomicOrdering::Relaxed);
+    }
+}
+
+struct OwnedBacking {
+    bytes: Vec<u8>,
+    _allocation: Allocation,
+}
+
+impl OwnedBacking {
+    fn new(length: usize, budget: &Arc<ReassemblyBudget>) -> Result<Self, AllocationError> {
+        let overhead = if length == 0 {
+            0
+        } else {
+            mem::size_of::<Self>() + mem::size_of::<AtomicUsize>()
+        };
+        let mut allocation =
+            budget.acquire(length.checked_add(overhead).ok_or(AllocationError)?)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| AllocationError)?;
+        allocation.resize(
+            bytes
+                .capacity()
+                .checked_add(overhead)
+                .ok_or(AllocationError)?,
+        )?;
+        Ok(Self {
+            bytes,
+            _allocation: allocation,
+        })
+    }
+
+    fn finish(self) -> Bytes {
+        Bytes::from_owner(self)
+    }
+}
+
+impl AsRef<[u8]> for OwnedBacking {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -360,19 +403,19 @@ impl Assembler {
                 end += 1;
             }
             let mut length = remaining.min(COPY_BLOCK_BYTES);
-            let mut buffer = BytesMut::with_capacity(length);
+            let mut buffer = OwnedBacking::new(length, &self.allocation.budget)?;
             for source in index..end {
                 let mut bytes = mem::take(&mut buffers[source].bytes);
                 while !bytes.is_empty() {
-                    let take = bytes.len().min(length - buffer.len());
-                    buffer.extend_from_slice(&bytes[..take]);
+                    let take = bytes.len().min(length - buffer.bytes.len());
+                    buffer.bytes.extend_from_slice(&bytes[..take]);
                     bytes.advance(take);
-                    if buffer.len() == length {
-                        buffers.push(Buffer::new_defragmented(offset, buffer.freeze()));
+                    if buffer.bytes.len() == length {
+                        buffers.push(Buffer::new_defragmented(offset, buffer.finish()));
                         offset += length as u64;
                         remaining -= length;
                         length = remaining.min(COPY_BLOCK_BYTES);
-                        buffer = BytesMut::with_capacity(length);
+                        buffer = OwnedBacking::new(length, &self.allocation.budget)?;
                     }
                 }
             }
@@ -420,6 +463,9 @@ impl Assembler {
             recvd.reserve(recvd.ranges.range_count() + 1)?;
             delivered.reserve(delivered.ranges.range_count() + self.data.len() + fragments)?;
         }
+        let mut backing = OwnedBacking::new(bytes.len(), &self.allocation.budget)?;
+        backing.bytes.extend_from_slice(&bytes);
+        bytes = backing.finish();
         self.end = self.end.max(offset + bytes.len() as u64);
         if let State::Unordered { ref mut recvd, .. } = self.state {
             // Discard duplicate data
@@ -700,8 +746,64 @@ mod test {
         assert_eq!(tail.offset, (COPY_BLOCK_BYTES * 2) as u64);
         assert_eq!(tail.bytes.as_ref(), &[7]);
         assembler.clear();
-        assert_eq!(budget.used(), 0);
+        assert!(budget.used() > 0);
         assert_eq!(first.bytes.len(), COPY_BLOCK_BYTES - 1);
+        let retained = first.bytes.slice(first.bytes.len() - 1..);
+        drop(first);
+        drop(tail);
+        assert_eq!(
+            budget.used(),
+            COPY_BLOCK_BYTES + mem::size_of::<OwnedBacking>() + mem::size_of::<AtomicUsize>()
+        );
+        drop(retained);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn delivered_backing_keeps_shared_budget_until_last_clone() {
+        let budget = ReassemblyBudget::new(1);
+        let length = MIN_REASSEMBLY_BYTES * 3 / 4;
+        let mut assembler = Assembler::new(budget.clone());
+        assembler
+            .insert(0, Bytes::from(vec![7; length]), length)
+            .unwrap();
+        let delivered = assembler.read(usize::MAX, true).unwrap().bytes;
+        let tail = delivered.slice(length - 1..);
+        drop(delivered);
+        assembler.reinit();
+        assert_eq!(
+            budget.used(),
+            length + mem::size_of::<OwnedBacking>() + mem::size_of::<AtomicUsize>()
+        );
+        assert!(
+            assembler
+                .insert(0, Bytes::from(vec![8; length]), length)
+                .is_err()
+        );
+        drop(tail);
+        assembler
+            .insert(0, Bytes::from(vec![8; length]), length)
+            .unwrap();
+        assert_eq!(
+            assembler.read(usize::MAX, true).unwrap().bytes.as_ref(),
+            vec![8; length]
+        );
+        assembler.clear();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn defragment_charges_old_and_new_backing_together() {
+        let budget = ReassemblyBudget::new(1);
+        let length = MIN_REASSEMBLY_BYTES / 2 + 1;
+        let mut assembler = Assembler::new(budget.clone());
+        assembler
+            .insert(0, Bytes::from(vec![7; length]), length * 2)
+            .unwrap();
+        assert!(assembler.defragment().is_err());
+        assert!(budget.used() <= MIN_REASSEMBLY_BYTES);
+        assembler.clear();
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]

@@ -1171,12 +1171,12 @@ mod tests {
             Side::Server,
             2u32.into(),
             2u32.into(),
-            1024,
-            1024u32.into(),
-            1024u32.into(),
+            65536,
+            65536u32.into(),
+            65536u32.into(),
         );
         let mut rejected = false;
-        for offset in (1..1024).step_by(2) {
+        for offset in (1..65536).step_by(2) {
             let result = receiver.received(
                 frame::Stream {
                     id: StreamId::new(Side::Client, Dir::Uni, 0),
@@ -1196,7 +1196,7 @@ mod tests {
             rejected,
             "sparse frames exceeded the connection's metadata allowance"
         );
-        assert!(receiver.data_recvd < 1024);
+        assert!(receiver.data_recvd < 65536);
     }
 
     #[test]
@@ -1205,14 +1205,14 @@ mod tests {
             Side::Server,
             2u32.into(),
             2u32.into(),
-            1024,
-            1024u32.into(),
-            1024u32.into(),
+            65536,
+            65536u32.into(),
+            65536u32.into(),
         );
         let first = StreamId::new(Side::Client, Dir::Uni, 0);
         let second = StreamId::new(Side::Client, Dir::Uni, 1);
         let mut rejected = false;
-        for offset in (1..1024).step_by(2) {
+        for offset in (1..65536).step_by(2) {
             for id in [first, second] {
                 if receiver
                     .received(
@@ -1253,7 +1253,7 @@ mod tests {
                 .end
                 > 0
         );
-        assert!(receiver.reassembly.used() <= 4096);
+        assert!(receiver.reassembly.used() <= 196608);
         for id in [first, second] {
             let final_offset = receiver.recv[&id]
                 .as_ref()
@@ -1321,7 +1321,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(receiver.data_recvd, 2);
-        assert!(receiver.reassembly.used() <= 4096);
+        assert!(receiver.reassembly.used() <= 65536);
     }
 
     #[test]
@@ -1399,7 +1399,7 @@ mod tests {
             2u32.into(),
             2u32.into(),
             4096,
-            8192u32.into(),
+            65536u32.into(),
             4096u32.into(),
         );
         let ids = [
@@ -1407,7 +1407,7 @@ mod tests {
             StreamId::new(Side::Client, Dir::Uni, 1),
         ];
         for id in ids {
-            for offset in (1..64).step_by(2) {
+            for offset in (1..512).step_by(2) {
                 let _ = receiver
                     .received(
                         frame::Stream {
@@ -1421,7 +1421,7 @@ mod tests {
                     .unwrap();
             }
         }
-        receiver.set_receive_window(4096u32.into());
+        receiver.set_receive_window(1024u32.into());
         let budget = receiver.reassembly.clone();
         let before = budget.used();
         let mut pending = Retransmits::default();
@@ -1434,7 +1434,7 @@ mod tests {
             recv.read(false),
             Err(super::super::ReadableError::ReassemblyLimit)
         ));
-        assert_eq!(budget.used(), before);
+        assert!(budget.used() <= before);
         let mut chunks = recv.read(true).unwrap();
         assert!(matches!(chunks.next(1), Err(ReadError::Blocked)));
     }
