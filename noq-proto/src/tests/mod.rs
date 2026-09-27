@@ -5129,9 +5129,12 @@ fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
     let mut server_received = 0;
     let mut metadata_blocked = false;
     let mut steps = 0;
+    let mut idle = false;
     loop {
         metadata_blocked |= pair.conn(Client).packet_metadata_blocked()
             || pair.conn(Server).packet_metadata_blocked();
+        let remaining = client_remaining + server_remaining;
+        let received = client_received + server_received;
         if client_remaining > 0 {
             send_bytes(
                 pair.send_stream(Client, client_stream),
@@ -5152,19 +5155,15 @@ fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
             pair.recv_stream(Server, server_stream),
             &mut server_received,
         );
-        steps += 1;
-        if !pair.blackhole_step(steps % 17 == 0, steps % 19 == 0) {
+        if idle
+            && remaining == client_remaining + server_remaining
+            && received == client_received + server_received
+        {
             break;
         }
+        steps += 1;
+        idle = !pair.blackhole_step(steps % 17 == 0, steps % 19 == 0);
     }
-    recv_bytes(
-        pair.recv_stream(Client, client_stream),
-        &mut client_received,
-    );
-    recv_bytes(
-        pair.recv_stream(Server, server_stream),
-        &mut server_received,
-    );
     assert!(metadata_blocked);
     assert_eq!(client_remaining, 0);
     assert_eq!(server_remaining, 0);
@@ -5495,6 +5494,7 @@ fn pending_control_pressure_closes_connection() {
 fn packet_pressure_ack_avoids_untracked_mtu_padding() {
     let transport = TransportConfig {
         pad_to_mtu: true,
+        deterministic_packet_numbers: true,
         ..TransportConfig::default()
     };
     let mut pair = ConnPair::builder().with_transport_cfg(transport).connect();
