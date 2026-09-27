@@ -2847,6 +2847,24 @@ fn finish_acked() {
 }
 
 #[test]
+fn lost_fin_only_frame_is_resent() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect();
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(b"hello").unwrap();
+    pair.drive();
+    pair.client_send(client_ch, s).finish().unwrap();
+    pair.drive_client();
+    pair.server.inbound.clear();
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Stream(StreamEvent::Finished { id })) if id == s
+    );
+}
+
+#[test]
 /// Ensure that we don't yield a finish event while there's still unacknowledged data
 fn finish_retransmit() {
     let _guard = subscribe();

@@ -954,7 +954,7 @@ impl StreamsState {
             // truncated to it) and must not be retransmitted.
             offsets.end = offsets.end.min(stream.pending.offset());
         }
-        if offsets.start >= offsets.end {
+        if offsets.start >= offsets.end && !frame.fin {
             return Ok(());
         }
         if !stream.is_pending() {
