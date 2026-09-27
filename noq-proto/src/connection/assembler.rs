@@ -4,7 +4,7 @@ use std::{
     mem,
     ops::Range,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     },
 };
@@ -62,6 +62,22 @@ impl ReassemblyBudget {
             budget: self.clone(),
             bytes,
         })
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ReceiveAllocationHandle(Weak<ReassemblyBudget>);
+
+impl ReceiveAllocationHandle {
+    pub(super) fn new(budget: &Arc<ReassemblyBudget>) -> Self {
+        Self(Arc::downgrade(budget))
+    }
+
+    pub fn has_allocations(&self) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|budget| budget.used.load(AtomicOrdering::Relaxed) != 0)
     }
 }
 

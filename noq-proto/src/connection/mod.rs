@@ -54,7 +54,7 @@ mod ack_frequency;
 use ack_frequency::AckFrequencyState;
 
 mod assembler;
-pub use assembler::Chunk;
+pub use assembler::{Chunk, ReceiveAllocationHandle};
 
 mod cid_state;
 use cid_state::CidState;
@@ -487,6 +487,11 @@ impl Connection {
     #[must_use]
     pub fn poll_endpoint_events(&mut self) -> Option<EndpointEvent> {
         self.endpoint_events.pop_front().map(EndpointEvent)
+    }
+
+    #[doc(hidden)]
+    pub fn receive_allocation_handle(&self) -> ReceiveAllocationHandle {
+        ReceiveAllocationHandle::new(&self.streams.reassembly)
     }
 
     /// Provide control over streams

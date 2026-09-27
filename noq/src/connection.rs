@@ -61,6 +61,7 @@ impl Connecting {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
 
+        let receive_allocations = conn.receive_allocation_handle();
         let conn = ConnectionRef(Arc::new(Arc::new(ConnectionInner {
             state: Mutex::new(State::new(
                 conn,
@@ -73,6 +74,7 @@ impl Connecting {
                 runtime.clone(),
             )),
             shared: Shared::default(),
+            receive_allocations,
         })));
 
         let driver = ConnectionDriver(conn.clone());
@@ -1408,7 +1410,7 @@ impl ConnectionRef {
     }
 
     pub(crate) fn weak_handle(&self) -> WeakConnectionHandle {
-        WeakConnectionHandle(Arc::downgrade(&self.0))
+        WeakConnectionHandle(Arc::downgrade(&self.0), self.0.receive_allocations.clone())
     }
 }
 
@@ -1448,6 +1450,7 @@ pub(crate) struct ConnectionInner {
     /// Kept private intentionally, use [`Self::lock_and_wake`].
     state: Mutex<State>,
     pub(crate) shared: Shared,
+    receive_allocations: proto::ReceiveAllocationHandle,
 }
 
 impl ConnectionInner {
@@ -1497,17 +1500,19 @@ impl Drop for WakeGuard<'_> {
     }
 }
 
-/// A handle to some connection internals, use with care.
-///
-/// This contains a weak reference to the connection so will not itself keep the connection
-/// alive.
+/// A weak handle to connection internals and receive allocation lifetime.
 #[derive(Debug, Clone)]
-pub struct WeakConnectionHandle(Weak<Arc<ConnectionInner>>);
+pub struct WeakConnectionHandle(Weak<Arc<ConnectionInner>>, proto::ReceiveAllocationHandle);
 
 impl WeakConnectionHandle {
     /// Returns `true` if the [`Connection`] associated with this handle is still alive.
     pub fn is_alive(&self) -> bool {
         self.0.upgrade().is_some()
+    }
+
+    /// Whether receive allocations remain owned, including bytes returned to the application.
+    pub fn has_receive_allocations(&self) -> bool {
+        self.1.has_allocations()
     }
 
     /// Upgrade the handle to a full `Connection`

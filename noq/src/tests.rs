@@ -1312,6 +1312,41 @@ async fn send_buffered_bytes_survive_window_shrink_and_stream_ownership() {
 }
 
 #[tokio::test]
+async fn receive_backing_outlives_connection_handles() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let endpoint = endpoint();
+        let connecting = endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let accepting = async { endpoint.accept().await.unwrap().await.unwrap() };
+        let (client, server) = tokio::join!(connecting, accepting);
+        let client = client.unwrap();
+        let weak = server.weak_handle();
+        let mut send = client.open_uni().await.unwrap();
+        send.write_all(&[42; 4096]).await.unwrap();
+        send.finish().unwrap();
+        let mut recv = server.accept_uni().await.unwrap();
+        let chunk = recv.read_chunk(4096).await.unwrap().unwrap();
+        let retained = chunk.slice(..1);
+        drop(chunk);
+        assert!(weak.has_receive_allocations());
+        client.close(0u32.into(), b"done");
+        drop(send);
+        drop(recv);
+        drop(client);
+        drop(server);
+        endpoint.wait_idle().await;
+        assert!(weak.upgrade().is_none());
+        assert!(weak.has_receive_allocations());
+        assert_eq!(retained.as_ref(), &[42]);
+        drop(retained);
+        assert!(!weak.has_receive_allocations());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn weak_connection_handle() {
     let _guard = subscribe();
     let endpoint = endpoint();
