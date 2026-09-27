@@ -528,7 +528,12 @@ impl SendBuffer {
         // for simplicity. Not doing so would require clipping the range against
         // all acknowledged ranges.
         range.start = range.start.max(self.fully_acked_offset());
-        self.retransmits.try_insert(range)
+        if self.retransmits.try_insert(range).is_err() {
+            self.retransmits.ranges.remove(0..u64::MAX);
+            self.retransmits
+                .insert(self.fully_acked_offset()..self.unsent);
+        }
+        Ok(())
     }
 
     pub(super) fn retransmit_all_for_0rtt(&mut self) {
@@ -678,6 +683,24 @@ mod tests {
             buf.poll_transmit(chunk.len() + 8),
             (transmitted..transmitted + chunk.len() as u64, false)
         );
+    }
+
+    #[test]
+    fn sparse_losses_retransmit_with_exhausted_storage() {
+        let budget = BufferBudget::new(64 * 1024);
+        let mut buf = SendBuffer::new(budget.clone());
+        let data = vec![7; 64 * 1024];
+        while let Ok((length, allocation)) = buf.prepare_write(data.len()) {
+            buf.write_reserved(&data[..length], allocation);
+        }
+        let end = buf.offset();
+        buf.poll_transmit(100_000);
+        let allocated = budget.used();
+        for offset in (1..40).step_by(2) {
+            buf.retransmit(offset..offset + 1).unwrap();
+        }
+        assert_eq!(budget.used(), allocated);
+        assert_eq!(buf.poll_transmit(100_000).0, 0..end);
     }
 
     #[test]

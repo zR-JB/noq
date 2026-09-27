@@ -2907,7 +2907,7 @@ impl Connection {
         self.streams.unacked_data
     }
 
-    /// Retained send backing and heap metadata, including acknowledged data behind gaps.
+    /// Retained stream send backing and buffer metadata, including data behind ACK gaps.
     pub fn send_allocated_bytes(&self) -> u64 {
         self.streams.transmit.used() as u64
     }
