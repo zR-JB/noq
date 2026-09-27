@@ -31,6 +31,11 @@ impl<T> PacketMap<T> {
     }
 
     #[cfg(test)]
+    pub(super) fn release_unused_admission(&mut self) {
+        self.refund();
+    }
+
+    #[cfg(test)]
     pub(super) fn admission_blocked(&self) -> bool {
         self.allocation
             .budget

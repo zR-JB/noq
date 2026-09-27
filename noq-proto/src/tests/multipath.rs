@@ -1,7 +1,11 @@
 //! Tests for multipath
 
 use alloc::{boxed::Box, format, sync::Arc, vec, vec::Vec};
-use core::{net::SocketAddr, num::NonZeroU32, time::Duration};
+use core::{
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroUsize},
+    time::Duration,
+};
 use std::dbg;
 
 use assert_matches::assert_matches;
@@ -2296,5 +2300,49 @@ fn regression_discarded_path_stats_are_up_to_date() -> TestResult {
     assert_ne!(discarded_stats.cwnd, 0);
     assert_ne!(discarded_stats.current_mtu, 0);
 
+    Ok(())
+}
+
+#[test]
+fn packet_pressure_blocks_self_abandon_until_storage_returns() -> TestResult {
+    let mut pair = ConnPair::builder().enable_multipath().connect();
+    pair.routes.as_basic_mut().passive_migration(Client);
+    let route = FourTuple {
+        remote: pair.routes.public_server_addr(),
+        local_ip: None,
+    };
+    pair.open_path(Client, route, PathStatus::Available)?;
+    pair.close_path(Client, PathId::ZERO, 0u8.into())?;
+    let charged = pair.conn_mut(Server).exhaust_packet_metadata();
+    pair.drive_client();
+    let now = pair.time;
+    pair.server.drive_incoming(now);
+    let events: Vec<_> = pair
+        .server
+        .conn_events
+        .values_mut()
+        .flat_map(|events| events.drain(..))
+        .collect();
+    for event in events {
+        pair.handle_event(Server, event);
+    }
+    let before = pair.conn_mut(Server).stats().frame_tx.path_abandon;
+    let mut buf = Vec::new();
+    for _ in 0..3 {
+        assert!(
+            pair.poll_transmit(Server, NonZeroUsize::new(1).unwrap(), &mut buf)
+                .is_none()
+        );
+    }
+    assert_eq!(pair.conn_mut(Server).stats().frame_tx.path_abandon, before);
+    drop(charged);
+    assert!(
+        pair.poll_transmit(Server, NonZeroUsize::new(1).unwrap(), &mut buf)
+            .is_some()
+    );
+    assert_eq!(
+        pair.conn_mut(Server).stats().frame_tx.path_abandon,
+        before + 1
+    );
     Ok(())
 }
