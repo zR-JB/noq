@@ -318,8 +318,15 @@ impl ChargedRanges {
         Ok(())
     }
 
+    pub(super) fn growth_bytes(&self) -> usize {
+        self.ranges
+            .capacity()
+            .saturating_mul(2 * mem::size_of::<Range<u64>>())
+    }
+
     pub(super) fn try_insert(&mut self, range: Range<u64>) -> Result<(), AllocationError> {
         if !range.is_empty()
+            && self.ranges.range_count() == self.ranges.capacity()
             && !self
                 .ranges
                 .iter()
