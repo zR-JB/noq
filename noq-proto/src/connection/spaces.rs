@@ -1,6 +1,7 @@
 use alloc::{
     boxed::Box,
     collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
     vec::Vec,
 };
 use core::{
@@ -8,8 +9,11 @@ use core::{
     ops::{Bound, Index, IndexMut, Range},
 };
 
+use super::{
+    buffer_budget::{AllocationError, BufferBudget},
+    packet_map::PacketMap,
+};
 use rand::{CryptoRng, RngExt};
-use sorted_index_buffer::SortedIndexBuffer;
 use tracing::trace;
 
 use super::{PathId, paths::PathResponses, paths::PathRetransmits};
@@ -37,8 +41,13 @@ pub(super) struct PacketSpace {
 }
 
 impl PacketSpace {
-    pub(super) fn new(now: Instant, space: SpaceId, rng: &mut (impl CryptoRng + ?Sized)) -> Self {
-        let number_space_0 = PacketNumberSpace::new(now, space, rng);
+    pub(super) fn new(
+        now: Instant,
+        space: SpaceId,
+        rng: &mut (impl CryptoRng + ?Sized),
+        budget: Arc<BufferBudget>,
+    ) -> Self {
+        let number_space_0 = PacketNumberSpace::new(now, space, rng, budget);
         Self {
             pending: Retransmits::default(),
             number_spaces: BTreeMap::from([(PathId::ZERO, number_space_0)]),
@@ -46,8 +55,12 @@ impl PacketSpace {
     }
 
     #[cfg(test)]
-    pub(super) fn new_deterministic(now: Instant, space: SpaceId) -> Self {
-        let number_space_0 = PacketNumberSpace::new_deterministic(now, space);
+    pub(super) fn new_deterministic(
+        now: Instant,
+        space: SpaceId,
+        budget: Arc<BufferBudget>,
+    ) -> Self {
+        let number_space_0 = PacketNumberSpace::new_deterministic(now, space, budget);
         Self {
             pending: Retransmits::default(),
             number_spaces: BTreeMap::from([(PathId::ZERO, number_space_0)]),
@@ -257,10 +270,10 @@ pub(super) struct PacketNumberSpace {
     pub(super) unacked_non_ack_eliciting_tail: u64,
     /// Transmitted but not acked
     // We use a BTreeMap here so we can efficiently query by range on ACK and for loss detection
-    pub(super) sent_packets: SortedIndexBuffer<SentPacket>,
+    pub(super) sent_packets: PacketMap<SentPacket>,
     /// Packets that were deemed lost
     // Older packets are regularly removed in `Connection::drain_lost_packets`.
-    pub(super) lost_packets: SortedIndexBuffer<LostPacket>,
+    pub(super) lost_packets: PacketMap<LostPacket>,
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(super) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -303,7 +316,12 @@ pub(super) struct PacketNumberSpace {
 }
 
 impl PacketNumberSpace {
-    pub(super) fn new(now: Instant, space: SpaceId, rng: &mut (impl CryptoRng + ?Sized)) -> Self {
+    pub(super) fn new(
+        now: Instant,
+        space: SpaceId,
+        rng: &mut (impl CryptoRng + ?Sized),
+        budget: Arc<BufferBudget>,
+    ) -> Self {
         let pn_filter = match space {
             SpaceId::Initial | SpaceId::Handshake => None,
             SpaceId::Data => Some(PacketNumberFilter::new(rng)),
@@ -316,8 +334,8 @@ impl PacketNumberSpace {
             largest_acked_packet_send_time: now,
             largest_ack_eliciting_sent: 0,
             unacked_non_ack_eliciting_tail: 0,
-            sent_packets: SortedIndexBuffer::new(),
-            lost_packets: SortedIndexBuffer::new(),
+            sent_packets: PacketMap::new(budget.clone()),
+            lost_packets: PacketMap::new(budget),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
             pending_ping: false,
@@ -333,7 +351,7 @@ impl PacketNumberSpace {
     }
 
     #[cfg(test)]
-    fn new_deterministic(now: Instant, space: SpaceId) -> Self {
+    fn new_deterministic(now: Instant, space: SpaceId, budget: Arc<BufferBudget>) -> Self {
         let pn_filter = match space {
             SpaceId::Initial | SpaceId::Handshake => None,
             SpaceId::Data => Some(PacketNumberFilter::disabled()),
@@ -346,8 +364,8 @@ impl PacketNumberSpace {
             largest_acked_packet_send_time: now,
             largest_ack_eliciting_sent: 0,
             unacked_non_ack_eliciting_tail: 0,
-            sent_packets: SortedIndexBuffer::new(),
-            lost_packets: SortedIndexBuffer::new(),
+            sent_packets: PacketMap::new(budget.clone()),
+            lost_packets: PacketMap::new(budget),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
             pending_ping: false,
@@ -448,7 +466,11 @@ impl PacketNumberSpace {
     }
 
     /// May return a packet that should be forgotten
-    pub(super) fn sent(&mut self, number: u64, packet: SentPacket) -> Option<SentPacket> {
+    pub(super) fn sent(
+        &mut self,
+        number: u64,
+        packet: SentPacket,
+    ) -> Result<Option<SentPacket>, AllocationError> {
         // Retain state for at most this many non-ACK-eliciting packets sent after the most recently
         // sent ACK-eliciting packet. We're never guaranteed to receive an ACK for those, and we
         // can't judge them as lost without an ACK, so to limit memory in applications which receive
@@ -484,8 +506,8 @@ impl PacketNumberSpace {
             self.unacked_non_ack_eliciting_tail += 1;
         }
 
-        self.sent_packets.insert(number, packet);
-        forgotten
+        self.sent_packets.insert(number, packet)?;
+        Ok(forgotten)
     }
 
     /// Whether any congestion-controlled packets in this space are not yet acknowledged or lost
