@@ -1616,6 +1616,10 @@ impl Connection {
                     && scheduling_info.may_send_data
                     && !scheduling_info.is_abandoned
                 {
+                    #[cfg(test)]
+                    {
+                        self.partial_stats.blocked_acks_tx += 1;
+                    }
                     allocation = None;
                     track = false;
                     can_send.other = false;
@@ -1714,6 +1718,10 @@ impl Connection {
             };
             last_packet_number = Some(builder.packet_number);
             if probe_ping {
+                #[cfg(test)]
+                {
+                    self.partial_stats.untracked_probes_tx += 1;
+                }
                 builder.write_frame(frame::Ping, &mut self.path_stats.get_mut(path_id).frame_tx);
             }
 

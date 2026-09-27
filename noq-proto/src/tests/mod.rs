@@ -5161,25 +5161,41 @@ fn congestion_blocked_ack_defers_ping() {
 
 #[test]
 fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
-    bidirectional_metadata_pressure(17, 19)
+    assert!(bidirectional_metadata_pressure(17, 19)?.untracked_probes > 0);
+    Ok(())
 }
 
 #[test]
 fn packet_metadata_pressure_preserves_stream_credit() -> TestResult {
-    bidirectional_metadata_pressure(19, 17)
+    assert!(bidirectional_metadata_pressure(19, 17)?.reads_while_blocked > 0);
+    Ok(())
 }
 
 #[test]
 fn packet_metadata_pressure_acknowledges_when_congestion_blocked() -> TestResult {
-    bidirectional_metadata_pressure(7, 7)
+    assert!(bidirectional_metadata_pressure(7, 7)?.blocked_acks > 0);
+    Ok(())
 }
 
 #[test]
 fn packet_metadata_pressure_samples_rtt_from_tracked_packets() -> TestResult {
-    bidirectional_metadata_pressure(6, 5)
+    let max_rtt = bidirectional_metadata_pressure(6, 5)?.max_rtt;
+    assert!(max_rtt < Duration::from_millis(200), "{max_rtt:?}");
+    Ok(())
 }
 
-fn bidirectional_metadata_pressure(server_drop: usize, client_drop: usize) -> TestResult {
+#[derive(Default)]
+struct MetadataPressure {
+    reads_while_blocked: usize,
+    blocked_acks: u64,
+    untracked_probes: u64,
+    max_rtt: Duration,
+}
+
+fn bidirectional_metadata_pressure(
+    server_drop: usize,
+    client_drop: usize,
+) -> TestResult<MetadataPressure> {
     let mut transport = TransportConfig::default();
     transport.send_window(64 * 1024);
     transport.deterministic_packet_numbers(true);
@@ -5208,14 +5224,15 @@ fn bidirectional_metadata_pressure(server_drop: usize, client_drop: usize) -> Te
     let mut server_remaining = 256 * 1024;
     let mut client_received = 0;
     let mut server_received = 0;
+    let mut pressure = MetadataPressure::default();
     let mut metadata_blocked = false;
     let mut steps = 0;
     let mut idle = false;
     loop {
-        metadata_blocked |= pair.conn(Client).packet_metadata_blocked()
-            || pair.conn(Server).packet_metadata_blocked();
+        let blocked = [Client, Server].map(|side| pair.conn(side).packet_metadata_blocked());
+        metadata_blocked |= blocked.contains(&true);
         let remaining = client_remaining + server_remaining;
-        let received = client_received + server_received;
+        let received = [client_received, server_received];
         if client_remaining > 0 {
             send_bytes(
                 pair.send_stream(Client, client_stream),
@@ -5236,9 +5253,15 @@ fn bidirectional_metadata_pressure(server_drop: usize, client_drop: usize) -> Te
             pair.recv_stream(Server, server_stream),
             &mut server_received,
         );
+        pressure.reads_while_blocked += usize::from(blocked[0] && client_received > received[0])
+            + usize::from(blocked[1] && server_received > received[1]);
+        for side in [Client, Server] {
+            let rtt = pair.path_stats(side, PathId::ZERO).unwrap().rtt;
+            pressure.max_rtt = pressure.max_rtt.max(rtt);
+        }
         if idle
             && remaining == client_remaining + server_remaining
-            && received == client_received + server_received
+            && received == [client_received, server_received]
         {
             break;
         }
@@ -5251,7 +5274,12 @@ fn bidirectional_metadata_pressure(server_drop: usize, client_drop: usize) -> Te
     assert_eq!(server_remaining, 0);
     assert_eq!(client_received, 256 * 1024);
     assert_eq!(server_received, 256 * 1024);
-    Ok(())
+    for side in [Client, Server] {
+        let stats = pair.stats(side);
+        pressure.blocked_acks += stats.blocked_acks_tx;
+        pressure.untracked_probes += stats.untracked_probes_tx;
+    }
+    Ok(pressure)
 }
 
 #[test]

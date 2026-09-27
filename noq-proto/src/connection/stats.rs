@@ -239,6 +239,10 @@ pub struct ConnectionStats {
     /// Number of [`super::Transmit`] produced by this connection.
     #[cfg(test)]
     pub(crate) transmits_tx: u64,
+    #[cfg(test)]
+    pub(crate) blocked_acks_tx: u64,
+    #[cfg(test)]
+    pub(crate) untracked_probes_tx: u64,
 }
 
 impl std::ops::Add<PathStats> for ConnectionStats {
@@ -272,6 +276,10 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             lost_bytes: self.lost_bytes + lost_bytes,
             #[cfg(test)]
             transmits_tx: self.transmits_tx,
+            #[cfg(test)]
+            blocked_acks_tx: self.blocked_acks_tx,
+            #[cfg(test)]
+            untracked_probes_tx: self.untracked_probes_tx,
         }
     }
 }
@@ -305,6 +313,10 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             lost_bytes,
             #[cfg(test)]
                 transmits_tx: _,
+            #[cfg(test)]
+                blocked_acks_tx: _,
+            #[cfg(test)]
+                untracked_probes_tx: _,
         } = self;
         *udp_tx += path_udp_tx;
         *udp_rx += path_udp_rx;
