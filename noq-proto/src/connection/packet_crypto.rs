@@ -7,7 +7,7 @@ use core::{
 use tracing::{debug, trace};
 
 use super::SpaceKind;
-use crate::connection::assembler::{Assembler, ReassemblyBudget};
+use crate::connection::{assembler::Assembler, buffer_budget::BufferBudget};
 use crate::crypto::{self, HeaderKey, KeyPair, Keys, PacketKey};
 use crate::packet::{Packet, PartialDecode};
 use crate::token::ResetToken;
@@ -117,7 +117,7 @@ impl CryptoState {
         buffer_size: usize,
     ) -> Self {
         let initial_keys = session.initial_keys(init_cid, side);
-        let budget = ReassemblyBudget::new(buffer_size as u64);
+        let budget = BufferBudget::for_receive(buffer_size as u64);
         let mut spaces = std::array::from_fn(|_| CryptoSpace {
             keys: None,
             crypto_stream: Assembler::new(budget.clone()),

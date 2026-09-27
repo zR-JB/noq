@@ -1,5 +1,7 @@
 use alloc::boxed::Box;
+use crate::connection::buffer_budget::{AllocationError, BufferBudget};
 use bytes::Bytes;
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
@@ -46,11 +48,11 @@ pub(super) struct ResetAt {
 }
 
 impl Send {
-    pub(super) fn new(max_data: VarInt) -> Box<Self> {
+    pub(super) fn new(max_data: VarInt, budget: Arc<BufferBudget>) -> Box<Self> {
         Box::new(Self {
             max_data: max_data.into(),
             state: SendState::Ready,
-            pending: SendBuffer::new(),
+            pending: SendBuffer::new(budget),
             priority: 0,
             fin_pending: false,
             connection_blocked: false,
@@ -157,16 +159,22 @@ impl Send {
 
         let mut result = Written::default();
         loop {
-            let (chunk, chunks_consumed) = source.pop_chunk(limit);
+            let (length, allocation) = match self.pending.prepare_write(limit) {
+                Ok(reserved) => reserved,
+                Err(_) if result.bytes != 0 => break,
+                Err(_) => return Err(WriteError::Blocked),
+            };
+            let (chunk, chunks_consumed) = source.pop_chunk(length);
             result.chunks += chunks_consumed;
             result.bytes += chunk.len();
 
             if chunk.is_empty() {
+                self.pending.release_empty_storage();
                 break;
             }
 
             limit -= chunk.len();
-            self.pending.write(chunk);
+            self.pending.write_reserved(chunk, allocation);
         }
 
         Ok(result)
@@ -198,9 +206,9 @@ impl Send {
     /// For a FIN-based finish this means the FIN and all data were acknowledged; for a reliable
     /// reset it means the RESET_STREAM_AT frame and all data up to the reliable size were
     /// acknowledged.
-    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> bool {
-        self.pending.ack(frame.offsets);
-        match self.state {
+    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> Result<bool, AllocationError> {
+        self.pending.ack(frame.offsets)?;
+        Ok(match self.state {
             SendState::DataSent {
                 ref mut finish_acked,
             } => {
@@ -215,7 +223,7 @@ impl Send {
                 }
             }
             _ => false,
-        }
+        })
     }
 
     /// Records acknowledgement of a RESET_STREAM_AT frame carrying the current reliable size.
@@ -433,7 +441,7 @@ mod tests {
 
     /// A `Send` with `data` bytes written and ready to be reset.
     fn writer(data: &[u8]) -> Box<Send> {
-        let mut send = Send::new(VarInt::MAX);
+        let mut send = Send::new(VarInt::MAX, BufferBudget::new(u64::MAX));
         let mut source = ByteSlice::from_slice(data);
         send.write(&mut source, data.len() as u64).unwrap();
         assert_eq!(send.offset(), data.len() as u64);
@@ -538,7 +546,10 @@ mod tests {
             offsets: 0..4,
             fin: false,
         };
-        assert!(!send.ack(meta), "data acked but RESET_STREAM_AT not yet");
+        assert!(
+            !send.ack(meta).unwrap(),
+            "data acked but RESET_STREAM_AT not yet"
+        );
         assert!(
             send.reset_at_acked(),
             "frame ack now completes the reliable reset"
@@ -553,7 +564,10 @@ mod tests {
             offsets: 0..4,
             fin: false,
         };
-        assert!(send.ack(meta), "data ack now completes the reliable reset");
+        assert!(
+            send.ack(meta).unwrap(),
+            "data ack now completes the reliable reset"
+        );
     }
 
     #[test]
