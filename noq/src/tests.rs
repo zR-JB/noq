@@ -1347,6 +1347,36 @@ async fn receive_backing_outlives_connection_handles() {
 }
 
 #[tokio::test]
+async fn receive_datagram_backing_outlives_connection_handles() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let endpoint = endpoint();
+        let connecting = endpoint
+            .connect(endpoint.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let accepting = async { endpoint.accept().await.unwrap().await.unwrap() };
+        let (client, server) = tokio::join!(connecting, accepting);
+        let client = client.unwrap();
+        let weak = server.weak_handle();
+        client.send_datagram(Bytes::from(vec![42; 1024])).unwrap();
+        let datagram = server.read_datagram().await.unwrap();
+        let retained = datagram.slice(..1);
+        drop(datagram);
+        assert!(weak.has_receive_allocations());
+        client.close(0u32.into(), b"done");
+        drop(client);
+        drop(server);
+        endpoint.wait_idle().await;
+        assert!(weak.upgrade().is_none());
+        assert!(weak.has_receive_allocations());
+        assert_eq!(retained.as_ref(), &[42]);
+        drop(retained);
+        assert!(!weak.has_receive_allocations());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn weak_connection_handle() {
     let _guard = subscribe();
     let endpoint = endpoint();

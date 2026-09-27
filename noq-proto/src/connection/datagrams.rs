@@ -1,10 +1,13 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, mem, sync::Arc};
 
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, trace};
 
-use super::Connection;
+use super::{
+    Connection,
+    buffer_budget::{Allocation, AllocationError, BufferBudget, OwnedBacking},
+};
 use crate::{
     FrameStats, TransportError,
     connection::PacketBuilder,
@@ -42,22 +45,15 @@ impl Datagrams<'_> {
         {
             return Err(SendDatagramError::TooLarge);
         }
-        if drop {
-            self.conn
-                .datagrams
-                .make_space_for(data.len(), send_buffer_size);
-        } else if !self
+        if self
             .conn
             .datagrams
-            .has_send_buffer_space(data.len(), send_buffer_size)
+            .queue_send(&data, drop, send_buffer_size)
+            .is_err()
         {
-            self.conn.datagrams.send_blocked = true;
+            self.conn.datagrams.block_send(data.len());
             return Err(SendDatagramError::Blocked(data));
         }
-        self.conn.datagrams.outgoing_total += data.len() + size_of::<Datagram>();
-        self.conn.datagrams.outgoing.push_back(Datagram {
-            data: Bytes::copy_from_slice(&data),
-        });
         Ok(())
     }
 
@@ -103,22 +99,15 @@ impl Datagrams<'_> {
 
         let mut queued = 0usize;
         for data in datagrams {
-            if drop {
-                self.conn
-                    .datagrams
-                    .make_space_for(data.len(), send_buffer_size);
-            } else if !self
+            if self
                 .conn
                 .datagrams
-                .has_send_buffer_space(data.len(), send_buffer_size)
+                .queue_send(data, drop, send_buffer_size)
+                .is_err()
             {
-                self.conn.datagrams.send_blocked = true;
+                self.conn.datagrams.block_send(data.len());
                 break;
             }
-            self.conn.datagrams.outgoing_total += data.len() + size_of::<Datagram>();
-            self.conn.datagrams.outgoing.push_back(Datagram {
-                data: Bytes::copy_from_slice(data),
-            });
             queued += 1;
         }
 
@@ -179,20 +168,108 @@ impl Datagrams<'_> {
             .datagram_send_buffer_size
             .saturating_sub(self.conn.datagrams.outgoing_total)
             .saturating_sub(size_of::<Datagram>())
+            .min(
+                self.conn
+                    .datagrams
+                    .outgoing_allocation
+                    .budget
+                    .available()
+                    .saturating_sub(queue_growth_bytes(&self.conn.datagrams.outgoing))
+                    .saturating_sub(OwnedBacking::OVERHEAD_BYTES),
+            )
     }
 }
 
-#[derive(Default)]
 pub(super) struct DatagramState {
     /// Payload bytes and queue entries not yet delivered to the application
     pub(super) recv_buffered: usize,
     pub(super) incoming: VecDeque<Datagram>,
     pub(super) outgoing: VecDeque<Datagram>,
     pub(super) outgoing_total: usize,
-    pub(super) send_blocked: bool,
+    blocked_send_bytes: Option<usize>,
+    incoming_allocation: Allocation,
+    outgoing_allocation: Allocation,
 }
 
 impl DatagramState {
+    pub(super) fn new(receive: Arc<BufferBudget>, send: Arc<BufferBudget>) -> Self {
+        Self {
+            recv_buffered: 0,
+            incoming: VecDeque::new(),
+            outgoing: VecDeque::new(),
+            outgoing_total: 0,
+            blocked_send_bytes: None,
+            incoming_allocation: Allocation {
+                budget: receive,
+                bytes: 0,
+            },
+            outgoing_allocation: Allocation {
+                budget: send,
+                bytes: 0,
+            },
+        }
+    }
+
+    fn block_send(&mut self, length: usize) {
+        self.blocked_send_bytes = Some(
+            self.blocked_send_bytes
+                .map_or(length, |old| old.min(length)),
+        );
+    }
+
+    pub(super) fn poll_unblocked(&mut self, window: usize) -> bool {
+        let Some(length) = self.blocked_send_bytes else {
+            return false;
+        };
+        let required = length
+            .saturating_add(if length == 0 {
+                0
+            } else {
+                OwnedBacking::OVERHEAD_BYTES
+            })
+            .saturating_add(queue_growth_bytes(&self.outgoing));
+        if !self.has_send_buffer_space(length, window)
+            || self.outgoing_allocation.budget.available() < required
+        {
+            return false;
+        }
+        self.blocked_send_bytes = None;
+        true
+    }
+
+    fn queue_send(
+        &mut self,
+        data: &[u8],
+        drop: bool,
+        window: usize,
+    ) -> Result<(), AllocationError> {
+        if drop {
+            self.make_space_for(data.len(), window);
+        } else if !self.has_send_buffer_space(data.len(), window) {
+            return Err(AllocationError);
+        }
+        loop {
+            match queue_datagram(&mut self.outgoing, &mut self.outgoing_allocation, data) {
+                Ok(()) => {
+                    self.outgoing_total += data.len() + size_of::<Datagram>();
+                    return Ok(());
+                }
+                Err(error) => {
+                    release_empty_queue(&mut self.outgoing, &mut self.outgoing_allocation);
+                    if !drop {
+                        return Err(error);
+                    }
+                    let Some(old) = self.outgoing.pop_front() else {
+                        return Err(error);
+                    };
+                    self.outgoing_total -= old.data.len() + size_of::<Datagram>();
+                    mem::drop(old);
+                    release_empty_queue(&mut self.outgoing, &mut self.outgoing_allocation);
+                }
+            }
+        }
+    }
+
     pub(super) fn received(
         &mut self,
         datagram: Datagram,
@@ -225,10 +302,17 @@ impl DatagramState {
             self.recv();
         }
 
+        if queue_datagram(
+            &mut self.incoming,
+            &mut self.incoming_allocation,
+            &datagram.data,
+        )
+        .is_err()
+        {
+            release_empty_queue(&mut self.incoming, &mut self.incoming_allocation);
+            return Ok(false);
+        }
         self.recv_buffered += size;
-        self.incoming.push_back(Datagram {
-            data: Bytes::copy_from_slice(&datagram.data),
-        });
         Ok(was_empty)
     }
 
@@ -240,6 +324,7 @@ impl DatagramState {
             trace!(len = prev.data.len(), "dropping outgoing datagram");
             self.outgoing_total -= prev.data.len() + size_of::<Datagram>();
         }
+        release_empty_queue(&mut self.outgoing, &mut self.outgoing_allocation);
     }
 
     fn has_send_buffer_space(&self, datagram_len: usize, send_buffer_size: usize) -> bool {
@@ -275,6 +360,7 @@ impl DatagramState {
             }
             result
         });
+        release_empty_queue(&mut self.outgoing, &mut self.outgoing_allocation);
         dropped_any
     }
 
@@ -299,6 +385,7 @@ impl DatagramState {
         }
 
         self.outgoing_total -= datagram.data.len() + size_of::<Datagram>();
+        release_empty_queue(&mut self.outgoing, &mut self.outgoing_allocation);
         buf.write_frame(datagram, stat);
         true
     }
@@ -306,6 +393,7 @@ impl DatagramState {
     pub(super) fn recv(&mut self) -> Option<Bytes> {
         let x = self.incoming.pop_front()?.data;
         self.recv_buffered -= x.len() + size_of::<Datagram>();
+        release_empty_queue(&mut self.incoming, &mut self.incoming_allocation);
         Some(x)
     }
 
@@ -321,13 +409,110 @@ impl DatagramState {
             out[i] = d.data;
         }
         self.recv_buffered -= received_bytes;
+        release_empty_queue(&mut self.incoming, &mut self.incoming_allocation);
         n
+    }
+}
+
+fn queue_growth_bytes(queue: &VecDeque<Datagram>) -> usize {
+    if queue.len() < queue.capacity() {
+        return 0;
+    }
+    queue
+        .len()
+        .saturating_add(1)
+        .max(queue.capacity().saturating_mul(2))
+        .max(4)
+        .saturating_mul(size_of::<Datagram>())
+}
+
+fn queue_datagram(
+    queue: &mut VecDeque<Datagram>,
+    allocation: &mut Allocation,
+    data: &[u8],
+) -> Result<(), AllocationError> {
+    let growth = queue_growth_bytes(queue);
+    if growth != 0 {
+        let mut replacement = allocation.budget.acquire(growth)?;
+        let mut entries = VecDeque::new();
+        entries
+            .try_reserve_exact(growth / size_of::<Datagram>())
+            .map_err(|_| AllocationError)?;
+        replacement.resize(entries.capacity() * size_of::<Datagram>())?;
+        entries.extend(mem::take(queue));
+        *queue = entries;
+        *allocation = replacement;
+    }
+    let data = if data.is_empty() {
+        Bytes::new()
+    } else {
+        let mut backing = OwnedBacking::new(data.len(), &allocation.budget)?;
+        backing.bytes.extend_from_slice(data);
+        backing.finish()
+    };
+    queue.push_back(Datagram { data });
+    Ok(())
+}
+
+fn release_empty_queue(queue: &mut VecDeque<Datagram>, allocation: &mut Allocation) {
+    if queue.is_empty() {
+        *queue = VecDeque::new();
+        allocation.resize(0).expect("releasing datagram queue");
+    }
+}
+
+#[cfg(test)]
+impl Default for DatagramState {
+    fn default() -> Self {
+        Self::new(BufferBudget::new(u64::MAX), BufferBudget::new(u64::MAX))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivered_datagrams_keep_aggregate_backing_credit() {
+        let budget = BufferBudget::new(64 * 1024);
+        let mut state = DatagramState::new(budget.clone(), BufferBudget::new(64 * 1024));
+        let source = Bytes::from(vec![7; 1024 * 1024]);
+        let mut retained = Vec::new();
+        for _ in 0..100 {
+            let accepted = state
+                .received(
+                    Datagram {
+                        data: source.slice(..1024),
+                    },
+                    &Some(128 * 1024),
+                )
+                .unwrap();
+            if !accepted {
+                break;
+            }
+            retained.push(state.recv().unwrap());
+            assert!(budget.used() <= 64 * 1024);
+        }
+        assert!(!retained.is_empty() && retained.len() < 100);
+        assert_eq!(state.recv_buffered, 0);
+        assert!(budget.used() > 0);
+        drop(retained);
+        assert_eq!(budget.used(), 0);
+        assert!(
+            state
+                .received(
+                    Datagram {
+                        data: source.slice(..1)
+                    },
+                    &Some(128 * 1024)
+                )
+                .unwrap()
+        );
+        let tiny = state.recv().unwrap();
+        assert!(budget.used() < 512);
+        drop(tiny);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn make_space_for_accounts_for_new_datagram() {

@@ -367,6 +367,15 @@ impl Connection {
             ),
         )]);
 
+        let streams = StreamsState::new(
+            side,
+            config.max_concurrent_uni_streams,
+            config.max_concurrent_bidi_streams,
+            config.send_window,
+            config.receive_window,
+            config.stream_receive_window,
+        );
+        let datagrams = DatagramState::new(streams.receive_budget(), streams.send_budget());
         let mut this = Self {
             endpoint_config,
             crypto_state: CryptoState::new(
@@ -418,15 +427,8 @@ impl Connection {
 
             next_observed_addr_seq_no: 0u32.into(),
 
-            streams: StreamsState::new(
-                side,
-                config.max_concurrent_uni_streams,
-                config.max_concurrent_bidi_streams,
-                config.send_window,
-                config.receive_window,
-                config.stream_receive_window,
-            ),
-            datagrams: DatagramState::default(),
+            streams,
+            datagrams,
             config,
             remote_cids: FxHashMap::from_iter([(PathId::ZERO, CidQueue::new(remote_cid))]),
             rng,
@@ -476,6 +478,12 @@ impl Connection {
     /// - a call was made to `handle_timeout`
     #[must_use]
     pub fn poll(&mut self) -> Option<Event> {
+        if self
+            .datagrams
+            .poll_unblocked(self.config.datagram_send_buffer_size)
+        {
+            return Some(Event::DatagramsUnblocked);
+        }
         if let Some(x) = self.events.pop_front() {
             return Some(x);
         }
@@ -2937,6 +2945,11 @@ impl Connection {
     }
 
     #[cfg(test)]
+    pub(crate) fn receive_buffer_allocated_bytes(&self) -> usize {
+        self.streams.receive_budget().used()
+    }
+
+    #[cfg(test)]
     pub(crate) fn packet_metadata_blocked(&self) -> bool {
         self.spaces[SpaceId::Data]
             .path_space(PathId::ZERO)
@@ -2945,7 +2958,7 @@ impl Connection {
             .admission_blocked()
     }
 
-    /// Retained stream send backing and buffer metadata, including data behind ACK gaps.
+    /// Retained send backing and buffer metadata, including stream data behind ACK gaps.
     pub fn send_allocated_bytes(&self) -> u64 {
         self.streams.transmit.used() as u64
     }
@@ -3592,12 +3605,8 @@ impl Connection {
             let path = self.path_data_mut(path_id);
             if path.mtud.black_hole_detected(now) {
                 path.congestion.on_mtu_update(path.mtud.current_mtu());
-                if let Some(max_datagram_size) = self.datagrams().max_size()
-                    && self.datagrams.drop_oversized(max_datagram_size)
-                    && self.datagrams.send_blocked
-                {
-                    self.datagrams.send_blocked = false;
-                    self.events.push_back(Event::DatagramsUnblocked);
+                if let Some(max_datagram_size) = self.datagrams().max_size() {
+                    self.datagrams.drop_oversized(max_datagram_size);
                 }
                 self.path_stats.get_mut(path_id).black_holes_detected += 1;
             }
@@ -6611,22 +6620,15 @@ impl Connection {
         }
 
         // DATAGRAM
-        let mut sent_datagrams = false;
         while !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
             && builder.frame_space_remaining() > Datagram::SIZE_BOUND
             && space_id == SpaceId::Data
         {
             match self.datagrams.write(builder, stats) {
-                true => {
-                    sent_datagrams = true;
-                }
+                true => {}
                 false => break,
             }
-        }
-        if self.datagrams.send_blocked && sent_datagrams {
-            self.events.push_back(Event::DatagramsUnblocked);
-            self.datagrams.send_blocked = false;
         }
 
         let path = &mut self.paths.get_mut(&path_id).expect("known path").data;

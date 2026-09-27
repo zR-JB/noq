@@ -1004,6 +1004,14 @@ impl StreamsState {
         self.allocated_remote_count[dir as usize]
     }
 
+    pub(in crate::connection) fn receive_budget(&self) -> Arc<BufferBudget> {
+        self.reassembly.clone()
+    }
+
+    pub(in crate::connection) fn send_budget(&self) -> Arc<BufferBudget> {
+        self.transmit.clone()
+    }
+
     pub(crate) fn set_send_window(&mut self, send_window: u64) {
         self.transmit.set_limit(send_window);
         self.send_window = send_window;

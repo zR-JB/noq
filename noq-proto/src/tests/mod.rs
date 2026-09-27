@@ -2420,15 +2420,51 @@ fn tiny_datagrams_do_not_retain_packet_storage() {
         .unwrap();
     drop(oversized);
     pair.drive();
-    let tiny = pair
-        .server_datagrams(server_ch)
-        .recv()
-        .unwrap()
-        .try_into_mut()
-        .expect("datagram must own its storage");
+    let tiny = pair.server_datagrams(server_ch).recv().unwrap();
     assert_eq!(tiny.as_ref(), &[7]);
-    assert_eq!(tiny.capacity(), 1);
     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap().len(), 1024);
+    assert!(
+        pair.server_conn_mut(server_ch)
+            .receive_buffer_allocated_bytes()
+            < 512
+    );
+    assert!(
+        pair.server_conn_mut(server_ch)
+            .receive_buffer_allocated_bytes()
+            > 0
+    );
+    drop(tiny);
+    assert_eq!(
+        pair.server_conn_mut(server_ch)
+            .receive_buffer_allocated_bytes(),
+        0
+    );
+}
+
+#[test]
+fn stream_ack_storage_credit_wakes_datagram_sender() {
+    let mut transport = TransportConfig::default();
+    transport.send_window(64 * 1024);
+    let mut pair = ConnPair::builder().with_transport_cfg(transport).connect();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    while pair.send_stream(Client, stream).write(&ZEROES).is_ok() {}
+    let data = Bytes::from(vec![42; 1024]);
+    assert_matches!(
+        pair.conn_mut(Client).datagrams().send(data.clone(), false),
+        Err(SendDatagramError::Blocked(_))
+    );
+    assert!(!matches!(
+        pair.poll(Client),
+        Some(Event::DatagramsUnblocked)
+    ));
+    pair.drive();
+    assert_matches!(pair.poll(Client), Some(Event::DatagramsUnblocked));
+    pair.conn_mut(Client)
+        .datagrams()
+        .send(data.clone(), false)
+        .unwrap();
+    pair.drive();
+    assert_eq!(pair.conn_mut(Server).datagrams().recv().unwrap(), data);
 }
 
 #[test]
