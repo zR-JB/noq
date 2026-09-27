@@ -5531,24 +5531,45 @@ impl crate::SharedBudget for Budget {
 }
 
 #[test]
-fn shared_budget_refusal_on_send_closes_the_connection() {
+fn exhausted_shared_budget_blocks_sends_and_refuses_new_connections() -> TestResult {
     let budget = Budget::new();
     let mut builder = ConnPair::builder();
     builder
-        .client_transport_cfg
+        .server_transport_cfg
         .shared_budget(Some(budget.clone()));
-    let mut pair = builder.connect();
-    budget.limit.store(budget.used() + 1024, Ordering::Relaxed);
-    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let (mut pair, client_config) = builder.build_pair();
+    let (client, server) = pair.connect_with(client_config.clone());
+    budget.limit.store(budget.used(), Ordering::Relaxed);
+    let stream = pair.server_streams(server).open(Dir::Uni).unwrap();
+    let total = 256 * 1024;
+    let mut remaining = total;
+    let mut received = 0;
+    send_bytes(pair.server_send(server, stream), &mut remaining)?;
+    assert!(remaining > 0);
+    for _ in 0..1_000 {
+        send_bytes(pair.server_send(server, stream), &mut remaining)?;
+        pair.step();
+        if pair.client_streams(client).accept(Dir::Uni).is_some() || received > 0 {
+            recv_bytes(pair.client_recv(client, stream), &mut received);
+        }
+        if received == total {
+            break;
+        }
+    }
+    assert_eq!(received, total);
+    while let Some(event) = pair.server_conn_mut(server).poll() {
+        assert!(!matches!(event, Event::ConnectionLost { .. }), "{event:?}");
+    }
+
+    let refused = pair.begin_connect(client_config);
+    pair.drive();
     assert_matches!(
-        pair.send_stream(Client, stream).write(&[0; 64 * 1024]),
-        Err(WriteError::Blocked)
+        pair.client_conn_mut(refused).poll(),
+        Some(Event::ConnectionLost {
+            reason: ConnectionError::ConnectionClosed(_)
+        })
     );
-    pair.drive_client();
-    while !matches!(pair.conn_mut(Client).poll().expect("close event"),
-        Event::ConnectionLost { reason: ConnectionError::TransportError(ref error) }
-        if error.code == TransportErrorCode::INTERNAL_ERROR)
-    {}
+    Ok(())
 }
 
 #[test]

@@ -154,7 +154,7 @@ impl TransportConfig {
         self
     }
 
-    /// Budget that every connection buffer charges while it holds bytes
+    /// Budget each connection charges for its floor and the buffered bytes beyond it
     pub fn shared_budget(&mut self, value: Option<Arc<dyn SharedBudget>>) -> &mut Self {
         self.shared_budget = value;
         self

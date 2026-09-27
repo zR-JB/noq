@@ -57,7 +57,7 @@ mod assembler;
 pub use assembler::Chunk;
 mod buffer_budget;
 mod packet_map;
-pub use buffer_budget::SharedBudget;
+pub use buffer_budget::{CONNECTION_FLOOR_BYTES, PacketCharge, PacketQueue, SharedBudget};
 
 mod cid_state;
 use cid_state::CidState;
@@ -208,6 +208,7 @@ pub struct Connection {
     /// Packet number spaces: initial, handshake, 1-RTT
     spaces: [PacketSpace; 3],
     packet_budget: Arc<buffer_budget::BufferBudget>,
+    packet_queue: Arc<buffer_budget::BufferBudget>,
     /// Highest usable packet space.
     highest_space: SpaceKind,
     /// Negotiated idle timeout
@@ -335,6 +336,8 @@ impl Connection {
         let mut rng = StdRng::from_seed(rng_seed);
         let shared = config.shared_budget.as_ref();
         let packet_budget = buffer_budget::BufferBudget::new(config.send_window, shared);
+        let packet_queue =
+            buffer_budget::BufferBudget::new(buffer_budget::PACKET_QUEUE_BYTES, shared);
         let mut initial_space =
             PacketSpace::new(now, SpaceId::Initial, &mut rng, packet_budget.clone());
         let mut handshake_space =
@@ -412,6 +415,7 @@ impl Connection {
             spin: false,
             spaces: [initial_space, handshake_space, data_space],
             packet_budget,
+            packet_queue,
             highest_space: SpaceKind::Initial,
             idle_timeout: match config.max_idle_timeout {
                 None | Some(VarInt(0)) => None,
@@ -1054,7 +1058,9 @@ impl Connection {
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
         if self.streams.allocation_failed()
-            || self.packet_budget.refused()
+            || self.packet_budget.floorless()
+            || self.packet_queue.floorless()
+            || self.crypto_state.budget.floorless()
             || self
                 .spaces
                 .iter()
@@ -3083,9 +3089,9 @@ impl Connection {
         self.packet_budget.set_limit(send_window);
     }
 
-    /// See [`TransportConfig::shared_budget()`]
-    pub fn shared_budget(&self) -> Option<&Arc<dyn SharedBudget>> {
-        self.config.shared_budget.as_ref()
+    #[doc(hidden)]
+    pub fn packet_queue(&self) -> PacketQueue {
+        PacketQueue(self.packet_queue.clone())
     }
 
     /// See [`TransportConfig::receive_window()`]

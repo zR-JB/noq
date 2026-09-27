@@ -1269,6 +1269,7 @@ async fn on_closed_endpoint_drop() {
 struct Budget {
     limit: AtomicUsize,
     used: AtomicUsize,
+    refusals: AtomicUsize,
 }
 
 impl Budget {
@@ -1276,6 +1277,7 @@ impl Budget {
         Arc::new(Self {
             limit: AtomicUsize::new(usize::MAX),
             used: AtomicUsize::new(0),
+            refusals: AtomicUsize::new(0),
         })
     }
 
@@ -1292,12 +1294,16 @@ impl Budget {
 
 impl proto::SharedBudget for Budget {
     fn try_charge(&self, bytes: usize) -> bool {
-        self.used
+        let charged = self
+            .used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes)
                     .filter(|&used| used <= self.limit.load(Ordering::Relaxed))
             })
-            .is_ok()
+            .is_ok();
+        self.refusals
+            .fetch_add(usize::from(!charged), Ordering::Relaxed);
+        charged
     }
 
     fn refund(&self, bytes: usize) {
@@ -1412,51 +1418,71 @@ async fn receive_datagram_backing_outlives_connection_handles() {
 }
 
 #[tokio::test]
-async fn shared_budget_refusal_closes_only_the_requesting_connection() {
+async fn exhausted_shared_budget_leaves_an_active_sibling_working() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let budget = Budget::new();
         let factory = EndpointFactory::new();
-        let server = budget.endpoint(&factory);
+        let mut transport = TransportConfig::default();
+        transport
+            .shared_budget(Some(budget.clone()))
+            .receive_window((16 * 1024u32).into());
+        let server = factory.endpoint_with_config("server", transport);
         let client = factory.endpoint("client");
         let address = server.local_addr().unwrap();
-        let mut connections = Vec::new();
-        for _ in 0..2 {
+        let connect = || async {
             let (client, server) =
                 tokio::join!(client.connect(address, "localhost").unwrap(), async {
                     server.accept().await.unwrap().await.unwrap()
                 });
-            connections.push((client.unwrap(), server));
-        }
-        let (sibling, sibling_server) = connections.pop().unwrap();
-        let (attacked, attacked_server) = connections.pop().unwrap();
-        budget
-            .limit
-            .store(budget.used() + 16 * 1024, Ordering::Relaxed);
-        let mut unread = attacked.open_uni().await.unwrap();
-        let _ = unread.write_all(&[7; 64 * 1024]).await;
-        match attacked_server.closed().await {
-            ConnectionError::TransportError(error) => {
-                assert_eq!(error.code, proto::TransportErrorCode::INTERNAL_ERROR)
+            (client.unwrap(), server)
+        };
+        let (sibling, sibling_server) = connect().await;
+        let mut attackers = Vec::new();
+        for _ in 0..3 {
+            let (attacker, attacker_server) = connect().await;
+            attacker_server.set_receive_window((1024 * 1024u32).into());
+            let mut unread = attacker.open_uni().await.unwrap();
+            unread.write_all(&[7; 512 * 1024]).await.unwrap();
+            while attacker.send_buffered_bytes() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            error => panic!("unexpected close: {error:?}"),
+            attackers.push((attacker, attacker_server, unread));
         }
+        budget.limit.store(budget.used(), Ordering::Relaxed);
+
+        let data = (0..1024 * 1024).map(|i| i as u8).collect::<Vec<_>>();
+        let (mut send, mut recv) = sibling.open_bi().await.unwrap();
+        let upload = async {
+            send.write_all(&data).await.unwrap();
+            send.finish().unwrap();
+        };
+        let serve = async {
+            let (mut send, mut recv) = sibling_server.accept_bi().await.unwrap();
+            let download = async {
+                send.write_all(&data).await.unwrap();
+                send.finish().unwrap();
+            };
+            let upload = async {
+                let mut uploaded = Vec::new();
+                while let Some(chunk) = recv.read_chunk(usize::MAX).await.unwrap() {
+                    uploaded.extend_from_slice(&chunk);
+                }
+                uploaded
+            };
+            tokio::join!(download, upload).1
+        };
+        let ((), uploaded, downloaded) = tokio::join!(upload, serve, recv.read_to_end(usize::MAX));
+        assert_eq!(uploaded, data);
+        assert_eq!(downloaded.unwrap(), data);
         assert!(sibling.close_reason().is_none());
-        budget.limit.store(usize::MAX, Ordering::Relaxed);
-        let mut send = sibling.open_uni().await.unwrap();
-        send.write_all(b"live").await.unwrap();
-        send.finish().unwrap();
-        let mut recv = sibling_server.accept_uni().await.unwrap();
-        assert_eq!(recv.read_to_end(4).await.unwrap(), b"live");
+        assert!(sibling_server.close_reason().is_none());
+        assert!(budget.refusals.load(Ordering::Relaxed) > 0);
+
         sibling.close(0u32.into(), b"done");
-        drop((
-            unread,
-            attacked,
-            attacked_server,
-            sibling,
-            sibling_server,
-            recv,
-            send,
-        ));
+        for (attacker, ..) in &attackers {
+            attacker.close(0u32.into(), b"done");
+        }
+        drop((attackers, sibling, sibling_server, send, recv));
         tokio::join!(server.wait_idle(), client.wait_idle());
         assert_eq!(budget.used(), 0);
     })

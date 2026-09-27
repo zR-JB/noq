@@ -78,6 +78,7 @@ impl ZeroRttCrypto {
 pub(super) struct CryptoState {
     /// Per encryption level crypto data (Initial, Handshake, Data).
     pub(super) spaces: [CryptoSpace; 3],
+    pub(super) budget: Arc<BufferBudget>,
     /// The TLS session.
     pub(super) session: Box<dyn crypto::Session>,
 
@@ -129,6 +130,7 @@ impl CryptoState {
         spaces[0].keys = Some(initial_keys);
         Self {
             spaces,
+            budget,
             session,
             next_crypto: None,
             prev_crypto: None,

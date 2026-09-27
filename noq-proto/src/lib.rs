@@ -42,12 +42,12 @@ pub use bloom_token_log::BloomTokenLog;
 
 pub(crate) mod connection;
 pub use crate::connection::{
-    Chunk, Chunks, ClosePathError, ClosedPath, ClosedStream, Connection, ConnectionError,
-    ConnectionStats, Datagrams, Event, FinishError, FrameStats, MultipathNotNegotiated,
-    NetworkChangeHint, PathAbandonReason, PathError, PathEvent, PathId, PathStats, PathStatus,
-    ReadError, ReadableError, RecvStream, ResetStreamAtError, RttEstimator, SendDatagramError,
-    SendStream, SetPathStatusError, SharedBudget, ShouldTransmit, StreamEvent, Streams, UdpStats,
-    WriteError,
+    CONNECTION_FLOOR_BYTES, Chunk, Chunks, ClosePathError, ClosedPath, ClosedStream, Connection,
+    ConnectionError, ConnectionStats, Datagrams, Event, FinishError, FrameStats,
+    MultipathNotNegotiated, NetworkChangeHint, PacketCharge, PacketQueue, PathAbandonReason,
+    PathError, PathEvent, PathId, PathStats, PathStatus, ReadError, ReadableError, RecvStream,
+    ResetStreamAtError, RttEstimator, SendDatagramError, SendStream, SetPathStatusError,
+    SharedBudget, ShouldTransmit, StreamEvent, Streams, UdpStats, WriteError,
 };
 #[cfg(test)]
 use test_strategy::Arbitrary;

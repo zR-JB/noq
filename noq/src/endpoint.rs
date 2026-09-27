@@ -39,7 +39,7 @@ use rustc_hash::FxHashMap;
     any(feature = "aws-lc-rs", feature = "ring"),
 ))]
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, futures::Notified, mpsc};
+use tokio::sync::{Notify, futures::Notified, mpsc};
 use tracing::{Instrument, Span, trace};
 use udp::{BATCH_SIZE, RecvMeta};
 
@@ -737,28 +737,10 @@ fn proto_ecn(ecn: udp::EcnCodepoint) -> proto::EcnCodepoint {
     }
 }
 
-const PACKET_QUEUE_BYTES: usize = 16 * 1024 * 1024;
-
 #[derive(Debug)]
 struct ConnectionSender {
     events: mpsc::UnboundedSender<ConnectionEvent>,
-    packet_budget: Arc<Semaphore>,
-    shared: Option<Arc<dyn proto::SharedBudget>>,
-}
-
-#[derive(Debug)]
-pub(crate) struct PacketCharge {
-    _permit: OwnedSemaphorePermit,
-    shared: Option<Arc<dyn proto::SharedBudget>>,
-    bytes: usize,
-}
-
-impl Drop for PacketCharge {
-    fn drop(&mut self) {
-        if let Some(shared) = &self.shared {
-            shared.refund(self.bytes);
-        }
-    }
+    packets: proto::PacketQueue,
 }
 
 impl std::ops::Deref for ConnectionSender {
@@ -771,30 +753,15 @@ impl std::ops::Deref for ConnectionSender {
 
 impl ConnectionSender {
     fn send_proto(&self, event: proto::ConnectionEvent) {
-        let charge = if let Some(bytes) = event.packet_storage_size() {
-            let bytes = bytes.saturating_add(mem::size_of::<ConnectionEvent>());
-            let Some(permit) = u32::try_from(bytes).ok().and_then(|permits| {
-                self.packet_budget
-                    .clone()
-                    .try_acquire_many_owned(permits)
-                    .ok()
-            }) else {
-                return;
-            };
-            if self
-                .shared
-                .as_ref()
-                .is_some_and(|shared| !shared.try_charge(bytes))
-            {
-                return;
+        let charge = match event.packet_storage_size() {
+            Some(bytes) => {
+                let bytes = bytes.saturating_add(mem::size_of::<ConnectionEvent>());
+                let Some(charge) = self.packets.charge(bytes) else {
+                    return;
+                };
+                Some(charge)
             }
-            Some(PacketCharge {
-                _permit: permit,
-                shared: self.shared.clone(),
-                bytes,
-            })
-        } else {
-            None
+            None => None,
         };
         let _ = self.events.send(ConnectionEvent::Proto(event, charge));
     }
@@ -841,8 +808,7 @@ impl ConnectionSet {
             handle,
             ConnectionSender {
                 events: send,
-                packet_budget: Arc::new(Semaphore::new(PACKET_QUEUE_BYTES)),
-                shared: conn.shared_budget().cloned(),
+                packets: conn.packet_queue(),
             },
         );
         self.active_connections += 1;
@@ -1181,7 +1147,7 @@ mod packet_queue_tests {
             let incoming = server.accept().await.unwrap();
             runtime.hold.store(true, Ordering::Relaxed);
             let connecting = incoming.accept().unwrap();
-            let budget = server
+            let queue = server
                 .inner
                 .state
                 .lock()
@@ -1192,12 +1158,13 @@ mod packet_queue_tests {
                 .values()
                 .next()
                 .unwrap()
-                .packet_budget
+                .packets
                 .clone();
-            let reserved = budget
-                .clone()
-                .try_acquire_many_owned((PACKET_QUEUE_BYTES - 16 * 1024) as u32)
-                .unwrap();
+            let mut reserved = Vec::new();
+            while let Some(charge) = queue.charge(16 * 1024) {
+                reserved.push(charge);
+            }
+            reserved.pop();
             let charge = initial.len()
                 + mem::size_of::<ConnectionEvent>()
                 + mem::size_of::<proto::ConnectionEvent>();
@@ -1209,15 +1176,15 @@ mod packet_queue_tests {
                         .unwrap();
                 }
                 tokio::task::yield_now().await;
-                if budget.available_permits() < charge {
+                if queue.charge(charge).is_none() {
                     break;
                 }
             }
             assert!(
-                budget.available_permits() < charge,
+                queue.charge(charge).is_none(),
                 "packet queue did not reach its bound"
             );
-            let remaining = budget.available_permits();
+            let used = queue.used();
             for _ in 0..16 {
                 relay
                     .send_to(&initial, server.local_addr().unwrap())
@@ -1225,7 +1192,7 @@ mod packet_queue_tests {
                     .unwrap();
             }
             tokio::task::yield_now().await;
-            assert_eq!(budget.available_permits(), remaining);
+            assert_eq!(queue.used(), used);
             server.close(VarInt::from_u32(7), b"closed");
             for task in runtime.tasks.lock().unwrap().drain(..) {
                 tokio::spawn(task);
@@ -1235,7 +1202,7 @@ mod packet_queue_tests {
                 Err(ConnectionError::LocallyClosed)
             ));
             drop(reserved);
-            assert_eq!(budget.available_permits(), PACKET_QUEUE_BYTES);
+            assert_eq!(queue.used(), 0);
         })
         .await
         .unwrap();
