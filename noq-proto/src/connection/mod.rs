@@ -56,6 +56,7 @@ use ack_frequency::AckFrequencyState;
 mod assembler;
 pub use assembler::Chunk;
 mod buffer_budget;
+mod packet_map;
 pub use buffer_budget::ReceiveAllocationHandle;
 
 mod cid_state;
@@ -206,6 +207,7 @@ pub struct Connection {
     spin: bool,
     /// Packet number spaces: initial, handshake, 1-RTT
     spaces: [PacketSpace; 3],
+    packet_budget: Arc<buffer_budget::BufferBudget>,
     /// Highest usable packet space.
     highest_space: SpaceKind,
     /// Negotiated idle timeout
@@ -331,15 +333,18 @@ impl Connection {
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
         let mut rng = StdRng::from_seed(rng_seed);
-        let mut initial_space = PacketSpace::new(now, SpaceId::Initial, &mut rng);
-        let mut handshake_space = PacketSpace::new(now, SpaceId::Handshake, &mut rng);
+        let packet_budget = buffer_budget::BufferBudget::new(config.send_window);
+        let mut initial_space =
+            PacketSpace::new(now, SpaceId::Initial, &mut rng, packet_budget.clone());
+        let mut handshake_space =
+            PacketSpace::new(now, SpaceId::Handshake, &mut rng, packet_budget.clone());
         #[cfg(test)]
         let mut data_space = match config.deterministic_packet_numbers {
-            true => PacketSpace::new_deterministic(now, SpaceId::Data),
-            false => PacketSpace::new(now, SpaceId::Data, &mut rng),
+            true => PacketSpace::new_deterministic(now, SpaceId::Data, packet_budget.clone()),
+            false => PacketSpace::new(now, SpaceId::Data, &mut rng, packet_budget.clone()),
         };
         #[cfg(not(test))]
-        let mut data_space = PacketSpace::new(now, SpaceId::Data, &mut rng);
+        let mut data_space = PacketSpace::new(now, SpaceId::Data, &mut rng, packet_budget.clone());
 
         // The spaces for PathId::ZERO do not need the PathEvent::Established event.
         initial_space.for_path(PathId::ZERO).open_status = OpenStatus::Informed;
@@ -394,6 +399,7 @@ impl Connection {
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
             spaces: [initial_space, handshake_space, data_space],
+            packet_budget,
             highest_space: SpaceKind::Initial,
             idle_timeout: match config.max_idle_timeout {
                 None | Some(VarInt(0)) => None,
@@ -998,7 +1004,12 @@ impl Connection {
 
         let path = vacant_entry.insert(PathState { data, prev: None });
 
-        let mut pn_space = spaces::PacketNumberSpace::new(now, SpaceId::Data, &mut self.rng);
+        let mut pn_space = spaces::PacketNumberSpace::new(
+            now,
+            SpaceId::Data,
+            &mut self.rng,
+            self.packet_budget.clone(),
+        );
         if let Some(pn) = pn {
             pn_space.dedup.insert(pn);
         }
@@ -1498,9 +1509,18 @@ impl Connection {
                 // A new datagram needs to be started.
                 transmit.segment_size()
             };
-            let can_send =
+            let track = self.spaces[space_id]
+                .for_path(path_id)
+                .sent_packets
+                .reserve_entry()
+                .is_ok();
+            let mut can_send =
                 self.space_can_send(space_id, path_id, max_packet_size, connection_close_pending);
-            let needs_loss_probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
+            if !track {
+                can_send.other = false;
+                can_send.space_specific = false;
+            }
+            let needs_loss_probe = track && self.spaces[space_id].for_path(path_id).loss_probes > 0;
             let space_will_send = {
                 if scheduling_info.is_abandoned {
                     // If this path is abandoned then we might still have to send
@@ -1631,7 +1651,7 @@ impl Connection {
             }
 
             let Some(mut builder) =
-                PacketBuilder::new(now, space_id, path_id, remote_cid, transmit, self)
+                PacketBuilder::new(now, space_id, path_id, remote_cid, transmit, self, track)
             else {
                 // Confidentiality limit is exceeded and the connection has been killed. We
                 // should not send any other packets. This works in a roundabout way: We
@@ -1858,8 +1878,15 @@ impl Connection {
         let mut transmit = TransmitBuf::new(buf, NonZeroUsize::MIN, probe_size as usize);
         transmit.start_new_datagram_with_size(probe_size as usize);
 
-        let mut builder =
-            PacketBuilder::new(now, SpaceId::Data, path_id, active_cid, &mut transmit, self)?;
+        let mut builder = PacketBuilder::new(
+            now,
+            SpaceId::Data,
+            path_id,
+            active_cid,
+            &mut transmit,
+            self,
+            true,
+        )?;
 
         // We implement MTU probes as ping packets padded up to the probe size
         trace!(?probe_size, "writing MTUD probe");
@@ -2039,7 +2066,8 @@ impl Connection {
         // sent once, immediately after migration, when the CID is known to be valid. Even
         // if a post-migration packet caused the CID to be retired, it's fair to pretend
         // this is sent first.
-        let mut builder = PacketBuilder::new(now, SpaceId::Data, path_id, *prev_cid, buf, self)?;
+        let mut builder =
+            PacketBuilder::new(now, SpaceId::Data, path_id, *prev_cid, buf, self, true)?;
         let challenge = frame::PathChallenge(token);
         let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
         builder.write_frame_with_log_msg(challenge, stats, Some("validating previous path"));
@@ -2094,7 +2122,7 @@ impl Connection {
         let buf = &mut TransmitBuf::new(buf, NonZeroUsize::MIN, MIN_INITIAL_SIZE.into());
         buf.start_new_datagram();
 
-        let mut builder = PacketBuilder::new(now, SpaceId::Data, path_id, cid, buf, self)?;
+        let mut builder = PacketBuilder::new(now, SpaceId::Data, path_id, cid, buf, self, true)?;
         let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
         builder.write_frame_with_log_msg(frame, stats, Some("(off-path)"));
 
@@ -2173,7 +2201,8 @@ impl Connection {
         let mut buf = TransmitBuf::new(buf, NonZeroUsize::MIN, MIN_INITIAL_SIZE.into());
         buf.start_new_datagram();
 
-        let mut builder = PacketBuilder::new(now, SpaceId::Data, path_id, cid, &mut buf, self)?;
+        let mut builder =
+            PacketBuilder::new(now, SpaceId::Data, path_id, cid, &mut buf, self, true)?;
         let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
         builder.write_frame_with_log_msg(frame, stats, Some("(nat-traversal)"));
         // Off-path: not tracked in congestion control. The packet is sent to a
@@ -2907,6 +2936,15 @@ impl Connection {
         self.streams.unacked_data
     }
 
+    #[cfg(test)]
+    pub(crate) fn packet_metadata_blocked(&self) -> bool {
+        self.spaces[SpaceId::Data]
+            .path_space(PathId::ZERO)
+            .unwrap()
+            .sent_packets
+            .admission_blocked()
+    }
+
     /// Retained stream send backing and buffer metadata, including data behind ACK gaps.
     pub fn send_allocated_bytes(&self) -> u64 {
         self.streams.transmit.used() as u64
@@ -2915,6 +2953,7 @@ impl Connection {
     /// See [`TransportConfig::send_window()`]
     pub fn set_send_window(&mut self, send_window: u64) {
         self.streams.set_send_window(send_window);
+        self.packet_budget.set_limit(send_window);
     }
 
     /// See [`TransportConfig::receive_window()`]
@@ -3542,7 +3581,7 @@ impl Connection {
                 path.mtud.on_non_probe_lost(packet, info.size);
                 path.congestion.on_packet_lost(info.size, packet, now);
 
-                self.spaces[pn_space].for_path(path_id).lost_packets.insert(
+                let _ = self.spaces[pn_space].for_path(path_id).lost_packets.insert(
                     packet,
                     LostPacket {
                         time_sent: info.time_sent,
@@ -4208,7 +4247,7 @@ impl Connection {
         pns.time_of_last_ack_eliciting_packet = None;
         pns.loss_time = None;
         pns.loss_probes = 0;
-        let sent_packets = mem::take(&mut pns.sent_packets);
+        let sent_packets = pns.sent_packets.take();
         let path = self
             .paths
             .get_mut(&PathId::ZERO)
@@ -4668,7 +4707,12 @@ impl Connection {
                     .for_path(path_id)
                     .next_packet_number;
                 self.spaces[SpaceId::Initial] = {
-                    let mut space = PacketSpace::new(now, SpaceId::Initial, &mut self.rng);
+                    let mut space = PacketSpace::new(
+                        now,
+                        SpaceId::Initial,
+                        &mut self.rng,
+                        self.packet_budget.clone(),
+                    );
                     space.for_path(path_id).next_packet_number = next_pn;
                     space.pending.crypto.push_back(frame::Crypto {
                         offset: 0,
@@ -4678,11 +4722,10 @@ impl Connection {
                 };
 
                 // Retransmit all 0-RTT data
-                let zero_rtt = mem::take(
-                    &mut self.spaces[SpaceId::Data]
-                        .for_path(PathId::ZERO)
-                        .sent_packets,
-                );
+                let zero_rtt = self.spaces[SpaceId::Data]
+                    .for_path(PathId::ZERO)
+                    .sent_packets
+                    .take();
                 for (_, info) in zero_rtt.into_iter() {
                     self.paths
                         .get_mut(&PathId::ZERO)
@@ -4756,9 +4799,10 @@ impl Connection {
                             self.spaces[SpaceId::Data].pending = Retransmits::default();
 
                             // Discard 0-RTT packets
-                            let sent_packets = mem::take(
-                                &mut self.spaces[SpaceId::Data].for_path(path_id).sent_packets,
-                            );
+                            let sent_packets = self.spaces[SpaceId::Data]
+                                .for_path(path_id)
+                                .sent_packets
+                                .take();
                             for (_, packet) in sent_packets.into_iter() {
                                 self.paths
                                     .get_mut(&path_id)
@@ -6151,6 +6195,39 @@ impl Connection {
             .pending_acks
             .maybe_ack_non_eliciting();
 
+        // ACK
+        if !scheduling_info.is_abandoned && scheduling_info.may_send_data {
+            for path_id in space
+                .number_spaces
+                .iter_mut()
+                .filter(|(_, pns)| pns.pending_acks.can_send())
+                .map(|(&path_id, _)| path_id)
+                .collect::<Vec<_>>()
+            {
+                Self::populate_acks(
+                    now,
+                    self.receiving_ecn,
+                    path_id,
+                    space_id,
+                    space,
+                    is_multipath_negotiated,
+                    builder,
+                    stats,
+                    space_has_keys,
+                );
+                if !builder.track {
+                    self.timers.stop(
+                        Timer::PerPath(path_id, PathTimer::MaxAckDelay),
+                        self.qlog.with_time(now),
+                    );
+                }
+            }
+        }
+
+        if !builder.track {
+            return;
+        }
+
         // HANDSHAKE_DONE
         if !is_0rtt
             && !scheduling_info.is_abandoned
@@ -6177,29 +6254,6 @@ impl Connection {
                 "immediate acks must be sent in the data space"
             );
             builder.write_frame(frame::ImmediateAck, stats);
-        }
-
-        // ACK
-        if !scheduling_info.is_abandoned && scheduling_info.may_send_data {
-            for path_id in space
-                .number_spaces
-                .iter_mut()
-                .filter(|(_, pns)| pns.pending_acks.can_send())
-                .map(|(&path_id, _)| path_id)
-                .collect::<Vec<_>>()
-            {
-                Self::populate_acks(
-                    now,
-                    self.receiving_ecn,
-                    path_id,
-                    space_id,
-                    space,
-                    is_multipath_negotiated,
-                    builder,
-                    stats,
-                    space_has_keys,
-                );
-            }
         }
 
         // ACK_FREQUENCY
@@ -6671,6 +6725,9 @@ impl Connection {
             }
         } else {
             builder.write_frame(frame::Ack::encoder(delay, ranges, ecn), stats);
+        }
+        if !builder.track {
+            pns.pending_acks.acks_sent();
         }
     }
 

@@ -36,6 +36,7 @@ pub(super) struct PacketBuilder<'a, 'b> {
     pub(super) _span: tracing::span::EnteredSpan,
     qlog: QlogSentPacket,
     sent_frames: SentFrames,
+    pub(super) track: bool,
 }
 
 impl<'a, 'b> PacketBuilder<'a, 'b> {
@@ -50,10 +51,20 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         dst_cid: ConnectionId,
         buffer: &'a mut TransmitBuf<'b>,
         conn: &mut Connection,
+        track: bool,
     ) -> Option<Self>
     where
         'b: 'a,
     {
+        if track
+            && conn.spaces[space_id]
+                .for_path(path_id)
+                .sent_packets
+                .reserve_entry()
+                .is_err()
+        {
+            return None;
+        }
         let mut qlog = QlogSentPacket::default();
 
         let version = conn.version;
@@ -173,6 +184,7 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             ack_eliciting: false,
             qlog,
             sent_frames: SentFrames::default(),
+            track,
             _span: span,
         })
     }
@@ -192,6 +204,7 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             _span: trace_span!("test").entered(),
             qlog: QlogSentPacket::default(),
             sent_frames: SentFrames::default(),
+            track: true,
             level: EncryptionLevel::Initial,
         }
     }
@@ -247,7 +260,11 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             Some(msg) => trace!(%frame, msg),
             None => trace!(%frame),
         }
-        self.sent_frames.record_sent_frame(frame);
+        if self.track {
+            self.sent_frames.record_sent_frame(frame);
+        } else {
+            debug_assert!(!frame.is_ack_eliciting());
+        }
     }
 
     /// Returns a writable buffer limited to the remaining frame space
@@ -279,7 +296,11 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         let ack_eliciting = self.ack_eliciting;
         let packet_number = self.packet_number;
         let space_id = self.space;
+        let track = self.track;
         let (size, padded, sent) = self.finish(conn, now);
+        if !track {
+            return;
+        }
 
         let size = match padded || ack_eliciting {
             true => size as u16,
@@ -297,11 +318,16 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             stream_frames: sent.stream_frames,
         };
 
-        conn.paths.get_mut(&path_id).unwrap().data.sent(
-            packet_number,
-            packet,
-            conn.spaces[space_id].for_path(path_id),
-        );
+        conn.paths
+            .get_mut(&path_id)
+            .unwrap()
+            .data
+            .sent(
+                packet_number,
+                packet,
+                conn.spaces[space_id].for_path(path_id),
+            )
+            .expect("packet node was reserved");
         conn.reset_keep_alive(path_id, now);
         if size != 0 {
             if ack_eliciting {

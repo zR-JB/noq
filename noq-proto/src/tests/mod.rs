@@ -5066,6 +5066,76 @@ fn initial_tail_loss_probe() {
 }
 
 #[test]
+fn packet_metadata_pressure_preserves_bidirectional_delivery() -> TestResult {
+    let mut transport = TransportConfig::default();
+    transport.send_window(64 * 1024);
+    let mut congestion = crate::congestion::CubicConfig::default();
+    congestion.initial_window(128 * 1024);
+    transport.congestion_controller_factory(Arc::new(congestion));
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(transport)
+        .with_latency(Duration::from_millis(50))
+        .connect();
+    let client_stream = pair.streams(Client).open(Dir::Bi).unwrap();
+    let mut client_remaining = 256 * 1024;
+    send_bytes(
+        pair.send_stream(Client, client_stream),
+        &mut client_remaining,
+    )?;
+    let server_stream = loop {
+        pair.step();
+        if let Some(stream) = pair.streams(Server).accept(Dir::Bi) {
+            break stream;
+        }
+    };
+    let mut server_remaining = 256 * 1024;
+    let mut client_received = 0;
+    let mut server_received = 0;
+    let mut metadata_blocked = false;
+    loop {
+        metadata_blocked |= pair.conn(Client).packet_metadata_blocked()
+            || pair.conn(Server).packet_metadata_blocked();
+        if client_remaining > 0 {
+            send_bytes(
+                pair.send_stream(Client, client_stream),
+                &mut client_remaining,
+            )?;
+        }
+        if server_remaining > 0 {
+            send_bytes(
+                pair.send_stream(Server, server_stream),
+                &mut server_remaining,
+            )?;
+        }
+        recv_bytes(
+            pair.recv_stream(Client, client_stream),
+            &mut client_received,
+        );
+        recv_bytes(
+            pair.recv_stream(Server, server_stream),
+            &mut server_received,
+        );
+        if !pair.step() {
+            break;
+        }
+    }
+    recv_bytes(
+        pair.recv_stream(Client, client_stream),
+        &mut client_received,
+    );
+    recv_bytes(
+        pair.recv_stream(Server, server_stream),
+        &mut server_received,
+    );
+    assert!(metadata_blocked);
+    assert_eq!(client_remaining, 0);
+    assert_eq!(server_remaining, 0);
+    assert_eq!(client_received, 256 * 1024);
+    assert_eq!(server_received, 256 * 1024);
+    Ok(())
+}
+
+#[test]
 fn throughput() -> TestResult {
     const TOTAL_BYTES: usize = 1_000_000;
     const BPS_LIMIT: u64 = 100_000;

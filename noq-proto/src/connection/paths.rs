@@ -415,14 +415,20 @@ impl PathData {
     }
 
     /// Account for transmission of `packet` with number `pn` in `space`
-    pub(super) fn sent(&mut self, pn: u64, packet: SentPacket, space: &mut PacketNumberSpace) {
+    pub(super) fn sent(
+        &mut self,
+        pn: u64,
+        packet: SentPacket,
+        space: &mut PacketNumberSpace,
+    ) -> Result<(), super::buffer_budget::AllocationError> {
         self.in_flight.insert(&packet);
         if self.first_packet.is_none() {
             self.first_packet = Some(pn);
         }
-        if let Some(forgotten) = space.sent(pn, packet) {
+        if let Some(forgotten) = space.sent(pn, packet)? {
             self.remove_in_flight(&forgotten);
         }
+        Ok(())
     }
 
     pub(super) fn record_path_challenge_sent(

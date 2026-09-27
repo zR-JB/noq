@@ -170,7 +170,7 @@ pub(super) struct AllocationError;
 
 impl From<AllocationError> for TransportError {
     fn from(_: AllocationError) -> Self {
-        Self::INTERNAL_ERROR("receive reassembly allocation limit")
+        Self::INTERNAL_ERROR("buffer allocation limit")
     }
 }
 
