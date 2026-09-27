@@ -326,6 +326,11 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             conn.path_data_mut(path_id).permit_idle_reset = false;
         }
         if !track {
+            conn.spaces[space_id].for_path(path_id).sent_untracked(
+                packet_number,
+                now,
+                ack_eliciting,
+            );
             if ack_eliciting {
                 conn.set_loss_detection_timer(now, path_id);
             }
