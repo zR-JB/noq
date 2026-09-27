@@ -1535,7 +1535,8 @@ impl Connection {
                     // PATH_ABANDON itself on it if there was no better space
                     // available. Otherwise we want to send the PATH_ABANDON as permitted by
                     // may_send_data however.
-                    scheduling_info.may_self_abandon
+                    track
+                        && scheduling_info.may_self_abandon
                         && self.spaces[space_id]
                             .pending
                             .path_abandon
@@ -1679,7 +1680,7 @@ impl Connection {
                 // https://www.rfc-editor.org/rfc/rfc9000.html#section-14.1
                 pad_datagram |= PadDatagram::ToMinMtu;
             }
-            if space_id == SpaceId::Data && self.config.pad_to_mtu {
+            if track && space_id == SpaceId::Data && self.config.pad_to_mtu {
                 pad_datagram |= PadDatagram::ToSegmentSize;
             }
 
@@ -6984,6 +6985,18 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn total_recvd(&self) -> u64 {
         self.path_data(PathId::ZERO).total_recvd
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_packet_metadata(&mut self) -> impl Drop + use<> {
+        for space in &mut self.spaces {
+            for path in space.iter_paths_mut() {
+                path.sent_packets.release_unused_admission();
+            }
+        }
+        self.packet_budget
+            .acquire(self.packet_budget.available())
+            .unwrap()
     }
 
     #[cfg(test)]

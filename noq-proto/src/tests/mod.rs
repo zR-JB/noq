@@ -5302,3 +5302,21 @@ fn regression_initial_coalescing_large_cid() {
     pair.time += Duration::from_secs(5);
     pair.drive_client(); // this used to try to build a packet without enough datagram space
 }
+
+#[test]
+fn packet_pressure_ack_avoids_untracked_mtu_padding() {
+    let transport = TransportConfig {
+        pad_to_mtu: true,
+        ..TransportConfig::default()
+    };
+    let mut pair = ConnPair::builder().with_transport_cfg(transport).connect();
+    let _charged = pair.conn_mut(Client).exhaust_packet_metadata();
+    pair.ping(Server);
+    pair.drive_server();
+    pair.drive_client();
+    pair.advance_time();
+    let now = pair.time;
+    pair.client.drive(now);
+    assert_eq!(pair.client.outbound.len(), 1);
+    assert!(pair.client.outbound[0].0.size < usize::from(pair.conn(Client).current_mtu()));
+}
