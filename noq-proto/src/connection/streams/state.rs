@@ -782,11 +782,11 @@ impl StreamsState {
             frame.offsets.end = frame.offsets.end.min(reliable_size);
             frame.offsets.start = frame.offsets.start.min(frame.offsets.end);
         }
-        self.unacked_data -= frame.offsets.end - frame.offsets.start;
-        if !stream
+        let (finished, acknowledged) = stream
             .ack(frame)
-            .map_err(|_| TransportError::INTERNAL_ERROR("send buffer allocation limit"))?
-        {
+            .map_err(|_| TransportError::INTERNAL_ERROR("send buffer allocation limit"))?;
+        self.unacked_data -= acknowledged;
+        if !finished {
             // The stream is unfinished or may still need retransmits
             return Ok(());
         }
@@ -2603,6 +2603,45 @@ mod tests {
         while stream.write(&data).is_ok() {}
         while !stream.state.write_frames_for_test(1200, true).is_empty() {}
         let end = stream.state.send[&id].as_ref().unwrap().pending.offset();
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id,
+                offsets: end / 2..end,
+                fin: false,
+            })
+            .unwrap();
+        assert_eq!(stream.state.unacked_data, end / 2);
+        for offsets in [0..10, 20..30, 40..50] {
+            stream
+                .state
+                .retransmit(frame::StreamMeta {
+                    id,
+                    offsets,
+                    fin: false,
+                })
+                .unwrap();
+        }
+        let retransmitted = stream.state.write_frames_for_test(100_000, true);
+        assert_eq!(retransmitted.first().unwrap().offsets, 0..end);
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id,
+                offsets: 50..end,
+                fin: false,
+            })
+            .unwrap();
+        assert_eq!(stream.state.unacked_data, 50);
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id,
+                offsets: 50..end,
+                fin: false,
+            })
+            .unwrap();
+        assert_eq!(stream.state.unacked_data, 50);
         stream
             .state
             .received_ack_of(frame::StreamMeta {

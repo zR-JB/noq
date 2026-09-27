@@ -399,15 +399,19 @@ impl AckBitmap {
         Ok(())
     }
 
-    fn mark(&mut self, range: Range<u64>) {
+    fn mark(&mut self, range: Range<u64>) -> u64 {
+        let mut acknowledged = 0;
         let mut offset = range.start;
         while offset < range.end {
             let shift = offset % 64;
             let length = (range.end - offset).min(64 - shift);
             let mask = u64::MAX >> (64 - length);
-            self.words[(offset / 64 - self.first_word) as usize] |= mask << shift;
+            let word = &mut self.words[(offset / 64 - self.first_word) as usize];
+            acknowledged += u64::from(((mask << shift) & !*word).count_ones());
+            *word |= mask << shift;
             offset += length;
         }
+        acknowledged
     }
 
     fn prefix(&self, range: Range<u64>) -> u64 {
@@ -507,13 +511,13 @@ impl SendBuffer {
     }
 
     /// Discard a range of acknowledged stream data
-    pub(super) fn ack(&mut self, mut range: Range<u64>) -> Result<(), AllocationError> {
+    pub(super) fn ack(&mut self, mut range: Range<u64>) -> Result<u64, AllocationError> {
         // Clamp the range to data which is still tracked
         let base_offset = self.fully_acked_offset();
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
-        self.acks.mark(range);
+        let acknowledged = self.acks.mark(range);
         let prefix = self.acks.prefix(self.data.range());
         self.data.pop_front((prefix - base_offset) as usize);
         self.acks.discard_prefix(prefix);
@@ -524,7 +528,7 @@ impl SendBuffer {
         // for non-present data would be an error.
         self.retransmits.ranges.remove(0..self.fully_acked_offset());
         self.release_empty_storage();
-        Ok(())
+        Ok(acknowledged)
     }
 
     pub(super) fn release_empty_storage(&mut self) {

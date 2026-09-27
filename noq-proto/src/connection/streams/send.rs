@@ -205,9 +205,9 @@ impl Send {
     /// For a FIN-based finish this means the FIN and all data were acknowledged; for a reliable
     /// reset it means the RESET_STREAM_AT frame and all data up to the reliable size were
     /// acknowledged.
-    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> Result<bool, AllocationError> {
-        self.pending.ack(frame.offsets)?;
-        Ok(match self.state {
+    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> Result<(bool, u64), AllocationError> {
+        let acknowledged = self.pending.ack(frame.offsets)?;
+        let finished = match self.state {
             SendState::DataSent {
                 ref mut finish_acked,
             } => {
@@ -222,7 +222,8 @@ impl Send {
                 }
             }
             _ => false,
-        })
+        };
+        Ok((finished, acknowledged))
     }
 
     /// Records acknowledgement of a RESET_STREAM_AT frame carrying the current reliable size.
@@ -544,7 +545,7 @@ mod tests {
             fin: false,
         };
         assert!(
-            !send.ack(meta).unwrap(),
+            !send.ack(meta).unwrap().0,
             "data acked but RESET_STREAM_AT not yet"
         );
         assert!(
@@ -562,7 +563,7 @@ mod tests {
             fin: false,
         };
         assert!(
-            send.ack(meta).unwrap(),
+            send.ack(meta).unwrap().0,
             "data ack now completes the reliable reset"
         );
     }
