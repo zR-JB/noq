@@ -5,7 +5,10 @@ use thiserror::Error;
 
 use crate::{
     VarInt,
-    connection::{send_buffer::SendBuffer, streams::BytesOrSlice},
+    connection::{
+        send_buffer::{Leased, SendBuffer},
+        streams::BytesOrSlice,
+    },
     frame,
 };
 
@@ -290,6 +293,12 @@ impl<'a> BytesSource<'a> for BytesArray<'a> {
     where
         'a: 'b,
     {
+        self.pop_bytes(limit)
+    }
+}
+
+impl BytesArray<'_> {
+    fn pop_bytes(&mut self, limit: usize) -> (Bytes, usize) {
         // The loop exists to skip empty chunks while still marking them as
         // consumed
         let mut chunks_consumed = 0;
@@ -314,6 +323,19 @@ impl<'a> BytesSource<'a> for BytesArray<'a> {
         }
 
         (Bytes::new(), chunks_consumed)
+    }
+}
+
+/// A [`BytesArray`] whose chunks the send buffer keeps without copying
+pub(super) struct LeasedArray<'a>(pub(super) BytesArray<'a>);
+
+impl<'a> BytesSource<'a> for LeasedArray<'a> {
+    fn pop_chunk<'b>(&'b mut self, limit: usize) -> (impl BytesOrSlice<'b>, usize)
+    where
+        'a: 'b,
+    {
+        let (chunk, chunks_consumed) = self.0.pop_bytes(limit);
+        (Leased(chunk), chunks_consumed)
     }
 }
 

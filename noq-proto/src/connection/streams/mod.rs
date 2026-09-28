@@ -21,7 +21,7 @@ use recv::{Recv, ResetAtOutcome};
 
 mod send;
 pub(crate) use send::{ByteSlice, BytesArray, Written};
-use send::{BytesSource, Send, SendState};
+use send::{BytesSource, LeasedArray, Send, SendState};
 pub use send::{FinishError, WriteError};
 
 mod state;
@@ -262,6 +262,16 @@ impl<'a> SendStream<'a> {
     /// the chunk will be advanced and contain only non-written data after the call.
     pub fn write_chunks(&mut self, data: &mut &mut [Bytes]) -> Result<usize, WriteError> {
         let written = self.write_source(&mut BytesArray::from_chunks(data))?;
+        *data = &mut std::mem::take(data)[written.chunks..];
+        Ok(written.bytes)
+    }
+
+    /// Send data on the given stream without copying it
+    ///
+    /// Like [`Self::write_chunks`], but the send buffer keeps each chunk until it is acknowledged
+    /// and charges its length, so the caller must already account for the chunk's backing.
+    pub fn write_leased_chunks(&mut self, data: &mut &mut [Bytes]) -> Result<usize, WriteError> {
+        let written = self.write_source(&mut LeasedArray(BytesArray::from_chunks(data)))?;
         *data = &mut std::mem::take(data)[written.chunks..];
         Ok(written.bytes)
     }
@@ -730,6 +740,13 @@ pub(super) trait BytesOrSlice<'a>: AsRef<[u8]> + 'a {
     }
     fn is_empty(&self) -> bool {
         self.as_ref().is_empty()
+    }
+    /// The chunk itself, if it is to be kept without a copy
+    fn leased(self) -> Result<Bytes, Self>
+    where
+        Self: Sized,
+    {
+        Err(self)
     }
 }
 

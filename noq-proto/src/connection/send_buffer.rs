@@ -35,6 +35,34 @@ pub(super) struct SendBuffer {
     retransmits: ChargedRanges,
 }
 
+/// Application bytes to keep without a copy
+pub(super) struct Leased(pub(super) Bytes);
+
+impl AsRef<[u8]> for Leased {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl BytesOrSlice<'_> for Leased {
+    fn leased(self) -> Result<Bytes, Self> {
+        Ok(self.0)
+    }
+}
+
+/// A leased chunk, charged like a copied block until its segment is dropped
+#[derive(Debug)]
+struct LeasedBacking {
+    bytes: Bytes,
+    _allocation: Allocation,
+}
+
+impl AsRef<[u8]> for LeasedBacking {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// Maximum number of bytes to combine into a single segment
 ///
 /// Larger segments use independently owned backing.
@@ -163,7 +191,7 @@ impl SendBufferData {
         Ok((length, allocation))
     }
 
-    fn append<'a>(&'a mut self, data: impl BytesOrSlice<'a>, allocation: Allocation) {
+    fn append<'a>(&'a mut self, data: impl BytesOrSlice<'a>, mut allocation: Allocation) {
         if data.is_empty() {
             return;
         }
@@ -172,6 +200,21 @@ impl SendBufferData {
             last.bytes.extend_from_slice(data.as_ref());
             return;
         }
+        let data = match data.leased() {
+            Ok(bytes) => {
+                allocation
+                    .resize(bytes.len() + OwnedBacking::OVERHEAD_BYTES)
+                    .expect("leased chunk was reserved");
+                let backing = LeasedBacking {
+                    bytes,
+                    _allocation: allocation,
+                };
+                self.segments
+                    .push_back((self.range().end, Bytes::from_owner(backing)));
+                return;
+            }
+            Err(data) => data,
+        };
         let capacity = if data.len() <= MAX_COMBINE {
             MAX_COMBINE.min(allocation.bytes - OwnedBacking::OVERHEAD_BYTES)
         } else {
@@ -711,6 +754,21 @@ mod tests {
         buf.write(source.slice(0..4000));
         buf.truncate(0);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn leased_chunk_stays_uncopied_and_charged_until_acknowledged() {
+        let budget = BufferBudget::new(u64::MAX, None);
+        let mut buf = SendBuffer::new(budget.clone());
+        let block = Bytes::from(vec![0x5a; 64 * 1024]);
+        let (length, allocation) = buf.prepare_write(block.len()).unwrap();
+        buf.write_reserved(Leased(block.slice(..length)), allocation);
+        assert_eq!(buf.get(0..length as u64).as_ptr(), block.as_ptr());
+        assert!(budget.used() >= length + OwnedBacking::OVERHEAD_BYTES);
+        buf.poll_transmit(length + 16);
+        buf.ack(0..length as u64).unwrap();
+        assert_eq!(budget.used(), 0);
+        assert!(block.is_unique());
     }
 
     #[test]

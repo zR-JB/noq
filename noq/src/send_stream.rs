@@ -104,6 +104,19 @@ impl SendStream {
         poll_fn(|cx| self.execute_poll(cx, |s| s.write_chunks(bufs))).await
     }
 
+    /// Like [`write_many_chunks`](Self::write_many_chunks), but keeps the chunks uncopied until
+    /// acknowledged, charged by length: the caller accounts for their backing allocations.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancellation safe. If this does not resolve, no bytes were written.
+    pub async fn write_leased_chunks(
+        &mut self,
+        bufs: &mut &mut [Bytes],
+    ) -> Result<usize, WriteError> {
+        poll_fn(|cx| self.execute_poll(cx, |s| s.write_leased_chunks(bufs))).await
+    }
+
     /// Writes a single [`Bytes`] into this stream in its entirety.
     ///
     /// Bytes to write are provided to this method as a single cheaply cloneable chunk. This
