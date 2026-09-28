@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 mod bbr3;
 mod cubic;
+mod hystart;
 mod new_reno;
 
 pub use bbr3::{Bbr3, Bbr3Config};

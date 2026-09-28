@@ -2,6 +2,7 @@ use std::any::Any;
 use std::cmp;
 use std::sync::Arc;
 
+use super::hystart::HyStart;
 use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant};
@@ -33,13 +34,14 @@ pub(super) struct State {
 
     /// Slow start threshold in bytes.
     ///
-    /// When the congestion window is below ssthresh, the mode is slow start
-    /// and the window grows by the number of bytes acknowledged.
+    /// When the congestion window is below ssthresh, the mode is slow start.
     ssthresh: u64,
 
     /// The time when QUIC first detects a loss, causing it to enter recovery. When a packet sent
     /// after this time is acknowledged, QUIC exits recovery.
     recovery_start_time: Option<Instant>,
+
+    hystart: HyStart,
 }
 
 /// CUBIC Functions.
@@ -122,8 +124,7 @@ impl Controller for Cubic {
         }
 
         if self.state.window < self.state.ssthresh {
-            // Slow start
-            self.state.window += bytes;
+            self.state.window += self.state.hystart.on_ack(self.state.ssthresh, sent, bytes);
         } else {
             // Congestion avoidance.
             let ca_start_time;
@@ -178,6 +179,18 @@ impl Controller for Cubic {
                 self.state.window += self.current_mtu;
                 self.state.cwnd_inc -= self.current_mtu;
             }
+        }
+    }
+
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        _in_flight: u64,
+        _app_limited: bool,
+        _largest_packet_num_acked: Option<u64>,
+    ) {
+        if self.state.hystart.on_end_acks(now) {
+            self.state.ssthresh = self.state.window;
         }
     }
 

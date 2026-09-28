@@ -5397,6 +5397,53 @@ fn throughput() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn slow_start_ends_on_queueing_delay_without_loss() -> TestResult {
+    let factories: [Arc<dyn ControllerFactory + Send + Sync>; 2] = [
+        Arc::new(crate::congestion::CubicConfig::default()),
+        Arc::new(crate::congestion::NewRenoConfig::default()),
+    ];
+    for factory in factories {
+        for (bytes_per_second, ends) in [(2_000_000, true), (1_000_000_000, false)] {
+            let mut transport = TransportConfig::default();
+            transport.congestion_controller_factory(factory.clone());
+            let mut pair = ConnPair::builder()
+                .with_transport_cfg(transport)
+                .with_routes(BwLimitedRouting::new(
+                    Pair::CLIENT_ADDR,
+                    Pair::SERVER_ADDR,
+                    Instant::now(),
+                    BwLimitConfig {
+                        bytes_per_second,
+                        buffer_size: u32::MAX,
+                        latency: Duration::from_millis(10),
+                    },
+                ))
+                .connect();
+            let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+            let mut remaining = 4 * 1024 * 1024;
+            let mut received = 0;
+            let mut accepted = false;
+            let ssthresh = loop {
+                send_bytes(pair.send_stream(Client, stream), &mut remaining)?;
+                accepted |= pair.streams(Server).accept(Dir::Uni).is_some();
+                if accepted {
+                    recv_bytes(pair.recv_stream(Server, stream), &mut received);
+                }
+                let controller = pair.congestion_state(Client, PathId::ZERO).unwrap();
+                let ssthresh = controller.metrics().ssthresh.unwrap();
+                if ssthresh != u64::MAX || !pair.step() {
+                    break ssthresh;
+                }
+            };
+            assert_eq!(ssthresh != u64::MAX, ends, "{bytes_per_second} B/s");
+            let stats = pair.path_stats(Client, PathId::ZERO).unwrap();
+            assert_eq!((stats.lost_packets, stats.congestion_events), (0, 0));
+        }
+    }
+    Ok(())
+}
+
 const ZEROES: [u8; 10_000] = [0u8; 10_000];
 
 fn send_bytes(mut send_stream: crate::SendStream<'_>, bytes_to_send: &mut usize) -> TestResult {

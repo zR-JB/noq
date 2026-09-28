@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use super::hystart::HyStart;
 use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
 use crate::Instant;
 use crate::connection::RttEstimator;
@@ -13,13 +14,14 @@ pub struct NewReno {
     /// Maximum number of bytes in flight that may be sent.
     window: u64,
     /// Slow start threshold in bytes. When the congestion window is below ssthresh, the mode is
-    /// slow start and the window grows by the number of bytes acknowledged.
+    /// slow start.
     ssthresh: u64,
     /// The time when QUIC first detects a loss, causing it to enter recovery. When a packet sent
     /// after this time is acknowledged, QUIC exits recovery.
     recovery_start_time: Instant,
     /// Bytes which had been acked by the peer since leaving slow start
     bytes_acked: u64,
+    hystart: HyStart,
 }
 
 impl NewReno {
@@ -32,6 +34,7 @@ impl NewReno {
             current_mtu: current_mtu as u64,
             config,
             bytes_acked: 0,
+            hystart: HyStart::default(),
         }
     }
 
@@ -55,11 +58,9 @@ impl Controller for NewReno {
         }
 
         if self.window < self.ssthresh {
-            // Slow start
-            self.window += bytes;
+            self.window += self.hystart.on_ack(self.ssthresh, sent, bytes);
 
             if self.window >= self.ssthresh {
-                // Exiting slow start
                 // Initialize `bytes_acked` for congestion avoidance. The idea
                 // here is that any bytes over `sshthresh` will already be counted
                 // towards the congestion avoidance phase - independent of when
@@ -80,6 +81,18 @@ impl Controller for NewReno {
                 self.bytes_acked -= self.window;
                 self.window += self.current_mtu;
             }
+        }
+    }
+
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        _in_flight: u64,
+        _app_limited: bool,
+        _largest_packet_num_acked: Option<u64>,
+    ) {
+        if self.hystart.on_end_acks(now) {
+            self.ssthresh = self.window;
         }
     }
 
