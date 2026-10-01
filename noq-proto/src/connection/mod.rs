@@ -1533,12 +1533,20 @@ impl Connection {
                 .filter(|space| !space.pending_acks.ranges().is_empty())
                 .count()
                 .saturating_mul(packet_map::btree_entry_lease::<PathId, u64>());
-            let allocation = self.spaces[space_id]
-                .for_path(path_id)
-                .sent_packets
-                .reserve_entry()
-                .and_then(|()| self.packet_budget.acquire(ack_metadata_bytes))
-                .ok();
+            let reserve = |conn: &mut Self| {
+                conn.spaces[space_id]
+                    .for_path(path_id)
+                    .sent_packets
+                    .reserve_entry()
+                    .and_then(|()| conn.packet_budget.acquire(ack_metadata_bytes))
+                    .ok()
+            };
+            let mut allocation = reserve(self);
+            // A connection unable to send cannot detect another loss to retire these records.
+            if allocation.is_none() && !self.spaces[space_id].for_path(path_id).lost_packets.is_empty() {
+                self.drain_lost_packets(now, space_id, path_id);
+                allocation = reserve(self);
+            }
             let mut allocation = allocation.filter(|_| {
                 let pending = !self.spaces[space_id].pending.is_empty(&self.streams)
                     || space_id == SpaceId::Data && self.streams.can_send_control();
