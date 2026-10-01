@@ -2032,11 +2032,10 @@ pub enum SendDatagramError {
 ///
 /// This limits the amount of CPU resources consumed by datagram generation,
 /// and allows other tasks (like receiving ACKs) to run in between.
-const MAX_TRANSMIT_DATAGRAMS: usize = 20;
+const MAX_TRANSMIT_DATAGRAMS: usize = 64;
 
 /// The maximum amount of datagrams that are sent in a single transmit
 ///
-/// This can be lower than the maximum platform capabilities, to avoid excessive
-/// memory allocations when calling `poll_transmit()`. Benchmarks have shown
-/// that numbers around 10 are a good compromise.
-const MAX_TRANSMIT_SEGMENTS: NonZeroUsize = NonZeroUsize::new(10).expect("known");
+/// This bounds the buffer filled by `poll_transmit()` while batching fast sends.
+/// The drive limit above still yields between batches for receives and other tasks.
+const MAX_TRANSMIT_SEGMENTS: NonZeroUsize = NonZeroUsize::new(32).expect("known");
