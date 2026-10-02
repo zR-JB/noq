@@ -4644,6 +4644,10 @@ impl Connection {
             match conn_err {
                 ConnectionError::ApplicationClosed(reason) => self.state.move_to_closed(reason),
                 ConnectionError::ConnectionClosed(reason) => self.state.move_to_closed(reason),
+                // A reset only ends the draining period; the peer's close reason stands.
+                ConnectionError::Reset if matches!(self.state.as_type(), StateType::Draining) => {
+                    self.state.move_to_drained(None, &mut self.endpoint_events);
+                }
                 ConnectionError::Reset
                 | ConnectionError::TransportError(TransportError {
                     code: TransportErrorCode::AEAD_LIMIT_REACHED,
