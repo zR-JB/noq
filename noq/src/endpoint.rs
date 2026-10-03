@@ -977,6 +977,7 @@ struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
     recv_buf: Box<[u8]>,
+    metas: [RecvMeta; BATCH_SIZE],
     pending: Option<PendingRecv>,
     receive_current_next: bool,
     recv_limiter: WorkLimiter,
@@ -985,7 +986,6 @@ struct RecvState {
 /// Received bytes remain in recv_buf until every GRO segment has been handled.
 /// The origin and receive timestamp survive yielding and subsequent rebinding.
 struct PendingRecv {
-    metas: [RecvMeta; BATCH_SIZE],
     messages: usize,
     message: usize,
     offset: usize,
@@ -994,9 +994,13 @@ struct PendingRecv {
 }
 
 impl PendingRecv {
-    fn peek(&mut self, slot_len: usize) -> Option<(std::ops::Range<usize>, RecvMeta)> {
+    fn peek<'m>(
+        &mut self,
+        metas: &'m [RecvMeta],
+        slot_len: usize,
+    ) -> Option<(std::ops::Range<usize>, &'m RecvMeta)> {
         while self.message < self.messages {
-            let meta = self.metas[self.message];
+            let meta = &metas[self.message];
             assert!(meta.len <= slot_len, "received descriptor exceeds its slot");
             if self.offset < meta.len {
                 let start = self.message * slot_len + self.offset;
@@ -1035,6 +1039,7 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
+            metas: [RecvMeta::default(); BATCH_SIZE],
             pending: None,
             receive_current_next: false,
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
@@ -1049,7 +1054,6 @@ impl RecvState {
         current_socket: bool,
     ) -> Poll<io::Result<()>> {
         debug_assert!(self.pending.is_none());
-        let mut metas = [RecvMeta::default(); BATCH_SIZE];
         let mut iovs: [IoSliceMut<'_>; BATCH_SIZE] = {
             let mut bufs = self
                 .recv_buf
@@ -1057,11 +1061,12 @@ impl RecvState {
                 .map(IoSliceMut::new);
             std::array::from_fn(|_| bufs.next().expect("BATCH_SIZE elements"))
         };
-        match socket.poll_recv(cx, &mut iovs, &mut metas) {
+        match socket.poll_recv(cx, &mut iovs, &mut self.metas) {
             Poll::Ready(Ok(messages)) => {
                 // Empty descriptors can result from shard forwarding. Account for their
                 // overhead so a non-Tokio socket cannot bypass the historic time limiter.
-                let empty = metas
+                let empty = self
+                    .metas
                     .iter()
                     .take(messages)
                     .filter(|meta| meta.len == 0)
@@ -1069,7 +1074,6 @@ impl RecvState {
                 self.recv_limiter
                     .record_work(empty.max(usize::from(messages == 0)));
                 self.pending = Some(PendingRecv {
-                    metas,
                     messages,
                     message: 0,
                     offset: 0,
@@ -1094,7 +1098,8 @@ impl RecvState {
         let _ = cx;
         let mut progress = PollProgress::default();
         while let Some(batch) = &mut self.pending {
-            let Some((range, meta)) = batch.peek(self.recv_buf.len() / BATCH_SIZE) else {
+            let Some((range, meta)) = batch.peek(&self.metas, self.recv_buf.len() / BATCH_SIZE)
+            else {
                 self.pending = None;
                 break;
             };
@@ -1216,8 +1221,12 @@ mod packet_queue_tests {
         }
     }
 
-    fn pending(bytes: usize, stride: usize, now: Instant) -> PendingRecv {
-        let mut metas = [RecvMeta::default(); BATCH_SIZE];
+    fn pending(
+        metas: &mut [RecvMeta; BATCH_SIZE],
+        bytes: usize,
+        stride: usize,
+        now: Instant,
+    ) -> PendingRecv {
         metas[0].len = bytes;
         metas[0].stride = stride;
         metas[0].addr = "127.0.0.1:9000".parse().unwrap();
@@ -1226,7 +1235,6 @@ mod packet_queue_tests {
         metas[0].interface_index = Some(7);
         metas[0].timestamp = Some(std::time::Duration::from_secs(3));
         PendingRecv {
-            metas,
             messages: 1,
             message: 0,
             offset: 0,
@@ -1238,12 +1246,13 @@ mod packet_queue_tests {
     #[test]
     fn interrupted_gro_cursor_preserves_order_and_metadata() {
         let now = Instant::now();
-        let mut batch = pending(5, 2, now);
+        let mut metas = [RecvMeta::default(); BATCH_SIZE];
+        let mut batch = pending(&mut metas, 5, 2, now);
         let bytes = [1, 2, 3, 4, 5];
         let mut received = Vec::new();
-        while let Some((range, meta)) = batch.peek(bytes.len()) {
+        while let Some((range, meta)) = batch.peek(&metas, bytes.len()) {
             // A failed checkpoint can peek repeatedly without consuming any bytes.
-            assert_eq!(batch.peek(bytes.len()).unwrap().0, range);
+            assert_eq!(batch.peek(&metas, bytes.len()).unwrap().0, range);
             assert_eq!(meta.addr, "127.0.0.1:9000".parse().unwrap());
             assert_eq!(meta.dst_ip, Some("127.0.0.2".parse().unwrap()));
             assert_eq!(meta.ecn, Some(udp::EcnCodepoint::Ce));
@@ -1254,7 +1263,7 @@ mod packet_queue_tests {
             batch.advance(range.len());
         }
         assert_eq!(received, [vec![1, 2], vec![3, 4], vec![5]]);
-        assert!(batch.peek(bytes.len()).is_none());
+        assert!(batch.peek(&metas, bytes.len()).is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1283,7 +1292,7 @@ mod packet_queue_tests {
                 let mut state = endpoint.inner.state.lock().unwrap();
                 let now = state.runtime.now();
                 state.recv_state.recv_buf[..5].copy_from_slice(&[1, 2, 3, 4, 5]);
-                state.recv_state.pending = Some(pending(5, 2, now));
+                state.recv_state.pending = Some(pending(&mut state.recv_state.metas, 5, 2, now));
                 state.recv_state.recv_limiter.start_cycle(|| now);
                 let State {
                     recv_state,
@@ -1395,7 +1404,12 @@ mod packet_queue_tests {
                     runtime.clone(),
                 );
                 state.recv_state.recv_buf[..packet.len()].copy_from_slice(&packet);
-                state.recv_state.pending = Some(pending(packet.len(), packet.len(), now));
+                state.recv_state.pending = Some(pending(
+                    &mut state.recv_state.metas,
+                    packet.len(),
+                    packet.len(),
+                    now,
+                ));
                 (packet, connecting)
             };
             let polls = Arc::new(AtomicUsize::new(0));
@@ -1432,7 +1446,12 @@ mod packet_queue_tests {
                     "old packet must still reach its connection"
                 );
                 state.recv_state.recv_buf[..packet.len()].copy_from_slice(&packet);
-                state.recv_state.pending = Some(pending(packet.len(), packet.len(), now));
+                state.recv_state.pending = Some(pending(
+                    &mut state.recv_state.metas,
+                    packet.len(),
+                    packet.len(),
+                    now,
+                ));
                 assert!(!state.drive_recv(cx, now).unwrap());
                 assert!(
                     state.prev_socket.is_none(),
