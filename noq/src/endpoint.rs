@@ -1377,7 +1377,7 @@ mod packet_queue_tests {
                     .connect(now, config, remote, "localhost")
                     .unwrap();
                 let mut initial = Vec::new();
-                connection
+                let _ = connection
                     .poll_transmit(now, NonZeroUsize::MIN, &mut initial)
                     .unwrap();
                 // The Initial source CID identifies this connection's local route.
