@@ -260,6 +260,11 @@ impl OwnedBacking {
         }
     }
 
+    /// Bytes held by the backing and its `Bytes::from_owner` owner allocation.
+    pub(super) fn allocation_size(&self) -> usize {
+        self._allocation.bytes
+    }
+
     pub(super) fn finish(self) -> Bytes {
         Bytes::from_owner(self)
     }

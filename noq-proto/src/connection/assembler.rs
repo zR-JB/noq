@@ -14,6 +14,9 @@ use super::buffer_budget::{
 };
 
 use super::buffer_budget::COPY_BLOCK_BYTES;
+
+/// Keep only the minimum, fully charged heap between reads on a live stream.
+const REUSABLE_BUFFER_CAPACITY: usize = 4;
 /// Helper to assemble unordered stream frames into an ordered stream
 #[derive(Debug)]
 pub(super) struct Assembler {
@@ -48,7 +51,9 @@ impl Assembler {
         if count <= self.data.capacity() {
             return Ok(());
         }
-        let capacity = count.max(self.data.capacity().saturating_mul(2)).max(4);
+        let capacity = count
+            .max(self.data.capacity().saturating_mul(2))
+            .max(REUSABLE_BUFFER_CAPACITY);
         let mut allocation = self.allocation.budget.acquire(
             capacity
                 .checked_mul(mem::size_of::<Buffer>())
@@ -156,7 +161,9 @@ impl Assembler {
             if let State::Unordered { delivered, .. } = &mut self.state {
                 delivered.insert(chunk.offset..chunk.offset + chunk.bytes.len() as u64);
             }
-            if self.data.is_empty() {
+            // A small stream commonly drains between packets. Reuse its charged metadata,
+            // but release larger heaps rather than retaining their high-water capacity.
+            if self.data.is_empty() && self.data.capacity() > REUSABLE_BUFFER_CAPACITY {
                 self.data = BinaryHeap::new();
                 self.allocation
                     .resize(0)
@@ -249,8 +256,8 @@ impl Assembler {
         Ok(())
     }
 
-    // Note: If a packet contains many frames from the same stream, the estimated over-allocation
-    // will be much higher because we are counting the same allocation multiple times.
+    // The incoming packet size bounds the frame, but each inserted frame gets its own charged
+    // backing. Slices of that backing can still conservatively count its footprint more than once.
     pub(super) fn insert(
         &mut self,
         mut offset: u64,
@@ -288,6 +295,7 @@ impl Assembler {
         }
         let mut backing = OwnedBacking::new(bytes.len(), &self.allocation.budget)?;
         backing.bytes.extend_from_slice(&bytes);
+        let allocation_size = backing.allocation_size();
         bytes = backing.finish();
         self.end = self.end.max(offset + bytes.len() as u64);
         if let State::Unordered { ref mut recvd, .. } = self.state {
@@ -410,7 +418,7 @@ impl Chunk {
 struct Buffer {
     offset: u64,
     bytes: Bytes,
-    /// Size of the allocation behind `bytes`, if `defragmented == false`.
+    /// Charged backing footprint, including its owner, if `defragmented == false`.
     /// Otherwise this will be set to `bytes.len()` by `try_mark_defragment`.
     /// Will never be less than `bytes.len()`.
     allocation_size: usize,
@@ -521,6 +529,116 @@ mod test {
     use super::*;
     use assert_matches::assert_matches;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn copied_backing_estimate_excludes_discarded_packet_storage() {
+        let budget = BufferBudget::for_receive(1024 * 1024, None);
+        let mut assembler = Assembler::new(budget.clone());
+        // Several frames can share a much larger packet before each gets copied.
+        for frame in 0..40 {
+            assembler
+                .insert(frame * 1024, Bytes::from(vec![7; 1024]), 65535)
+                .unwrap();
+        }
+        // No artificial fragmentation or compaction from the discarded packet allocation.
+        assert_eq!(assembler.data.len(), 40);
+        assert_eq!(assembler.allocated, 40 * (1024 + OwnedBacking::OVERHEAD_BYTES));
+        for frame in 0..40 {
+            let chunk = assembler.read(usize::MAX, true).unwrap();
+            assert_eq!(chunk.offset, frame * 1024);
+            assert_eq!(chunk.bytes.as_ref(), &[7; 1024]);
+        }
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn tiny_owned_backings_still_trigger_compaction() {
+        let budget = BufferBudget::for_receive(1024 * 1024, None);
+        let mut assembler = Assembler::new(budget.clone());
+        for offset in 0..700 {
+            assembler.insert(offset, Bytes::from_static(b"a"), 1).unwrap();
+        }
+        // Capacity alone would miss the owner overhead of hundreds of one-byte frames.
+        assert!(assembler.data.len() < 700);
+        assert!(assembler.data.iter().any(|buffer| buffer.bytes.len() > 1));
+        let mut delivered = 0;
+        while let Some(chunk) = assembler.read(usize::MAX, true) {
+            assert_eq!(chunk.offset, delivered);
+            assert!(chunk.bytes.iter().all(|&byte| byte == b'a'));
+            delivered += chunk.bytes.len() as u64;
+        }
+        assert_eq!(delivered, 700);
+        assembler.clear();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn small_heap_reuses_charged_storage_and_clear_refunds_it() {
+        let budget = BufferBudget::for_receive(1, None);
+        let mut assembler = Assembler::new(budget.clone());
+        assembler.insert(0, Bytes::from_static(b"a"), 1).unwrap();
+        let capacity = assembler.data.capacity();
+        let storage = assembler.data.as_slice().as_ptr();
+        assert!(capacity <= REUSABLE_BUFFER_CAPACITY);
+        let retained = capacity * mem::size_of::<Buffer>();
+
+        for offset in 0..3 {
+            if offset != 0 {
+                assembler.insert(offset, Bytes::from_static(b"a"), 1).unwrap();
+            }
+            let chunk = assembler.read(usize::MAX, true).unwrap();
+            assert_eq!(chunk.offset, offset);
+            assert_eq!(chunk.bytes.as_ref(), b"a");
+            drop(chunk);
+            assert!(assembler.data.is_empty());
+            assert_eq!(assembler.data.as_slice().as_ptr(), storage);
+            assert_eq!(budget.used(), retained);
+        }
+
+        // Retained metadata remains charged: exhaustion still refuses new backing.
+        let remaining = budget.acquire(budget.available()).unwrap();
+        assert!(assembler.insert(3, Bytes::from_static(b"b"), 1).is_err());
+        assert!(assembler.data.is_empty());
+        assert_eq!(assembler.data.as_slice().as_ptr(), storage);
+        drop(remaining);
+        assembler.insert(3, Bytes::from_static(b"b"), 1).unwrap();
+        let delivered = assembler.read(usize::MAX, true).unwrap();
+        assembler.clear();
+        assert_eq!(assembler.data.capacity(), 0);
+        assert_eq!(budget.used(), 1 + OwnedBacking::OVERHEAD_BYTES);
+        drop(delivered);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn drained_large_heap_releases_storage() {
+        let budget = BufferBudget::for_receive(1, None);
+        let mut assembler = Assembler::new(budget.clone());
+        for offset in 0..5 {
+            assembler.insert(offset, Bytes::from_static(b"a"), 1).unwrap();
+        }
+        assert!(assembler.data.capacity() > REUSABLE_BUFFER_CAPACITY);
+        for offset in 0..5 {
+            let chunk = assembler.read(usize::MAX, true).unwrap();
+            assert_eq!(chunk.offset, offset);
+            assert_eq!(chunk.bytes.as_ref(), b"a");
+        }
+        assert_eq!(assembler.data.capacity(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn stream_drop_refunds_reused_metadata_but_not_delivered_backing() {
+        let budget = BufferBudget::for_receive(1, None);
+        let mut assembler = Assembler::new(budget.clone());
+        assembler.insert(0, Bytes::from_static(b"a"), 1).unwrap();
+        let delivered = assembler.read(usize::MAX, true).unwrap();
+        assert!(assembler.allocation.bytes != 0);
+        drop(assembler);
+        assert_eq!(budget.used(), 1 + OwnedBacking::OVERHEAD_BYTES);
+        drop(delivered);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn defragment_releases_large_backing_before_partial_reads() {
