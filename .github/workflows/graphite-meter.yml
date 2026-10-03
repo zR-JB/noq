@@ -18,4 +18,5 @@ jobs:
       - run: cargo test --locked -p noq-proto --lib --tests
       - run: cargo test --locked -p noq --lib --tests
       - run: cargo check --locked -p noq-proto --no-default-features --features rustls-aws-lc-rs
+      - run: cargo check --locked -p noq --no-default-features --features runtime-smol,rustls,ring
       - run: cargo clippy --locked --workspace --exclude fuzz --all-features --all-targets -- -D warnings
