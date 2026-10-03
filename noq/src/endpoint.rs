@@ -281,6 +281,10 @@ impl Endpoint {
         let addr = socket.local_addr()?;
         let mut inner = self.inner.state.lock().unwrap();
         inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
+        if let Some(batch) = &mut inner.recv_state.pending {
+            batch.current_socket = false;
+        }
+        inner.recv_state.receive_current_next = true;
         inner.ipv6 = addr.is_ipv6();
 
         // Update connection socket references
@@ -499,6 +503,7 @@ impl Drop for EndpointDriver {
         // connections.
         endpoint.recv_state.connections.senders.clear();
         endpoint.recv_state.connections.active_connections = 0;
+        endpoint.recv_state.pending = None;
     }
 }
 
@@ -602,36 +607,70 @@ impl State {
     fn drive_recv(&mut self, cx: &mut Context<'_>, now: Instant) -> Result<bool, io::Error> {
         let get_time = || self.runtime.now();
         self.recv_state.recv_limiter.start_cycle(get_time);
-        if let Some(socket) = &mut self.prev_socket {
-            // We don't care about the `PollProgress` from old sockets.
-            let poll_res = self.recv_state.poll_socket(
-                cx,
-                &mut self.inner,
-                &mut **socket,
-                &mut self.sender,
-                &*self.runtime,
-                now,
-            );
-            if poll_res.is_err() {
-                self.prev_socket = None;
+        let result = (|| -> Result<PollProgress, io::Error> {
+            let mut progress = PollProgress::default();
+            let mut previous_pending = self.prev_socket.is_none();
+            let mut current_pending = false;
+            loop {
+                let batch = self.recv_state.process_pending(
+                    cx,
+                    &mut self.inner,
+                    &mut self.sender,
+                    &*self.runtime,
+                );
+                progress.received_connection_packet |= batch.received_connection_packet;
+                if batch.keep_going || !self.recv_state.recv_limiter.allow_work(get_time) {
+                    progress.keep_going = true;
+                    break;
+                }
+                if previous_pending && current_pending {
+                    break;
+                }
+
+                // A retained previous-socket batch must finish before scratch is reused.
+                // Give the other socket the next read, even across endpoint polls.
+                let current =
+                    previous_pending || (!current_pending && self.recv_state.receive_current_next);
+                let socket = if current {
+                    &mut self.socket
+                } else {
+                    self.prev_socket
+                        .as_mut()
+                        .expect("previous socket available")
+                };
+                match self.recv_state.poll_recv(cx, &mut **socket, now, current) {
+                    Poll::Ready(Ok(())) => {
+                        self.recv_state.receive_current_next = !current;
+                    }
+                    Poll::Pending => {
+                        if current {
+                            current_pending = true;
+                        } else {
+                            previous_pending = true;
+                        }
+                    }
+                    Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
+                        self.recv_state.recv_limiter.record_work(1);
+                    }
+                    Poll::Ready(Err(e)) => {
+                        if current {
+                            return Err(e);
+                        }
+                        self.prev_socket = None;
+                        previous_pending = true;
+                    }
+                }
             }
-        };
-        let poll_res = self.recv_state.poll_socket(
-            cx,
-            &mut self.inner,
-            &mut *self.socket,
-            &mut self.sender,
-            &*self.runtime,
-            now,
-        );
+            Ok(progress)
+        })();
         self.recv_state.recv_limiter.finish_cycle(get_time);
-        let poll_res = poll_res?;
-        if poll_res.received_connection_packet {
-            // Traffic has arrived on self.socket, therefore there is no need for the abandoned
-            // one anymore. TODO: Account for multiple outgoing connections.
+        let progress = result?;
+        if progress.received_connection_packet {
+            // Only traffic received on the current socket retires the previous socket.
+            // Buffered traffic is marked previous if a rebind happens while it is pending.
             self.prev_socket = None;
         }
-        Ok(poll_res.keep_going)
+        Ok(progress.keep_going)
     }
 
     fn handle_events(&mut self, cx: &mut Context<'_>, shared: &Shared) -> bool {
@@ -938,7 +977,41 @@ struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
     recv_buf: Box<[u8]>,
+    pending: Option<PendingRecv>,
+    receive_current_next: bool,
     recv_limiter: WorkLimiter,
+}
+
+/// Received bytes remain in recv_buf until every GRO segment has been handled.
+/// The origin and receive timestamp survive yielding and subsequent rebinding.
+struct PendingRecv {
+    metas: [RecvMeta; BATCH_SIZE],
+    messages: usize,
+    message: usize,
+    offset: usize,
+    now: Instant,
+    current_socket: bool,
+}
+
+impl PendingRecv {
+    fn peek(&mut self, slot_len: usize) -> Option<(std::ops::Range<usize>, RecvMeta)> {
+        while self.message < self.messages {
+            let meta = self.metas[self.message];
+            assert!(meta.len <= slot_len, "received descriptor exceeds its slot");
+            if self.offset < meta.len {
+                let start = self.message * slot_len + self.offset;
+                let len = (meta.len - self.offset).min(meta.stride.max(1));
+                return Some((start..start + len, meta));
+            }
+            self.message += 1;
+            self.offset = 0;
+        }
+        None
+    }
+
+    fn advance(&mut self, len: usize) {
+        self.offset += len;
+    }
 }
 
 impl RecvState {
@@ -962,97 +1035,120 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
+            pending: None,
+            receive_current_next: false,
             recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
 
-    fn poll_socket(
+    fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
-        endpoint: &mut proto::Endpoint,
         socket: &mut dyn AsyncUdpSocket,
-        sender: &mut Pin<Box<dyn UdpSender>>,
-        runtime: &dyn Runtime,
         now: Instant,
-    ) -> Result<PollProgress, io::Error> {
-        let mut received_connection_packet = false;
+        current_socket: bool,
+    ) -> Poll<io::Result<()>> {
+        debug_assert!(self.pending.is_none());
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
         let mut iovs: [IoSliceMut<'_>; BATCH_SIZE] = {
             let mut bufs = self
                 .recv_buf
                 .chunks_mut(self.recv_buf.len() / BATCH_SIZE)
                 .map(IoSliceMut::new);
-
-            // expect() safe as self.recv_buf is chunked into BATCH_SIZE items
-            // and iovs will be of size BATCH_SIZE, thus from_fn is called
-            // exactly BATCH_SIZE times.
             std::array::from_fn(|_| bufs.next().expect("BATCH_SIZE elements"))
         };
-        loop {
-            match socket.poll_recv(cx, &mut iovs, &mut metas) {
-                Poll::Ready(Ok(msgs)) => {
-                    self.recv_limiter.record_work(msgs);
-                    for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-                        for data in buf[..meta.len].chunks(meta.stride.max(1)) {
-                            let buf = BytesMut::from(data);
-                            let mut response_buffer = Vec::new();
-                            let addresses = FourTuple::new(meta.addr, meta.dst_ip);
-                            match endpoint.handle(
-                                now,
-                                addresses,
-                                meta.ecn.map(proto_ecn),
-                                buf,
-                                &mut response_buffer,
-                            ) {
-                                Some(DatagramEvent::NewConnection(incoming)) => {
-                                    if self.connections.close.is_none() {
-                                        self.incoming.push_back(incoming);
-                                    } else {
-                                        let transmit =
-                                            endpoint.refuse(incoming, &mut response_buffer);
-                                        respond(transmit, &response_buffer, sender);
-                                    }
-                                }
-                                Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-                                    // Ignoring errors from dropped connections that haven't yet
-                                    // been cleaned up
-                                    received_connection_packet = true;
-                                    self.connections
-                                        .senders
-                                        .get_mut(&handle)
-                                        .unwrap()
-                                        .send_proto(event);
-                                }
-                                Some(DatagramEvent::Response(transmit)) => {
-                                    respond(transmit, &response_buffer, sender);
-                                }
-                                None => {}
-                            }
-                        }
+        match socket.poll_recv(cx, &mut iovs, &mut metas) {
+            Poll::Ready(Ok(messages)) => {
+                // Empty descriptors can result from shard forwarding. Account for their
+                // overhead so a non-Tokio socket cannot bypass the historic time limiter.
+                let empty = metas
+                    .iter()
+                    .take(messages)
+                    .filter(|meta| meta.len == 0)
+                    .count();
+                self.recv_limiter
+                    .record_work(empty.max(usize::from(messages == 0)));
+                self.pending = Some(PendingRecv {
+                    metas,
+                    messages,
+                    message: 0,
+                    offset: 0,
+                    now,
+                    current_socket,
+                });
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn process_pending(
+        &mut self,
+        cx: &mut Context<'_>,
+        endpoint: &mut proto::Endpoint,
+        sender: &mut Pin<Box<dyn UdpSender>>,
+        runtime: &dyn Runtime,
+    ) -> PollProgress {
+        #[cfg(not(feature = "runtime-tokio"))]
+        let _ = cx;
+        let mut progress = PollProgress::default();
+        while let Some(batch) = &mut self.pending {
+            let Some((range, meta)) = batch.peek(self.recv_buf.len() / BATCH_SIZE) else {
+                self.pending = None;
+                break;
+            };
+            // Checkpoint before copying, advancing the cursor, or mutating the endpoint.
+            // Outside Tokio's scheduler this is unconstrained; the time limiter remains.
+            #[cfg(feature = "runtime-tokio")]
+            let coop = match tokio::task::coop::poll_proceed(cx) {
+                Poll::Ready(coop) => coop,
+                Poll::Pending => {
+                    progress.keep_going = true;
+                    break;
+                }
+            };
+            let bytes = BytesMut::from(&self.recv_buf[range.clone()]);
+            batch.advance(range.len());
+            let mut response_buffer = Vec::new();
+            let addresses = FourTuple::new(meta.addr, meta.dst_ip);
+            match endpoint.handle(
+                batch.now,
+                addresses,
+                meta.ecn.map(proto_ecn),
+                bytes,
+                &mut response_buffer,
+            ) {
+                Some(DatagramEvent::NewConnection(incoming)) => {
+                    if self.connections.close.is_none() {
+                        self.incoming.push_back(incoming);
+                    } else {
+                        let transmit = endpoint.refuse(incoming, &mut response_buffer);
+                        respond(transmit, &response_buffer, sender);
                     }
                 }
-                Poll::Pending => {
-                    return Ok(PollProgress {
-                        received_connection_packet,
-                        keep_going: false,
-                    });
+                Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+                    progress.received_connection_packet |= batch.current_socket;
+                    self.connections
+                        .senders
+                        .get_mut(&handle)
+                        .unwrap()
+                        .send_proto(event);
                 }
-                // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
-                // attacker
-                Poll::Ready(Err(ref e)) if e.kind() == io::ErrorKind::ConnectionReset => {
-                    continue;
+                Some(DatagramEvent::Response(transmit)) => {
+                    respond(transmit, &response_buffer, sender);
                 }
-                Poll::Ready(Err(e)) => {
-                    return Err(e);
-                }
+                None => {}
             }
+            #[cfg(feature = "runtime-tokio")]
+            coop.made_progress();
+            self.recv_limiter.record_work(1);
             if !self.recv_limiter.allow_work(|| runtime.now()) {
-                return Ok(PollProgress {
-                    received_connection_packet,
-                    keep_going: true,
-                });
+                progress.keep_going = true;
+                break;
             }
         }
+        progress
     }
 }
 
@@ -1069,7 +1165,7 @@ impl fmt::Debug for RecvState {
 
 #[derive(Default)]
 struct PollProgress {
-    /// Whether a datagram was routed to an existing connection
+    /// Whether a datagram received on the current socket reached an existing connection
     received_connection_packet: bool,
     /// Whether datagram handling was interrupted early by the work limiter for fairness
     keep_going: bool,
@@ -1118,6 +1214,238 @@ mod packet_queue_tests {
         fn now(&self) -> Instant {
             TokioRuntime.now()
         }
+    }
+
+    fn pending(bytes: usize, stride: usize, now: Instant) -> PendingRecv {
+        let mut metas = [RecvMeta::default(); BATCH_SIZE];
+        metas[0].len = bytes;
+        metas[0].stride = stride;
+        metas[0].addr = "127.0.0.1:9000".parse().unwrap();
+        metas[0].dst_ip = Some("127.0.0.2".parse().unwrap());
+        metas[0].ecn = Some(udp::EcnCodepoint::Ce);
+        metas[0].interface_index = Some(7);
+        metas[0].timestamp = Some(std::time::Duration::from_secs(3));
+        PendingRecv {
+            metas,
+            messages: 1,
+            message: 0,
+            offset: 0,
+            now,
+            current_socket: true,
+        }
+    }
+
+    #[test]
+    fn interrupted_gro_cursor_preserves_order_and_metadata() {
+        let now = Instant::now();
+        let mut batch = pending(5, 2, now);
+        let bytes = [1, 2, 3, 4, 5];
+        let mut received = Vec::new();
+        while let Some((range, meta)) = batch.peek(bytes.len()) {
+            // A failed checkpoint can peek repeatedly without consuming any bytes.
+            assert_eq!(batch.peek(bytes.len()).unwrap().0, range);
+            assert_eq!(meta.addr, "127.0.0.1:9000".parse().unwrap());
+            assert_eq!(meta.dst_ip, Some("127.0.0.2".parse().unwrap()));
+            assert_eq!(meta.ecn, Some(udp::EcnCodepoint::Ce));
+            assert_eq!(meta.interface_index, Some(7));
+            assert_eq!(meta.timestamp, Some(std::time::Duration::from_secs(3)));
+            assert_eq!(batch.now, now);
+            received.push(bytes[range.clone()].to_vec());
+            batch.advance(range.len());
+        }
+        assert_eq!(received, [vec![1, 2], vec![3, 4], vec![5]]);
+        assert!(batch.peek(bytes.len()).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooperative_yield_preserves_unprocessed_receive_bytes() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let factory = crate::tests::EndpointFactory::new();
+            let runtime = Arc::new(HeldRuntime::default());
+            runtime.hold.store(true, Ordering::Relaxed);
+            let endpoint =
+                factory.endpoint_with_runtime("held", Default::default(), runtime.clone());
+            std::future::poll_fn(|cx| {
+                let mut exhausted = false;
+                for _ in 0..256 {
+                    match tokio::task::coop::poll_proceed(cx) {
+                        Poll::Ready(coop) => coop.made_progress(),
+                        Poll::Pending => {
+                            exhausted = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(
+                    exhausted,
+                    "test must execute within a cooperative Tokio task"
+                );
+                let mut state = endpoint.inner.state.lock().unwrap();
+                let now = state.runtime.now();
+                state.recv_state.recv_buf[..5].copy_from_slice(&[1, 2, 3, 4, 5]);
+                state.recv_state.pending = Some(pending(5, 2, now));
+                state.recv_state.recv_limiter.start_cycle(|| now);
+                let State {
+                    recv_state,
+                    inner,
+                    sender,
+                    runtime,
+                    ..
+                } = &mut *state;
+                assert!(
+                    recv_state
+                        .process_pending(cx, inner, sender, &**runtime)
+                        .keep_going
+                );
+                let batch = recv_state.pending.as_ref().unwrap();
+                assert_eq!((batch.message, batch.offset), (0, 0));
+                assert_eq!(&recv_state.recv_buf[..5], &[1, 2, 3, 4, 5]);
+                recv_state.recv_limiter.finish_cycle(|| now);
+                Poll::Ready(())
+            })
+            .await;
+            tokio::task::yield_now().await;
+            std::future::poll_fn(|cx| {
+                let mut state = endpoint.inner.state.lock().unwrap();
+                let now = state.runtime.now();
+                state.recv_state.recv_limiter.start_cycle(|| now);
+                let State {
+                    recv_state,
+                    inner,
+                    sender,
+                    runtime,
+                    ..
+                } = &mut *state;
+                assert!(
+                    !recv_state
+                        .process_pending(cx, inner, sender, &**runtime)
+                        .keep_going
+                );
+                assert!(recv_state.pending.is_none());
+                assert_eq!(&recv_state.recv_buf[..5], &[1, 2, 3, 4, 5]);
+                recv_state.recv_limiter.finish_cycle(|| now);
+                Poll::Ready(())
+            })
+            .await;
+            runtime.tasks.lock().unwrap().clear();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[derive(Debug)]
+    struct CountingSocket {
+        socket: Box<dyn AsyncUdpSocket>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl AsyncUdpSocket for CountingSocket {
+        fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+            self.socket.create_sender()
+        }
+
+        fn poll_recv(
+            &mut self,
+            _: &mut Context<'_>,
+            _: &mut [IoSliceMut<'_>],
+            _: &mut [RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            Poll::Pending
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.socket.local_addr()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebind_pending_old_batch_preserves_previous_socket_and_polls_current() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let factory = crate::tests::EndpointFactory::new();
+            let runtime = Arc::new(HeldRuntime::default());
+            runtime.hold.store(true, Ordering::Relaxed);
+            let endpoint =
+                factory.endpoint_with_runtime("held", Default::default(), runtime.clone());
+            let now = runtime.now();
+            let (packet, connecting) = {
+                let mut state = endpoint.inner.state.lock().unwrap();
+                let config = state.default_client_config.clone().unwrap();
+                let remote = "127.0.0.1:9000".parse().unwrap();
+                let (handle, mut connection) = state
+                    .inner
+                    .connect(now, config, remote, "localhost")
+                    .unwrap();
+                let mut initial = Vec::new();
+                connection
+                    .poll_transmit(now, NonZeroUsize::MIN, &mut initial)
+                    .unwrap();
+                // The Initial source CID identifies this connection's local route.
+                let scid_len_offset = 6 + usize::from(initial[5]);
+                let scid_len = usize::from(initial[scid_len_offset]);
+                let scid_start = scid_len_offset + 1;
+                let mut packet = vec![0x40];
+                packet.extend_from_slice(&initial[scid_start..scid_start + scid_len]);
+                packet.resize(packet.len() + 32, 0);
+                let sender = state.socket.create_sender();
+                let connecting = state.recv_state.connections.insert(
+                    handle,
+                    connection,
+                    sender,
+                    runtime.clone(),
+                );
+                state.recv_state.recv_buf[..packet.len()].copy_from_slice(&packet);
+                state.recv_state.pending = Some(pending(packet.len(), packet.len(), now));
+                (packet, connecting)
+            };
+            let polls = Arc::new(AtomicUsize::new(0));
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            endpoint
+                .rebind_abstract(Box::new(CountingSocket {
+                    socket: TokioRuntime.wrap_udp_socket(socket).unwrap(),
+                    polls: polls.clone(),
+                }))
+                .unwrap();
+            std::future::poll_fn(|cx| {
+                let mut state = endpoint.inner.state.lock().unwrap();
+                assert!(!state.recv_state.pending.as_ref().unwrap().current_socket);
+                assert!(!state.drive_recv(cx, now).unwrap());
+                assert!(
+                    state.prev_socket.is_some(),
+                    "old buffered traffic must not retire previous socket"
+                );
+                assert!(
+                    polls.load(Ordering::Relaxed) > 0,
+                    "new socket must get a receive turn"
+                );
+                assert!(state.recv_state.pending.is_none());
+                let queue = &state
+                    .recv_state
+                    .connections
+                    .senders
+                    .values()
+                    .next()
+                    .unwrap()
+                    .packets;
+                assert!(
+                    queue.used() > 0,
+                    "old packet must still reach its connection"
+                );
+                state.recv_state.recv_buf[..packet.len()].copy_from_slice(&packet);
+                state.recv_state.pending = Some(pending(packet.len(), packet.len(), now));
+                assert!(!state.drive_recv(cx, now).unwrap());
+                assert!(
+                    state.prev_socket.is_none(),
+                    "current buffered traffic must retire previous socket"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            drop(connecting);
+            runtime.tasks.lock().unwrap().clear();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
