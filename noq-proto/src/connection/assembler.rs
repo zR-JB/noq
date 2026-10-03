@@ -555,11 +555,14 @@ mod test {
     fn tiny_owned_backings_still_trigger_compaction() {
         let budget = BufferBudget::for_receive(1024 * 1024, None);
         let mut assembler = Assembler::new(budget.clone());
-        for offset in 0..700 {
-            assembler.insert(offset, Bytes::from_static(b"a"), 1).unwrap();
+        let frames = 32768 / OwnedBacking::OVERHEAD_BYTES + 1;
+        for offset in 0..frames {
+            assembler
+                .insert(offset as u64, Bytes::from_static(b"a"), 1)
+                .unwrap();
         }
         // Capacity alone would miss the owner overhead of hundreds of one-byte frames.
-        assert!(assembler.data.len() < 700);
+        assert!(assembler.data.len() < frames);
         assert!(assembler.data.iter().any(|buffer| buffer.bytes.len() > 1));
         let mut delivered = 0;
         while let Some(chunk) = assembler.read(usize::MAX, true) {
@@ -567,7 +570,7 @@ mod test {
             assert!(chunk.bytes.iter().all(|&byte| byte == b'a'));
             delivered += chunk.bytes.len() as u64;
         }
-        assert_eq!(delivered, 700);
+        assert_eq!(delivered, frames as u64);
         assembler.clear();
         assert_eq!(budget.used(), 0);
     }
