@@ -377,6 +377,7 @@ impl Connection {
             config.max_concurrent_bidi_streams,
             config.send_window,
             config.receive_window,
+            config.initial_receive_window,
             config.stream_receive_window,
             shared,
         );
@@ -5225,6 +5226,9 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
+                    if let Some(rtt) = self.path(path_id).map(|path| path.rtt.get()) {
+                        self.streams.note_arrival(now, rtt);
+                    }
                     if self.streams.received(frame, payload_len)?.should_transmit() {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }

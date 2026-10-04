@@ -33,6 +33,7 @@ pub struct TransportConfig {
     pub(crate) max_idle_timeout: Option<VarInt>,
     pub(crate) stream_receive_window: VarInt,
     pub(crate) receive_window: VarInt,
+    pub(crate) initial_receive_window: Option<VarInt>,
     pub(crate) send_window: u64,
     pub(crate) shared_budget: Option<Arc<dyn SharedBudget>>,
     pub(crate) send_fairness: bool,
@@ -140,6 +141,16 @@ impl TransportConfig {
     /// stream while another is blocked.
     pub fn receive_window(&mut self, value: VarInt) -> &mut Self {
         self.receive_window = value;
+        self
+    }
+
+    /// Starts the connection receive window at `value` and doubles it, up to `receive_window`,
+    /// while the application reads half of it within two round trips, as quic-go does.
+    ///
+    /// Buffered data then follows the bandwidth-delay product the application sustains rather than
+    /// `receive_window`. `None` grants `receive_window` at once.
+    pub fn initial_receive_window(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.initial_receive_window = value;
         self
     }
 
@@ -572,6 +583,7 @@ impl Default for TransportConfig {
             max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
             receive_window: VarInt::MAX,
+            initial_receive_window: None,
             send_window: (8 * STREAM_RWND).into(),
             shared_budget: None,
             send_fairness: true,
@@ -625,6 +637,7 @@ impl fmt::Debug for TransportConfig {
             max_idle_timeout,
             stream_receive_window,
             receive_window,
+            initial_receive_window,
             send_window,
             shared_budget,
             send_fairness,
@@ -663,6 +676,7 @@ impl fmt::Debug for TransportConfig {
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
             .field("receive_window", receive_window)
+            .field("initial_receive_window", initial_receive_window)
             .field("send_window", send_window)
             .field("shared_budget", shared_budget)
             .field("send_fairness", send_fairness)

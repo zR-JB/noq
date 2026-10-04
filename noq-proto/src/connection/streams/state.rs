@@ -12,7 +12,7 @@ use super::{
     ShouldTransmit, StreamEvent, StreamHalf,
 };
 use crate::{
-    Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
+    Dir, Duration, Instant, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     connection::{
         PacketBuilder,
         buffer_budget::{
@@ -194,6 +194,14 @@ pub struct StreamsState {
 
     /// The shrink to be applied to local_max_data when receive_window is shrunk
     receive_window_shrink_debt: u64,
+    /// The window autotuning starts from, and the most it grows `receive_window` to
+    initial_receive_window: Option<u64>,
+    receive_window_limit: u64,
+    /// Bytes the application consumed, and when and after how many the autotuning epoch began
+    bytes_read: u64,
+    tuning_epoch: Option<(Instant, u64)>,
+    /// The latest STREAM frame arrival and smoothed RTT, which time autotuning epochs
+    clock: Option<(Instant, Duration)>,
     /// Whether the locally-initiated stream limit has been hit, per direction
     pub(super) streams_blocked: [bool; 2],
     /// Whether the peer advertised the `reset_stream_at` transport parameter, i.e. whether it can
@@ -209,9 +217,13 @@ impl StreamsState {
         max_remote_bi: VarInt,
         send_window: u64,
         receive_window: VarInt,
+        initial_receive_window: Option<VarInt>,
         stream_receive_window: VarInt,
         shared: Option<&Arc<dyn SharedBudget>>,
     ) -> Self {
+        let receive_window_limit = receive_window;
+        let receive_window =
+            initial_receive_window.map_or(receive_window, |initial| initial.min(receive_window));
         let reassembly = BufferBudget::for_receive(receive_window.into(), shared);
         let transmit = BufferBudget::new(send_window, shared);
         let floor = Self::floor_bytes(max_remote_bi, max_remote_uni);
@@ -265,6 +277,11 @@ impl StreamsState {
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
+            initial_receive_window: initial_receive_window.map(u64::from),
+            receive_window_limit: receive_window_limit.into(),
+            bytes_read: 0,
+            tuning_epoch: None,
+            clock: None,
             streams_blocked: [false, false],
             peer_reset_stream_at: false,
             slots,
@@ -1185,9 +1202,49 @@ impl StreamsState {
         self.send_window = send_window;
     }
 
-    /// Set the receive_window, returning whether the peer was granted more credit
+    /// Set the receive window, or its autotuning limit, returning whether the peer was granted
+    /// more credit
     pub(crate) fn set_receive_window(&mut self, receive_window: VarInt) -> bool {
-        let receive_window: u64 = receive_window.into();
+        let limit = u64::from(receive_window);
+        self.receive_window_limit = limit;
+        let window = match self.initial_receive_window {
+            Some(initial) => self.receive_window.max(initial).min(limit),
+            None => limit,
+        };
+        self.resize_receive_window(window)
+    }
+
+    pub(crate) fn note_arrival(&mut self, now: Instant, rtt: Duration) {
+        self.clock = Some((now, rtt));
+    }
+
+    /// Doubles the window when the application read more than half of it within two round trips
+    /// of the epoch's start, which then restarts.
+    fn tune_receive_window(&mut self) {
+        let Some((now, rtt)) = self.clock else { return };
+        if self.receive_window >= self.receive_window_limit {
+            return;
+        }
+        let Some((start, offset)) = self.tuning_epoch else {
+            self.tuning_epoch = Some((now, self.bytes_read));
+            return;
+        };
+        let read = self.bytes_read - offset;
+        if read <= self.receive_window / 2 {
+            return;
+        }
+        let elapsed = now.saturating_duration_since(start).as_nanos();
+        if elapsed * u128::from(self.receive_window) < 4 * rtt.as_nanos() * u128::from(read) {
+            let window = self
+                .receive_window
+                .saturating_mul(2)
+                .min(self.receive_window_limit);
+            self.resize_receive_window(window);
+        }
+        self.tuning_epoch = Some((now, self.bytes_read));
+    }
+
+    fn resize_receive_window(&mut self, receive_window: u64) -> bool {
         let mut expanded = false;
         if receive_window > self.receive_window {
             let diff = receive_window - self.receive_window;
@@ -1334,6 +1391,8 @@ impl StreamsState {
             self.limit_reassembly();
         }
         self.local_max_data = self.local_max_data.saturating_add(credits - paid);
+        self.bytes_read = self.bytes_read.saturating_add(credits);
+        self.tune_receive_window();
 
         if self.local_max_data > VarInt::MAX.into_inner() {
             return ShouldTransmit(false);
@@ -1459,9 +1518,47 @@ mod tests {
             128u32.into(),
             1024 * 1024,
             (1024 * 1024u32).into(),
+            None,
             (1024 * 1024u32).into(),
             None,
         )
+    }
+
+    #[test]
+    fn receive_window_doubles_while_half_is_read_within_two_round_trips() {
+        let mut state = StreamsState::new(
+            Side::Server,
+            2u32.into(),
+            2u32.into(),
+            65536,
+            (256 * 1024u32).into(),
+            Some((64 * 1024u32).into()),
+            65536u32.into(),
+            None,
+        );
+        assert_eq!(state.local_max_data, 64 * 1024);
+        let (start, rtt) = (Instant::now(), Duration::from_millis(10));
+        state.note_arrival(start, rtt);
+        state.add_read_credits(1);
+        state.note_arrival(start + Duration::from_millis(15), rtt);
+        state.add_read_credits(40 * 1024);
+        assert_eq!(state.receive_window, 128 * 1024);
+        assert_eq!(state.local_max_data, 128 * 1024 + 40 * 1024 + 1);
+        // Half the window in more than two round trips keeps it.
+        state.note_arrival(start + Duration::from_millis(100), rtt);
+        state.add_read_credits(80 * 1024);
+        assert_eq!(state.receive_window, 128 * 1024);
+        state.note_arrival(start + Duration::from_millis(101), rtt);
+        state.add_read_credits(80 * 1024);
+        assert_eq!(state.receive_window, 256 * 1024);
+        state.note_arrival(start + Duration::from_millis(102), rtt);
+        state.add_read_credits(160 * 1024);
+        assert_eq!(state.receive_window, 256 * 1024, "the limit caps growth");
+        // A higher limit leaves the window to autotuning; a lower one shrinks it.
+        state.set_receive_window((1024 * 1024u32).into());
+        assert_eq!(state.receive_window, 256 * 1024);
+        state.set_receive_window((32 * 1024u32).into());
+        assert_eq!(state.receive_window, 32 * 1024);
     }
 
     #[test]
@@ -1472,6 +1569,7 @@ mod tests {
             2u32.into(),
             65536,
             65536u32.into(),
+            None,
             65536u32.into(),
             None,
         );
@@ -1507,6 +1605,7 @@ mod tests {
             2u32.into(),
             65536,
             65536u32.into(),
+            None,
             65536u32.into(),
             None,
         );
@@ -1605,6 +1704,7 @@ mod tests {
             1u32.into(),
             1024,
             1024u32.into(),
+            None,
             1024u32.into(),
             None,
         );
@@ -1634,6 +1734,7 @@ mod tests {
             1u32.into(),
             4096,
             4096u32.into(),
+            None,
             4096u32.into(),
             None,
         );
@@ -1703,6 +1804,7 @@ mod tests {
             2u32.into(),
             4096,
             65536u32.into(),
+            None,
             4096u32.into(),
             None,
         );
@@ -1751,6 +1853,7 @@ mod tests {
             1u32.into(),
             1024 * 1024,
             (1024 * 1024u32).into(),
+            None,
             (1024 * 1024u32).into(),
             None,
         );
@@ -2651,6 +2754,7 @@ mod tests {
             10_000u32.into(),
             1024 * 1024,
             (1024 * 1024u32).into(),
+            None,
             (1024 * 1024u32).into(),
             None,
         );

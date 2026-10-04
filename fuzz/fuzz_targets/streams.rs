@@ -39,6 +39,7 @@ fuzz_target!(|input: (StreamParams, Vec<Operation>)| {
         params.max_remote_bi.into(),
         params.send_window.into(),
         params.receive_window.into(),
+        None,
         params.stream_receive_window.into(),
         None,
     );
