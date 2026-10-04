@@ -972,11 +972,23 @@ impl std::ops::Deref for EndpointRef {
     }
 }
 
+/// Receive batch storage per endpoint: GRO fills each message with up to 64 KiB, so four messages
+/// carry more datagrams than one cooperative turn processes.
+const RECV_BUFFER_BYTES: usize = 384 * 1024;
+
+/// Bytes of an endpoint's receive batch for `segments` GRO segments of up to `packet` bytes per message.
+pub fn receive_batch_bytes(packet: usize, segments: usize) -> usize {
+    let slot = packet * segments;
+    slot * (RECV_BUFFER_BYTES / slot).clamp(1, BATCH_SIZE)
+}
+
 /// State directly involved in handling incoming packets
 struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
     recv_buf: Box<[u8]>,
+    /// Bytes of `recv_buf` each received message may fill
+    slot: usize,
     metas: [RecvMeta; BATCH_SIZE],
     pending: Option<PendingRecv>,
     receive_current_next: bool,
@@ -1024,12 +1036,9 @@ impl RecvState {
         max_receive_segments: NonZeroUsize,
         endpoint: &proto::Endpoint,
     ) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * max_receive_segments.get()
-                * BATCH_SIZE
-        ];
+        let packet = endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize;
+        let slot = packet * max_receive_segments.get();
+        let recv_buf = vec![0; receive_batch_bytes(packet, max_receive_segments.get())];
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
@@ -1039,6 +1048,7 @@ impl RecvState {
             },
             incoming: VecDeque::new(),
             recv_buf: recv_buf.into(),
+            slot,
             metas: [RecvMeta::default(); BATCH_SIZE],
             pending: None,
             receive_current_next: false,
@@ -1054,14 +1064,11 @@ impl RecvState {
         current_socket: bool,
     ) -> Poll<io::Result<()>> {
         debug_assert!(self.pending.is_none());
-        let mut iovs: [IoSliceMut<'_>; BATCH_SIZE] = {
-            let mut bufs = self
-                .recv_buf
-                .chunks_mut(self.recv_buf.len() / BATCH_SIZE)
-                .map(IoSliceMut::new);
-            std::array::from_fn(|_| bufs.next().expect("BATCH_SIZE elements"))
-        };
-        match socket.poll_recv(cx, &mut iovs, &mut self.metas) {
+        let messages = self.recv_buf.len() / self.slot;
+        let mut bufs = self.recv_buf.chunks_mut(self.slot).map(IoSliceMut::new);
+        let mut iovs: [IoSliceMut<'_>; BATCH_SIZE] =
+            std::array::from_fn(|_| bufs.next().unwrap_or_else(|| IoSliceMut::new(&mut [])));
+        match socket.poll_recv(cx, &mut iovs[..messages], &mut self.metas) {
             Poll::Ready(Ok(messages)) => {
                 // Empty descriptors can result from shard forwarding. Account for their
                 // overhead so a non-Tokio socket cannot bypass the historic time limiter.
@@ -1098,8 +1105,7 @@ impl RecvState {
         let _ = cx;
         let mut progress = PollProgress::default();
         while let Some(batch) = &mut self.pending {
-            let Some((range, meta)) = batch.peek(&self.metas, self.recv_buf.len() / BATCH_SIZE)
-            else {
+            let Some((range, meta)) = batch.peek(&self.metas, self.slot) else {
                 self.pending = None;
                 break;
             };
