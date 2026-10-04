@@ -1293,6 +1293,7 @@ impl Budget {
 }
 
 impl proto::SharedBudget for Budget {
+    #[allow(deprecated)] // try_update needs Rust 1.99; the workspace supports 1.88
     fn try_charge(&self, bytes: usize) -> bool {
         let charged = self
             .used

@@ -358,6 +358,7 @@ mod tests {
     }
 
     impl SharedBudget for Shared {
+        #[allow(deprecated)] // try_update needs Rust 1.99; the workspace supports 1.88
         fn try_charge(&self, bytes: usize) -> bool {
             self.used
                 .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |used| {

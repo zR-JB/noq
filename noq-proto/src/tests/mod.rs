@@ -5505,6 +5505,7 @@ impl Budget {
 }
 
 impl crate::SharedBudget for Budget {
+    #[allow(deprecated)] // try_update needs Rust 1.99; the workspace supports 1.88
     fn try_charge(&self, bytes: usize) -> bool {
         self.used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {

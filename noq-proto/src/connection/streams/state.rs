@@ -1539,20 +1539,20 @@ mod tests {
         assert_eq!(state.local_max_data, 64 * 1024);
         let (start, rtt) = (Instant::now(), Duration::from_millis(10));
         state.note_arrival(start, rtt);
-        state.add_read_credits(1);
+        let _ = state.add_read_credits(1);
         state.note_arrival(start + Duration::from_millis(15), rtt);
-        state.add_read_credits(40 * 1024);
+        let _ = state.add_read_credits(40 * 1024);
         assert_eq!(state.receive_window, 128 * 1024);
         assert_eq!(state.local_max_data, 128 * 1024 + 40 * 1024 + 1);
         // Half the window in more than two round trips keeps it.
         state.note_arrival(start + Duration::from_millis(100), rtt);
-        state.add_read_credits(80 * 1024);
+        let _ = state.add_read_credits(80 * 1024);
         assert_eq!(state.receive_window, 128 * 1024);
         state.note_arrival(start + Duration::from_millis(101), rtt);
-        state.add_read_credits(80 * 1024);
+        let _ = state.add_read_credits(80 * 1024);
         assert_eq!(state.receive_window, 256 * 1024);
         state.note_arrival(start + Duration::from_millis(102), rtt);
-        state.add_read_credits(160 * 1024);
+        let _ = state.add_read_credits(160 * 1024);
         assert_eq!(state.receive_window, 256 * 1024, "the limit caps growth");
         // A higher limit leaves the window to autotuning; a lower one shrinks it.
         state.set_receive_window((1024 * 1024u32).into());
