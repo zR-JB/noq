@@ -26,6 +26,9 @@ pub(super) struct Send {
     pub(super) fin_pending: bool,
     /// Whether this stream is in the `connection_blocked` list of `Streams`
     pub(super) connection_blocked: bool,
+    /// Whether a `Writable` event for this stream's place in `connection_blocked` awaits its
+    /// next write
+    pub(super) woken: bool,
     /// The reason the peer wants us to stop, if `STOP_SENDING` was received
     pub(super) stop_reason: Option<VarInt>,
     /// State of an in-progress reliable reset (RESET_STREAM_AT), if any.
@@ -58,6 +61,7 @@ impl Send {
             priority: 0,
             fin_pending: false,
             connection_blocked: false,
+            woken: false,
             stop_reason: None,
             reset_at: None,
         })

@@ -298,6 +298,7 @@ impl<'a> SendStream<'a> {
                 self.state.transmit.clone(),
             ))
             .ok_or(WriteError::ClosedStream)?;
+        stream.woken = false;
 
         if limit == 0 {
             trace!(
@@ -345,6 +346,14 @@ impl<'a> SendStream<'a> {
         self.state.data_sent += written.bytes as u64;
         self.state.unacked_data += written.bytes as u64;
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);
+        // A stream that took credit waits behind the others the next time it is blocked
+        if stream.connection_blocked && written.bytes > 0 {
+            stream.connection_blocked = false;
+            let blocked = &mut self.state.connection_blocked;
+            if let Some(index) = blocked.iter().position(|&id| id == self.id) {
+                blocked.remove(index);
+            }
+        }
         if !was_pending {
             self.state.pending.push_pending(self.id, stream.priority);
         }

@@ -1098,22 +1098,24 @@ impl StreamsState {
         }
 
         if self.write_limit() > 0 {
-            for index in (0..self.connection_blocked.len()).rev() {
-                let id = self.connection_blocked[index];
+            // Longest waiting first. A woken stream keeps its place until it writes, so a stream
+            // that takes every grant it is woken for cannot starve the streams behind it.
+            let mut index = 0;
+            while let Some(&id) = self.connection_blocked.get(index) {
                 let Some(stream) = self.send.get_mut(&id).and_then(|s| s.as_mut()) else {
-                    self.connection_blocked.swap_remove(index);
+                    self.connection_blocked.remove(index);
                     continue;
                 };
-                if stream.is_writable() && stream.max_data > stream.offset() {
-                    if !stream.pending.can_write() {
-                        continue;
-                    }
+                if !(stream.is_writable() && stream.max_data > stream.offset()) {
                     stream.connection_blocked = false;
-                    self.connection_blocked.swap_remove(index);
+                    self.connection_blocked.remove(index);
+                    continue;
+                }
+                index += 1;
+                if !stream.woken && stream.pending.can_write() {
+                    stream.woken = true;
                     return Some(StreamEvent::Writable { id });
                 }
-                stream.connection_blocked = false;
-                self.connection_blocked.swap_remove(index);
             }
         }
 
@@ -3131,6 +3133,55 @@ mod tests {
         }
         assert_eq!(sender.unacked_data, 0);
         assert_eq!(budget.used(), exhausted.bytes);
+    }
+
+    #[test]
+    fn connection_credit_reaches_the_longest_waiting_stream() {
+        let mut server = make(Side::Server);
+        server.set_params(&TransportParameters {
+            initial_max_data: VarInt::from_u32(1000),
+            initial_max_stream_data_uni: VarInt::MAX,
+            initial_max_streams_uni: VarInt::from_u32(100),
+            ..TransportParameters::default()
+        });
+        let conn_state = ConnState::established();
+        let open = |state: &mut StreamsState| {
+            Streams {
+                state,
+                conn_state: &conn_state,
+            }
+            .open(Dir::Uni)
+            .unwrap()
+        };
+        let (bulk, head) = (open(&mut server), open(&mut server));
+        let write = |state: &mut StreamsState, id| {
+            SendStream {
+                id,
+                state,
+                conn_state: &conn_state,
+            }
+            .write(&[0; 4000])
+        };
+
+        // The bulk stream takes all credit and the head stream waits behind it
+        assert_eq!(write(&mut server, bulk), Ok(1000));
+        assert_eq!(write(&mut server, bulk), Err(WriteError::Blocked));
+        assert_eq!(write(&mut server, head), Err(WriteError::Blocked));
+
+        // Both are woken, longest waiting first, and the bulk stream takes the grant
+        server.received_max_data(VarInt::from_u32(2000));
+        assert_eq!(server.poll(), Some(StreamEvent::Writable { id: bulk }));
+        assert_eq!(server.poll(), Some(StreamEvent::Writable { id: head }));
+        assert_eq!(server.poll(), None);
+        assert_eq!(write(&mut server, bulk), Ok(1000));
+        assert_eq!(write(&mut server, bulk), Err(WriteError::Blocked));
+        assert_eq!(write(&mut server, head), Err(WriteError::Blocked));
+
+        // The head stream kept its place, so the next grant wakes it first
+        server.received_max_data(VarInt::from_u32(3000));
+        assert_eq!(server.poll(), Some(StreamEvent::Writable { id: head }));
+        assert_eq!(server.poll(), Some(StreamEvent::Writable { id: bulk }));
+        assert_eq!(write(&mut server, head), Ok(1000));
     }
 
     #[test]
