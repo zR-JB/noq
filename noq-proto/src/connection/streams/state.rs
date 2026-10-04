@@ -1099,7 +1099,8 @@ impl StreamsState {
 
         if self.write_limit() > 0 {
             // Longest waiting first. A woken stream keeps its place until it writes, so a stream
-            // that takes every grant it is woken for cannot starve the streams behind it.
+            // that takes every grant it is woken for cannot starve the streams behind it, as long
+            // as woken tasks run in wake order, as a current-thread runtime runs them.
             let mut index = 0;
             while let Some(&id) = self.connection_blocked.get(index) {
                 let Some(stream) = self.send.get_mut(&id).and_then(|s| s.as_mut()) else {
