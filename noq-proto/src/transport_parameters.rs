@@ -173,7 +173,11 @@ impl TransportParameters {
             initial_src_cid: Some(initial_src_cid),
             initial_max_streams_bidi: config.max_concurrent_bidi_streams,
             initial_max_streams_uni: config.max_concurrent_uni_streams,
-            initial_max_data: config.receive_window,
+            initial_max_data: config
+                .initial_receive_window
+                .map_or(config.receive_window, |initial| {
+                    initial.min(config.receive_window)
+                }),
             initial_max_stream_data_bidi_local: config.stream_receive_window,
             initial_max_stream_data_bidi_remote: config.stream_receive_window,
             initial_max_stream_data_uni: config.stream_receive_window,
