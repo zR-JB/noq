@@ -504,6 +504,9 @@ impl Drop for EndpointDriver {
         endpoint.recv_state.connections.senders.clear();
         endpoint.recv_state.connections.active_connections = 0;
         endpoint.recv_state.pending = None;
+        // Wake callers waiting for the connection state cleared above.
+        self.0.shared.all_draining.notify_waiters();
+        self.0.shared.idle.notify_waiters();
     }
 }
 
