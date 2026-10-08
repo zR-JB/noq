@@ -4720,7 +4720,9 @@ impl Connection {
             if self
                 .paths
                 .get(&path_id)
-                .map(|p| p.data.validated && p.data.network_path == network_path)
+                .map(|p| {
+                    p.data.validated && p.data.network_path.is_probably_same_path(&network_path)
+                })
                 .unwrap_or(false)
             {
                 self.connection_close_pending = true;
