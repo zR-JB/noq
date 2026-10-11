@@ -547,9 +547,6 @@ impl TransportParameters {
                         return Err(Error::Malformed);
                     }
                     let value: VarInt = r.get()?;
-                    if len != value.size() {
-                        return Err(Error::Malformed);
-                    }
                     params.address_discovery_role = value.try_into()?;
                     tracing::debug!(
                         role = ?params.address_discovery_role,
@@ -562,10 +559,6 @@ impl TransportParameters {
                     }
 
                     let value: PathId = r.get()?;
-                    if len != value.size() {
-                        return Err(Error::Malformed);
-                    }
-
                     params.initial_max_path_id = Some(value);
                 }
                 TransportParameterId::N0NatTraversal => {
@@ -599,7 +592,7 @@ impl TransportParameters {
                             match id {
                                 $(TransportParameterId::$id => {
                                     let value = r.get::<VarInt>()?;
-                                    if len != value.size() || got.$name { return Err(Error::Malformed); }
+                                    if got.$name { return Err(Error::Malformed); }
                                     params.$name = value.into();
                                     got.$name = true;
                                 })*
@@ -1011,6 +1004,23 @@ mod test {
                 Err(Error::IllegalValue)
             );
         }
+    }
+
+    #[test]
+    fn read_nonminimal_integers() {
+        // RFC 9000 Section 16: values need not use the shortest encoding.
+        let mut buf = Vec::new();
+        for id in [
+            TransportParameterId::InitialMaxData as u64,
+            TransportParameterId::InitialMaxPathId as u64,
+        ] {
+            buf.write_var(id);
+            buf.write_var(2);
+            buf.extend_from_slice(&[0x40, 0x07]);
+        }
+        let params = TransportParameters::read(Side::Server, &mut buf.as_slice()).unwrap();
+        assert_eq!(params.initial_max_data, VarInt::from_u32(7));
+        assert_eq!(params.initial_max_path_id, Some(PathId(7)));
     }
 
     #[test]
