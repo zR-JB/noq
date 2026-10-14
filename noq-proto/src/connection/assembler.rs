@@ -11,7 +11,7 @@ use bytes::{Buf, Bytes};
 #[cfg(test)]
 use super::buffer_budget::MIN_BUFFER_BYTES;
 use super::buffer_budget::{
-    Allocation, AllocationError, BufferBudget, ChargedRanges, OwnedBacking,
+    Allocation, AllocationError, BufferBudget, ChargedRanges, OwnedBacking, PacketSlice,
 };
 
 use super::buffer_budget::COPY_BLOCK_BYTES;
@@ -257,8 +257,10 @@ impl Assembler {
         Ok(())
     }
 
-    // The incoming packet size bounds the frame, but each inserted frame gets its own charged
-    // backing. Slices of that backing can still conservatively count its footprint more than once.
+    // The incoming packet size bounds the frame. A frame filling at least half its packet
+    // keeps the packet's buffer, charged at the packet's size; a smaller one gets its own
+    // charged backing, so no frame pins more than twice its bytes. Slices can still
+    // conservatively count a footprint more than once.
     pub(super) fn insert(
         &mut self,
         mut offset: u64,
@@ -294,10 +296,18 @@ impl Assembler {
             recvd.reserve(recvd.ranges.range_count() + 1)?;
             delivered.reserve(delivered.ranges.range_count() + self.data.len() + fragments)?;
         }
-        let mut backing = OwnedBacking::new(bytes.len(), &self.allocation.budget)?;
-        backing.bytes.extend_from_slice(&bytes);
-        let allocation_size = backing.allocation_size();
-        bytes = backing.finish();
+        let allocation_size = if bytes.len() >= allocation_size / 2 {
+            let slice = PacketSlice::new(bytes, allocation_size, &self.allocation.budget)?;
+            let allocation_size = slice.allocation_size();
+            bytes = slice.finish();
+            allocation_size
+        } else {
+            let mut backing = OwnedBacking::new(bytes.len(), &self.allocation.budget)?;
+            backing.bytes.extend_from_slice(&bytes);
+            let allocation_size = backing.allocation_size();
+            bytes = backing.finish();
+            allocation_size
+        };
         self.end = self.end.max(offset + bytes.len() as u64);
         if let State::Unordered { ref mut recvd, .. } = self.state {
             // Discard duplicate data
@@ -556,6 +566,25 @@ mod test {
     }
 
     #[test]
+    fn a_frame_filling_its_packet_keeps_the_packet_buffer() {
+        let budget = BufferBudget::for_receive(1024 * 1024, None);
+        let mut assembler = Assembler::new(budget.clone());
+        let packet = Bytes::from(vec![7; 1200]);
+        let frame = packet.slice(20..1200);
+        assembler.insert(0, frame.clone(), 1200).unwrap();
+        // Charged at the packet's size, without a copy of the frame.
+        assert_eq!(
+            budget.used() - assembler.allocation.bytes,
+            1200 + PacketSlice::OVERHEAD_BYTES
+        );
+        let chunk = assembler.read(usize::MAX, true).unwrap();
+        assert_eq!(chunk.bytes.as_ptr(), frame.as_ptr());
+        drop((chunk, frame, packet));
+        assembler.clear();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
     fn tiny_owned_backings_still_trigger_compaction() {
         let budget = BufferBudget::for_receive(1024 * 1024, None);
         let mut assembler = Assembler::new(budget.clone());
@@ -612,7 +641,7 @@ mod test {
         let delivered = assembler.read(usize::MAX, true).unwrap();
         assembler.clear();
         assert_eq!(assembler.data.capacity(), 0);
-        assert_eq!(budget.used(), 1 + OwnedBacking::OVERHEAD_BYTES);
+        assert_eq!(budget.used(), 1 + PacketSlice::OVERHEAD_BYTES);
         drop(delivered);
         assert_eq!(budget.used(), 0);
     }
@@ -642,7 +671,7 @@ mod test {
         let delivered = assembler.read(usize::MAX, true).unwrap();
         assert!(assembler.allocation.bytes != 0);
         drop(assembler);
-        assert_eq!(budget.used(), 1 + OwnedBacking::OVERHEAD_BYTES);
+        assert_eq!(budget.used(), 1 + PacketSlice::OVERHEAD_BYTES);
         drop(delivered);
         assert_eq!(budget.used(), 0);
     }
@@ -720,10 +749,7 @@ mod test {
         let tail = delivered.slice(length - 1..);
         drop(delivered);
         assembler = Assembler::new(assembler.allocation.budget.clone());
-        assert_eq!(
-            budget.used(),
-            length + mem::size_of::<OwnedBacking>() + mem::size_of::<AtomicUsize>()
-        );
+        assert_eq!(budget.used(), length + PacketSlice::OVERHEAD_BYTES);
         assert!(
             assembler
                 .insert(0, Bytes::from(vec![8; length]), length)
@@ -747,7 +773,7 @@ mod test {
         let length = MIN_BUFFER_BYTES / 2 + 1;
         let mut assembler = Assembler::new(budget.clone());
         assembler
-            .insert(0, Bytes::from(vec![7; length]), length * 2)
+            .insert(0, Bytes::from(vec![7; length]), length * 3)
             .unwrap();
         assert!(assembler.defragment().is_err());
         assert!(budget.used() <= MIN_BUFFER_BYTES);
