@@ -1764,6 +1764,11 @@ impl Connection {
                     .map(|(&path_id, _)| path_id)
                     .collect::<Vec<_>>()
                 {
+                    // Reserve room for CONNECTION_CLOSE even when an Initial token leaves
+                    // little space after the header.
+                    let room = builder
+                        .frame_space_remaining()
+                        .saturating_sub(frame::ConnectionClose::SIZE_BOUND);
                     Self::populate_acks(
                         now,
                         self.receiving_ecn,
@@ -1774,22 +1779,12 @@ impl Connection {
                         &mut builder,
                         &mut self.path_stats.get_mut(path_id).frame_tx,
                         self.crypto_state.has_keys(space_id.encryption_level()),
+                        room,
                     );
                 }
 
-                // Since there only 64 ACK frames there will always be enough space
-                // to encode the ConnectionClose frame too. However we still have the
-                // check here to prevent crashes if something changes.
-
-                // TODO(flub): This needs fixing for multipath, to ensure we can always
-                //    write the CONNECTION_CLOSE even if we have many PATH_ACKs to send:
-                //    https://github.com/n0-computer/noq/issues/367.
-                debug_assert!(
-                    builder.frame_space_remaining() > frame::ConnectionClose::SIZE_BOUND,
-                    "ACKs should leave space for ConnectionClose"
-                );
                 let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
-                if frame::ConnectionClose::SIZE_BOUND < builder.frame_space_remaining() {
+                if frame::ConnectionClose::SIZE_BOUND <= builder.frame_space_remaining() {
                     let max_frame_size = builder.frame_space_remaining();
                     let close: Close = match self.state.as_type() {
                         StateType::Closed => {
@@ -6388,6 +6383,7 @@ impl Connection {
                     builder,
                     stats,
                     space_has_keys,
+                    usize::MAX,
                 );
                 if !builder.track {
                     self.timers.stop(
@@ -6891,6 +6887,7 @@ impl Connection {
         builder: &mut PacketBuilder<'a, 'b>,
         stats: &mut FrameStats,
         space_has_keys: bool,
+        room: usize,
     ) {
         // 0-RTT packets must never carry acks (which would have to be of handshake packets)
         debug_assert!(space_has_keys, "tried to send ACK in 0-RTT");
@@ -6920,13 +6917,21 @@ impl Connection {
         let ack_delay_exp = TransportParameters::default().ack_delay_exponent;
         let delay = delay_micros >> ack_delay_exp.into_inner();
 
-        if is_multipath_negotiated && space_id == SpaceId::Data {
-            if !ranges.is_empty() {
-                let frame = frame::PathAck::encoder(path_id, delay, ranges, ecn);
-                builder.write_frame(frame, stats);
+        let path_ack = is_multipath_negotiated && space_id == SpaceId::Data;
+        if !path_ack || !ranges.is_empty() {
+            let frame: frame::EncodableFrame<'_> = match path_ack {
+                true => frame::PathAck::encoder(path_id, delay, ranges, ecn).into(),
+                false => frame::Ack::encoder(delay, ranges, ecn).into(),
+            };
+            // Only a close packet limits the ACK's room; it is then measured before it is written.
+            if room < builder.frame_space_remaining() {
+                let mut measured = Vec::new();
+                crate::coding::Encodable::encode(&frame, &mut measured);
+                if measured.len() > room {
+                    return;
+                }
             }
-        } else {
-            builder.write_frame(frame::Ack::encoder(delay, ranges, ecn), stats);
+            builder.write_frame(frame, stats);
         }
         if !builder.track {
             pns.pending_acks.acks_sent();
@@ -8185,6 +8190,54 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "rustls", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[test]
+    fn large_initial_token_leaves_room_for_close() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let config = crate::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let (mut acked, mut alone) = (false, false);
+        // Every token length across the space an ACK and a CONNECTION_CLOSE share.
+        for token_len in 1000..1130 {
+            config
+                .token_store
+                .insert("localhost", vec![0; token_len].into());
+            let mut endpoint =
+                crate::Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
+            let now = Instant::now();
+            let (_, mut conn) = endpoint
+                .connect(
+                    now,
+                    config.clone(),
+                    "[::1]:4433".parse().unwrap(),
+                    "localhost",
+                )
+                .unwrap();
+            let pns = conn.spaces[SpaceId::Initial].for_path(PathId::ZERO);
+            for pn in (0..32).step_by(2) {
+                pns.pending_acks.insert_one(pn, now);
+                pns.dedup.insert(pn);
+                pns.pending_acks.packet_received(now, pn, true, &pns.dedup);
+            }
+            conn.close(now, 0u32.into(), Bytes::new());
+            let mut buf = Vec::new();
+            let Some(_) = conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf) else {
+                // A token leaving no room for a CRYPTO or CONNECTION_CLOSE frame kills the connection.
+                continue;
+            };
+            assert!(buf.len() <= 1200, "token {token_len}");
+            let sent = conn.stats().frame_tx;
+            assert_eq!(sent.connection_close, 1, "token {token_len}");
+            acked |= sent.acks == 1;
+            alone |= sent.acks == 0;
+        }
+        assert!(
+            acked && alone,
+            "the range covers packets with and without the ACK"
+        );
+    }
 
     #[test]
     fn negotiate_max_idle_timeout_commutative() {
