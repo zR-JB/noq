@@ -168,6 +168,22 @@ fn stateless_retry() {
 }
 
 #[test]
+fn retry_round_trip_paces_the_resent_initial() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let client_ch = pair.begin_connect(client_config());
+    let start = pair.time;
+    while pair.client_conn_mut(client_ch).is_handshaking() {
+        assert!(pair.step());
+    }
+    // A Retry and the handshake take a few 2 ms round trips; paced at the 333 ms initial RTT, the resent Initial
+    // alone waited about 22 ms.
+    let took = pair.time - start;
+    assert!(took < Duration::from_millis(10), "handshake took {took:?}");
+}
+
+#[test]
 fn retry_token_expired() {
     let _guard = subscribe();
 
