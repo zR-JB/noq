@@ -16,6 +16,10 @@ pub(super) const MIN_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(super) const PACKET_QUEUE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Charges beyond the floor reach the shared budget in steps of this many bytes: above its floor a
+/// budget keeps at most two steps it does not use, at or below its floor none.
+const SHARED_STEP: usize = 64 * 1024;
+
 /// Byte budget shared by connections beyond their floors
 pub trait SharedBudget: Send + Sync + fmt::Debug {
     /// Charges `bytes` if they fit
@@ -28,6 +32,9 @@ pub trait SharedBudget: Send + Sync + fmt::Debug {
 pub(super) struct BufferBudget {
     limit: AtomicUsize,
     used: AtomicUsize,
+    /// Bytes charged to the shared budget beyond the floor; at least what `used` needs once
+    /// concurrent acquires settle.
+    charged: AtomicUsize,
     shared: Option<Arc<dyn SharedBudget>>,
     floor: usize,
     refused: AtomicBool,
@@ -54,6 +61,7 @@ impl BufferBudget {
                     .max(MIN_BUFFER_BYTES),
             ),
             used: AtomicUsize::new(0),
+            charged: AtomicUsize::new(0),
             shared: shared.cloned(),
             floor,
             refused: AtomicBool::new(false),
@@ -91,42 +99,35 @@ impl BufferBudget {
 
     pub(super) fn acquire(self: &Arc<Self>, bytes: usize) -> Result<Allocation, AllocationError> {
         let mut used = self.used();
-        loop {
+        let next = loop {
             let next = used
                 .checked_add(bytes)
                 .filter(|&next| next <= self.limit.load(AtomicOrdering::Relaxed))
                 .ok_or(AllocationError)?;
-            let charge = self.beyond_floor(next) - self.beyond_floor(used);
-            if let Some(shared) = &self.shared
-                && charge != 0
-                && !shared.try_charge(charge)
-            {
-                self.refused.store(true, AtomicOrdering::Relaxed);
-                return Err(AllocationError);
-            }
             match self.used.compare_exchange(
                 used,
                 next,
                 AtomicOrdering::Relaxed,
                 AtomicOrdering::Relaxed,
             ) {
-                Ok(_) => {
-                    return Ok(Allocation {
-                        budget: self.clone(),
-                        bytes,
-                    });
-                }
-                Err(current) => {
-                    self.refund(charge);
-                    used = current;
-                }
+                Ok(_) => break next,
+                Err(current) => used = current,
             }
+        };
+        if let Err(error) = self.cover(self.beyond_floor(next)) {
+            self.used.fetch_sub(bytes, AtomicOrdering::Relaxed);
+            self.refused.store(true, AtomicOrdering::Relaxed);
+            return Err(error);
         }
+        Ok(Allocation {
+            budget: self.clone(),
+            bytes,
+        })
     }
 
     fn release(&self, bytes: usize) {
-        let used = self.used.fetch_sub(bytes, AtomicOrdering::Relaxed);
-        self.refund(self.beyond_floor(used) - self.beyond_floor(used - bytes));
+        let used = self.used.fetch_sub(bytes, AtomicOrdering::Relaxed) - bytes;
+        self.trim(self.beyond_floor(used));
         self.refused.store(false, AtomicOrdering::Relaxed);
     }
 
@@ -134,18 +135,74 @@ impl BufferBudget {
         used.saturating_sub(self.floor)
     }
 
-    fn refund(&self, bytes: usize) {
-        if let Some(shared) = &self.shared
-            && bytes != 0
-        {
-            shared.refund(bytes);
+    /// Raises the shared charge to cover `need`, a step past it where that fits.
+    fn cover(&self, need: usize) -> Result<(), AllocationError> {
+        let Some(shared) = &self.shared else {
+            return Ok(());
+        };
+        let mut charged = self.charged.load(AtomicOrdering::Relaxed);
+        while charged < need {
+            let stepped = need.saturating_add(SHARED_STEP);
+            let target = if shared.try_charge(stepped - charged) {
+                stepped
+            } else if shared.try_charge(need - charged) {
+                need
+            } else {
+                return Err(AllocationError);
+            };
+            match self.charged.compare_exchange(
+                charged,
+                target,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(current) => {
+                    shared.refund(target - charged);
+                    charged = current;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the shared charge beyond one step past `need` once it exceeds two, or all of it
+    /// once nothing is needed.
+    fn trim(&self, need: usize) {
+        let Some(shared) = &self.shared else {
+            return;
+        };
+        let mut charged = self.charged.load(AtomicOrdering::Relaxed);
+        loop {
+            let target = match need {
+                0 => 0,
+                _ if charged > need.saturating_add(2 * SHARED_STEP) => need + SHARED_STEP,
+                _ => return,
+            };
+            if charged <= target {
+                return;
+            }
+            match self.charged.compare_exchange(
+                charged,
+                target,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return shared.refund(charged - target),
+                Err(current) => charged = current,
+            }
         }
     }
 }
 
 impl Drop for BufferBudget {
     fn drop(&mut self) {
-        self.refund(self.floor);
+        if let Some(shared) = &self.shared {
+            let charged = self.floor + *self.charged.get_mut();
+            if charged != 0 {
+                shared.refund(charged);
+            }
+        }
     }
 }
 
@@ -395,11 +452,13 @@ mod tests {
     struct Shared {
         limit: usize,
         used: AtomicUsize,
+        charges: AtomicUsize,
     }
 
     impl SharedBudget for Shared {
         #[allow(deprecated)] // try_update needs Rust 1.99; the workspace supports 1.88
         fn try_charge(&self, bytes: usize) -> bool {
+            self.charges.fetch_add(1, AtomicOrdering::Relaxed);
             self.used
                 .fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |used| {
                     used.checked_add(bytes).filter(|&used| used <= self.limit)
@@ -417,6 +476,7 @@ mod tests {
         let shared = Arc::new(Shared {
             limit: 2 * MIN_BUFFER_BYTES,
             used: AtomicUsize::new(0),
+            charges: AtomicUsize::new(0),
         });
         let dyn_shared: Arc<dyn SharedBudget> = shared.clone();
         let budget = BufferBudget::new(u64::MAX, Some(&dyn_shared));
@@ -435,6 +495,28 @@ mod tests {
             }
         });
         assert_eq!(budget.used(), 0);
+        assert_eq!(shared.used.load(AtomicOrdering::Relaxed), MIN_BUFFER_BYTES);
+        drop(budget);
+        assert_eq!(shared.used.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn charges_beyond_the_floor_move_in_steps() {
+        let shared = Arc::new(Shared {
+            limit: usize::MAX,
+            used: AtomicUsize::new(0),
+            charges: AtomicUsize::new(0),
+        });
+        let dyn_shared: Arc<dyn SharedBudget> = shared.clone();
+        let budget = BufferBudget::new(u64::MAX, Some(&dyn_shared));
+        let piece = 1200;
+        let held: Vec<_> = (0..1000).map(|_| budget.acquire(piece).unwrap()).collect();
+        let need = 1000 * piece - MIN_BUFFER_BYTES;
+        let beyond = shared.used.load(AtomicOrdering::Relaxed) - MIN_BUFFER_BYTES;
+        assert!((need..=need + 2 * SHARED_STEP).contains(&beyond));
+        // The floor's charge, then one per step instead of one per acquire.
+        assert!(shared.charges.load(AtomicOrdering::Relaxed) <= 1 + need / SHARED_STEP + 1);
+        drop(held);
         assert_eq!(shared.used.load(AtomicOrdering::Relaxed), MIN_BUFFER_BYTES);
         drop(budget);
         assert_eq!(shared.used.load(AtomicOrdering::Relaxed), 0);
