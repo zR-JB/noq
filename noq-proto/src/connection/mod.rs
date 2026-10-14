@@ -4863,6 +4863,13 @@ impl Connection {
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.for_path(PathId::ZERO).take(0) {
+                    // The Retry answers the first Initial unless a probe repeated it: a round trip that paces the
+                    // resent Initial instead of the initial RTT, as quic-go does.
+                    let path = self.path_data_mut(PathId::ZERO);
+                    if path.pto_count == 0 {
+                        let sample = now.saturating_duration_since(info.time_sent);
+                        path.rtt.update(Duration::ZERO, sample);
+                    }
                     self.on_packet_acked(now, PathId::ZERO, 0, info);
                 };
 
