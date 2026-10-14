@@ -276,6 +276,45 @@ impl AsRef<[u8]> for OwnedBacking {
     }
 }
 
+/// Received bytes left in their packet's buffer, charged at the packet's size until dropped.
+#[derive(Debug)]
+pub(super) struct PacketSlice {
+    bytes: Bytes,
+    _allocation: Allocation,
+}
+
+impl PacketSlice {
+    pub(super) const OVERHEAD_BYTES: usize = mem::size_of::<Self>() + mem::size_of::<AtomicUsize>();
+
+    pub(super) fn new(
+        bytes: Bytes,
+        packet_bytes: usize,
+        budget: &Arc<BufferBudget>,
+    ) -> Result<Self, AllocationError> {
+        let charge = packet_bytes
+            .checked_add(Self::OVERHEAD_BYTES)
+            .ok_or(AllocationError)?;
+        Ok(Self {
+            bytes,
+            _allocation: budget.acquire(charge)?,
+        })
+    }
+
+    pub(super) fn allocation_size(&self) -> usize {
+        self._allocation.bytes
+    }
+
+    pub(super) fn finish(self) -> Bytes {
+        Bytes::from_owner(self)
+    }
+}
+
+impl AsRef<[u8]> for PacketSlice {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct AllocationError;
 
