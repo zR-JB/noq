@@ -1042,14 +1042,12 @@ mod test {
 
     #[test]
     fn read_min_ack_delay_length_mismatch() {
-        // `min_ack_delay` claims no value at all, so its `VarInt` starts on the parameter that
-        // follows it.
+        // `min_ack_delay` claims no value, so its `VarInt` takes the first byte of a following
+        // `disable_active_migration`, and a second one decodes cleanly after it.
         let mut buf = Vec::new();
         buf.write_var(TransportParameterId::MinAckDelayDraft07 as u64);
         buf.write_var(0);
-        buf.write_var(TransportParameterId::InitialMaxData as u64);
-        buf.write_var(1);
-        buf.write(VarInt::from_u32(7));
+        buf.extend_from_slice(&[0x0c, 0x0c, 0x00]);
         assert_eq!(
             TransportParameters::read(Side::Server, &mut buf.as_slice()),
             Err(Error::Malformed)
