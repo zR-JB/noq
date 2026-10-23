@@ -2206,6 +2206,38 @@ mod tests {
     }
 
     #[test]
+    fn send_stopped_while_connection_blocked() {
+        let mut server = make(Side::Server);
+        server.set_params(&TransportParameters {
+            initial_max_streams_uni: 1u32.into(),
+            initial_max_data: 5u32.into(),
+            initial_max_stream_data_uni: 42u32.into(),
+            ..TransportParameters::default()
+        });
+
+        let state = ConnState::established();
+        let id = Streams {
+            state: &mut server,
+            conn_state: &state,
+        }
+        .open(Dir::Uni)
+        .unwrap();
+
+        let mut stream = SendStream {
+            id,
+            state: &mut server,
+            conn_state: &state,
+        };
+        assert_eq!(stream.write(b"hello"), Ok(5));
+        assert_eq!(stream.write(b"!"), Err(WriteError::Blocked));
+
+        // The peer may grant no connection credit until the reset that this error leads to
+        let error_code = 0u32.into();
+        stream.state.received_stop_sending(id, error_code);
+        assert_eq!(stream.write(b"!"), Err(WriteError::Stopped(error_code)));
+    }
+
+    #[test]
     fn final_offset_flow_control() {
         let mut client = make(Side::Client);
         assert_eq!(

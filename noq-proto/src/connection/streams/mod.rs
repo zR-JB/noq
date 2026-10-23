@@ -300,31 +300,13 @@ impl<'a> SendStream<'a> {
             .ok_or(WriteError::ClosedStream)?;
         stream.woken = false;
 
-        if limit == 0 {
-            trace!(
-                stream = %self.id, max_data = self.state.max_data, data_sent = self.state.data_sent,
-                "write blocked by connection-level flow control or send window"
-            );
-            if !stream.connection_blocked {
-                stream.connection_blocked = true;
-                if reserve_control_vec(
-                    &mut self.state.connection_blocked,
-                    Some(&mut self.state.blocked_allocation),
-                    1,
-                )
-                .is_ok()
-                {
-                    self.state.connection_blocked.push(self.id);
-                } else {
-                    self.state.allocation_failed = true;
-                }
-            }
-            return Err(WriteError::Blocked);
-        }
-
         let was_pending = stream.is_pending();
         let written = match stream.write(source, limit) {
             Err(WriteError::Blocked) => {
+                trace!(
+                    stream = %self.id, max_data = self.state.max_data, data_sent = self.state.data_sent,
+                    "write blocked by flow control or send window"
+                );
                 if !stream.connection_blocked {
                     stream.connection_blocked = true;
                     if reserve_control_vec(
