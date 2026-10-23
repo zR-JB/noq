@@ -158,11 +158,12 @@ impl Send {
         if let Some(error_code) = self.stop_reason {
             return Err(WriteError::Stopped(error_code));
         }
-        let budget = self.max_data - self.pending.offset();
-        if budget == 0 {
+        // After the stop: a peer may grant no connection credit until the reset that a stop leads to
+        let limit = limit.min(self.max_data - self.pending.offset());
+        if limit == 0 {
             return Err(WriteError::Blocked);
         }
-        let mut limit = limit.min(budget) as usize;
+        let mut limit = limit as usize;
 
         let mut result = Written::default();
         loop {
