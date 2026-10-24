@@ -56,7 +56,13 @@ impl PartialDecode {
                 "packet too short to contain payload length",
             )),
             Ordering::Greater => {
-                let rest = Some(buf.get_mut().split_off(packet_len));
+                // Coalesced packets get allocations of their own: a frame kept in its packet's
+                // buffer is charged at that packet's size, not the datagram's
+                let position = buf.position();
+                let data = buf.into_inner();
+                let rest = Some(BytesMut::from(&data[packet_len..]));
+                let mut buf = io::Cursor::new(BytesMut::from(&data[..packet_len]));
+                buf.set_position(position);
                 Ok((Self { plain_header, buf }, rest))
             }
         }

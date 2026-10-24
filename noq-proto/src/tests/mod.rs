@@ -6397,3 +6397,44 @@ fn crypto_backing_credit_survives_loss_and_handshake_cleanup() {
     assert_eq!(pair.client_conn_mut(client).send_allocated_bytes(), 0);
     assert_eq!(pair.server_conn_mut(server).send_allocated_bytes(), 0);
 }
+
+#[test]
+fn coalesced_packet_does_not_pin_its_datagram() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(b"0123456789").unwrap();
+    pair.client.drive(pair.time);
+    let (_, short) = pair.client.outbound.pop_front().unwrap();
+    pair.client.outbound.clear();
+    assert_eq!(short[0] & 0x80, 0, "expected a 1-RTT packet");
+    // An undecryptable Handshake packet coalesced in front of the real 1-RTT packet
+    const GARBAGE: usize = 60_000;
+    let mut datagram = BytesMut::new();
+    datagram.extend_from_slice(&[0xE0, 0, 0, 0, 1, 8]);
+    datagram.extend_from_slice(&short[1..9]);
+    datagram.extend_from_slice(&[0]);
+    datagram.extend_from_slice(&(0x8000_0000u32 | GARBAGE as u32).to_be_bytes());
+    datagram.extend_from_slice(&[0x5a; GARBAGE]);
+    datagram.extend_from_slice(&short);
+    let start = datagram.as_ptr() as usize;
+    let allocation = start..start + datagram.capacity();
+    pair.server.inbound.push(
+        pair.time,
+        util::Inbound {
+            ecn: None,
+            packet: datagram,
+            remote: Pair::CLIENT_ADDR,
+            dst_ip: Some(Pair::SERVER_ADDR.ip()),
+        },
+    );
+    pair.server.drive(pair.time);
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(id) if id == s);
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    let chunk = chunks.next(usize::MAX).unwrap().unwrap();
+    assert_eq!(&chunk.bytes[..], b"0123456789");
+    assert!(!allocation.contains(&(chunk.bytes.as_ptr() as usize)));
+}
