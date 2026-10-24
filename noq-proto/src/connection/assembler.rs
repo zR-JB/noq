@@ -14,6 +14,10 @@ use super::buffer_budget::{
 };
 
 use super::buffer_budget::COPY_BLOCK_BYTES;
+use crate::TransportError;
+
+/// Bound on the distinct received ranges of a stream read out of order
+const MAX_UNORDERED_GAPS: usize = 1024;
 
 /// Keep only the minimum, fully charged heap between reads on a live stream.
 const REUSABLE_BUFFER_CAPACITY: usize = 4;
@@ -265,7 +269,7 @@ impl Assembler {
         mut offset: u64,
         mut bytes: Bytes,
         allocation_size: usize,
-    ) -> Result<(), AllocationError> {
+    ) -> Result<(), TransportError> {
         debug_assert!(
             bytes.len() <= allocation_size,
             "allocation_size less than bytes.len(): {:?} < {:?}",
@@ -327,6 +331,12 @@ impl Assembler {
                 offset = duplicate.end;
             }
             recvd.insert(range);
+            // Each received range costs an O(n) insert into `recvd`, so gaps are capped
+            if recvd.ranges.range_count() > MAX_UNORDERED_GAPS {
+                return Err(TransportError::INTERNAL_ERROR(
+                    "too many gaps in stream buffer",
+                ));
+            }
         } else if offset < self.bytes_read {
             if (offset + bytes.len() as u64) <= self.bytes_read {
                 return Ok(());
@@ -1156,6 +1166,21 @@ mod test {
             read += chunk.bytes.len();
         }
         assert_eq!(read, 4096 * 1200);
+    }
+
+    #[test]
+    fn unordered_gaps_are_capped() {
+        let mut x = Assembler::new(BufferBudget::for_receive(64 * 1024 * 1024, None));
+        x.ensure_ordering(false).unwrap();
+        let mut result = Ok(());
+        for k in (0..2 * MAX_UNORDERED_GAPS as u64).rev() {
+            result = x.insert(2 * k + 1, Bytes::from_static(b"a"), 1);
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(result.is_err());
+        assert_eq!(x.data.len(), MAX_UNORDERED_GAPS);
     }
 
     #[test]
