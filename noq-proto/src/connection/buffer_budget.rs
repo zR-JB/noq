@@ -4,6 +4,7 @@ use core::{
     ops::Range,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
 };
+use std::sync::{Mutex, PoisonError};
 
 use bytes::Bytes;
 
@@ -32,8 +33,9 @@ pub(super) struct BufferBudget {
     limit: AtomicUsize,
     used: AtomicUsize,
     /// Bytes charged to the shared budget beyond the floor; at least what `used` needs once
-    /// concurrent acquires settle.
-    charged: AtomicUsize,
+    /// concurrent acquires settle. Changes read `used` under the lock, so a release cannot trim
+    /// below an acquire that raced it.
+    charged: Mutex<usize>,
     shared: Option<Arc<dyn SharedBudget>>,
     floor: usize,
     refused: AtomicBool,
@@ -60,7 +62,7 @@ impl BufferBudget {
                     .max(MIN_BUFFER_BYTES),
             ),
             used: AtomicUsize::new(0),
-            charged: AtomicUsize::new(0),
+            charged: Mutex::new(0),
             shared: shared.cloned(),
             floor,
             refused: AtomicBool::new(false),
@@ -98,7 +100,7 @@ impl BufferBudget {
 
     pub(super) fn acquire(self: &Arc<Self>, bytes: usize) -> Result<Allocation, AllocationError> {
         let mut used = self.used();
-        let next = loop {
+        loop {
             let next = used
                 .checked_add(bytes)
                 .filter(|&next| next <= self.limit.load(AtomicOrdering::Relaxed))
@@ -109,11 +111,11 @@ impl BufferBudget {
                 AtomicOrdering::Relaxed,
                 AtomicOrdering::Relaxed,
             ) {
-                Ok(_) => break next,
+                Ok(_) => break,
                 Err(current) => used = current,
             }
-        };
-        if let Err(error) = self.cover(self.beyond_floor(next)) {
+        }
+        if let Err(error) = self.cover() {
             self.used.fetch_sub(bytes, AtomicOrdering::Relaxed);
             self.refused.store(true, AtomicOrdering::Relaxed);
             return Err(error);
@@ -125,8 +127,8 @@ impl BufferBudget {
     }
 
     fn release(&self, bytes: usize) {
-        let used = self.used.fetch_sub(bytes, AtomicOrdering::Relaxed) - bytes;
-        self.trim(self.beyond_floor(used));
+        self.used.fetch_sub(bytes, AtomicOrdering::Relaxed);
+        self.trim();
         self.refused.store(false, AtomicOrdering::Relaxed);
     }
 
@@ -134,62 +136,43 @@ impl BufferBudget {
         used.saturating_sub(self.floor)
     }
 
-    /// Raises the shared charge to cover `need`, a step past it where that fits.
-    fn cover(&self, need: usize) -> Result<(), AllocationError> {
+    /// Raises the shared charge to cover what `used` needs, a step past it where that fits.
+    fn cover(&self) -> Result<(), AllocationError> {
         let Some(shared) = &self.shared else {
             return Ok(());
         };
-        let mut charged = self.charged.load(AtomicOrdering::Relaxed);
-        while charged < need {
-            let stepped = need.saturating_add(SHARED_STEP);
-            let target = if shared.try_charge(stepped - charged) {
-                stepped
-            } else if shared.try_charge(need - charged) {
-                need
-            } else {
-                return Err(AllocationError);
-            };
-            match self.charged.compare_exchange(
-                charged,
-                target,
-                AtomicOrdering::Relaxed,
-                AtomicOrdering::Relaxed,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(current) => {
-                    shared.refund(target - charged);
-                    charged = current;
-                }
-            }
+        let mut charged = self.charged.lock().unwrap_or_else(PoisonError::into_inner);
+        let need = self.beyond_floor(self.used());
+        if *charged >= need {
+            return Ok(());
         }
+        let stepped = need.saturating_add(SHARED_STEP);
+        *charged = if shared.try_charge(stepped - *charged) {
+            stepped
+        } else if shared.try_charge(need - *charged) {
+            need
+        } else {
+            return Err(AllocationError);
+        };
         Ok(())
     }
 
-    /// Returns the shared charge beyond one step past `need` once it exceeds two, or all of it
-    /// once nothing is needed.
-    fn trim(&self, need: usize) {
+    /// Returns the shared charge beyond one step past what `used` needs once it exceeds two,
+    /// or all of it once nothing is needed.
+    fn trim(&self) {
         let Some(shared) = &self.shared else {
             return;
         };
-        let mut charged = self.charged.load(AtomicOrdering::Relaxed);
-        loop {
-            let target = match need {
-                0 => 0,
-                _ if charged > need.saturating_add(2 * SHARED_STEP) => need + SHARED_STEP,
-                _ => return,
-            };
-            if charged <= target {
-                return;
-            }
-            match self.charged.compare_exchange(
-                charged,
-                target,
-                AtomicOrdering::Relaxed,
-                AtomicOrdering::Relaxed,
-            ) {
-                Ok(_) => return shared.refund(charged - target),
-                Err(current) => charged = current,
-            }
+        let mut charged = self.charged.lock().unwrap_or_else(PoisonError::into_inner);
+        let need = self.beyond_floor(self.used());
+        let target = match need {
+            0 => 0,
+            _ if *charged > need.saturating_add(2 * SHARED_STEP) => need + SHARED_STEP,
+            _ => return,
+        };
+        if *charged > target {
+            shared.refund(*charged - target);
+            *charged = target;
         }
     }
 }
@@ -197,7 +180,8 @@ impl BufferBudget {
 impl Drop for BufferBudget {
     fn drop(&mut self) {
         if let Some(shared) = &self.shared {
-            let charged = self.floor + *self.charged.get_mut();
+            let charged = self.floor
+                + *self.charged.get_mut().unwrap_or_else(PoisonError::into_inner);
             if charged != 0 {
                 shared.refund(charged);
             }
