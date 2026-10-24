@@ -399,7 +399,16 @@ impl Connection {
             config.stream_receive_window,
             shared,
         );
-        let datagrams = DatagramState::new(streams.receive_budget(), streams.send_budget());
+        // Received datagrams get a budget of their own, so they cannot take the reassembly room
+        // that stream credit already granted needs. Without a floor, a refused charge drops them.
+        let datagrams = DatagramState::new(
+            buffer_budget::BufferBudget::with_floor(
+                (config.datagram_receive_buffer_size.unwrap_or(0) as u64).saturating_mul(4),
+                shared,
+                0,
+            ),
+            streams.send_budget(),
+        );
         let mut this = Self {
             endpoint_config,
             crypto_state,
@@ -3094,6 +3103,11 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn receive_buffer_allocated_bytes(&self) -> usize {
         self.streams.receive_budget().used()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn datagram_receive_allocated_bytes(&self) -> usize {
+        self.datagrams.received_allocated_bytes()
     }
 
     #[cfg(test)]

@@ -197,6 +197,11 @@ impl DatagramState {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn received_allocated_bytes(&self) -> usize {
+        self.incoming.allocation.budget.used()
+    }
+
     fn block_send(&mut self, length: usize) {
         self.blocked_send_bytes = Some(
             self.blocked_send_bytes

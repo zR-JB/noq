@@ -2755,18 +2755,18 @@ fn tiny_datagrams_do_not_retain_packet_storage() {
     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap().len(), 1024);
     assert!(
         pair.server_conn_mut(server_ch)
-            .receive_buffer_allocated_bytes()
+            .datagram_receive_allocated_bytes()
             < 512
     );
     assert!(
         pair.server_conn_mut(server_ch)
-            .receive_buffer_allocated_bytes()
+            .datagram_receive_allocated_bytes()
             > 0
     );
     drop(tiny);
     assert_eq!(
         pair.server_conn_mut(server_ch)
-            .receive_buffer_allocated_bytes(),
+            .datagram_receive_allocated_bytes(),
         0
     );
 }
@@ -6437,4 +6437,45 @@ fn coalesced_packet_does_not_pin_its_datagram() {
     let chunk = chunks.next(usize::MAX).unwrap().unwrap();
     assert_eq!(&chunk.bytes[..], b"0123456789");
     assert!(!allocation.contains(&(chunk.bytes.as_ptr() as usize)));
+}
+
+#[test]
+fn unread_datagrams_leave_reassembly_room_for_granted_credit() {
+    let _guard = subscribe();
+    const WINDOW: usize = 64 * 1024;
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            receive_window: (WINDOW as u32).into(),
+            datagram_receive_buffer_size: Some(WINDOW),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+    for _ in 0..WINDOW / size_of::<Datagram>() {
+        pair.client_datagrams(client_ch)
+            .send(Bytes::from_static(b"x"), true)
+            .unwrap();
+        pair.drive();
+    }
+    assert!(
+        pair.server_conn_mut(server_ch)
+            .datagram_receive_allocated_bytes()
+            > WINDOW
+    );
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s)
+        .write(&[0; WINDOW / 2])
+        .unwrap();
+    pair.drive();
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Uni), Some(id) if id == s);
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(true).unwrap();
+    let mut read = 0;
+    while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+        read += chunk.bytes.len();
+    }
+    let _ = chunks.finalize();
+    assert_eq!(read, WINDOW / 2);
 }
