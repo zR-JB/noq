@@ -1371,6 +1371,13 @@ impl StreamsState {
     /// queued, the [`Recv::record_sent_max_stream_data`] function should be called to
     /// suppress sending further updates until the window increases significantly
     /// again.
+    /// Issues credit for bytes the application read; only reads tune the receive window
+    pub(super) fn add_bytes_read(&mut self, bytes: u64) -> ShouldTransmit {
+        self.bytes_read = self.bytes_read.saturating_add(bytes);
+        self.tune_receive_window();
+        self.add_read_credits(bytes)
+    }
+
     pub(super) fn add_read_credits(&mut self, credits: u64) -> ShouldTransmit {
         let paid = credits.min(self.receive_window_shrink_debt);
         if paid != 0 {
@@ -1378,8 +1385,6 @@ impl StreamsState {
             self.limit_reassembly();
         }
         self.local_max_data = self.local_max_data.saturating_add(credits - paid);
-        self.bytes_read = self.bytes_read.saturating_add(credits);
-        self.tune_receive_window();
 
         if self.local_max_data > VarInt::MAX.into_inner() {
             return ShouldTransmit(false);
@@ -1514,6 +1519,32 @@ mod tests {
     }
 
     #[test]
+    fn discarded_stream_data_does_not_tune_the_receive_window() {
+        let mut state = StreamsState::new(
+            Side::Server,
+            64u32.into(),
+            64u32.into(),
+            1 << 20,
+            (16u32 << 20).into(),
+            Some((64 * 1024u32).into()),
+            (1u32 << 20).into(),
+            None,
+        );
+        let (start, rtt) = (Instant::now(), Duration::from_millis(50));
+        for i in 0..40 {
+            state.note_arrival(start + Duration::from_millis(i), rtt);
+            let _ = state
+                .received_reset(frame::ResetStream {
+                    id: StreamId::new(Side::Client, Dir::Uni, i),
+                    error_code: 0u32.into(),
+                    final_offset: VarInt::from_u64(state.receive_window / 2 + 1).unwrap(),
+                })
+                .unwrap();
+        }
+        assert_eq!(state.receive_window, 64 * 1024);
+    }
+
+    #[test]
     fn receive_window_doubles_while_half_is_read_within_two_round_trips() {
         let mut state = StreamsState::new(
             Side::Server,
@@ -1528,20 +1559,20 @@ mod tests {
         assert_eq!(state.local_max_data, 64 * 1024);
         let (start, rtt) = (Instant::now(), Duration::from_millis(10));
         state.note_arrival(start, rtt);
-        let _ = state.add_read_credits(1);
+        let _ = state.add_bytes_read(1);
         state.note_arrival(start + Duration::from_millis(15), rtt);
-        let _ = state.add_read_credits(40 * 1024);
+        let _ = state.add_bytes_read(40 * 1024);
         assert_eq!(state.receive_window, 128 * 1024);
         assert_eq!(state.local_max_data, 128 * 1024 + 40 * 1024 + 1);
         // Half the window in more than two round trips keeps it.
         state.note_arrival(start + Duration::from_millis(100), rtt);
-        let _ = state.add_read_credits(80 * 1024);
+        let _ = state.add_bytes_read(80 * 1024);
         assert_eq!(state.receive_window, 128 * 1024);
         state.note_arrival(start + Duration::from_millis(101), rtt);
-        let _ = state.add_read_credits(80 * 1024);
+        let _ = state.add_bytes_read(80 * 1024);
         assert_eq!(state.receive_window, 256 * 1024);
         state.note_arrival(start + Duration::from_millis(102), rtt);
-        let _ = state.add_read_credits(160 * 1024);
+        let _ = state.add_bytes_read(160 * 1024);
         assert_eq!(state.receive_window, 256 * 1024, "the limit caps growth");
         // A higher limit leaves the window to autotuning; a lower one shrinks it.
         state.set_receive_window((1024 * 1024u32).into());

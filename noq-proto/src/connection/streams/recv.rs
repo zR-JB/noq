@@ -551,7 +551,7 @@ impl<'a> Chunks<'a> {
         }
 
         // Issue connection-level flow control credit for any data we read regardless of state
-        let max_data = self.streams.add_read_credits(self.read);
+        let max_data = self.streams.add_bytes_read(self.read);
         self.pending.max_data |= max_data.0;
         should_transmit |= max_data.0;
         ShouldTransmit(should_transmit)
