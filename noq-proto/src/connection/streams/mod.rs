@@ -274,7 +274,7 @@ impl<'a> SendStream<'a> {
     /// and charges its length, so the caller must already account for the chunk's backing.
     pub fn write_leased_chunks(&mut self, data: &mut &mut [Bytes]) -> Result<usize, WriteError> {
         let written = self.write_source(&mut LeasedArray(BytesArray::from_chunks(data)))?;
-        *data = &mut std::mem::take(data)[written.chunks..];
+        *data = &mut core::mem::take(data)[written.chunks..];
         Ok(written.bytes)
     }
 

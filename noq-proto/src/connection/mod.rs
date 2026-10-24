@@ -378,15 +378,14 @@ impl Connection {
             ),
         )]);
 
-        let crypto_state =
-            CryptoState::new(
-                crypto,
-                init_cid,
-                side,
-                &mut rng,
-                config.crypto_buffer_size,
-                shared,
-            );
+        let crypto_state = CryptoState::new(
+            crypto,
+            init_cid,
+            side,
+            &mut rng,
+            config.crypto_buffer_size,
+            shared,
+        );
         #[cfg(test)]
         let crypto_state = crypto_state.with_key_phase_size(config.initial_key_phase_size);
 
@@ -1565,7 +1564,12 @@ impl Connection {
             };
             let mut allocation = reserve(self);
             // A connection unable to send cannot detect another loss to retire these records.
-            if allocation.is_none() && !self.spaces[space_id].for_path(path_id).lost_packets.is_empty() {
+            if allocation.is_none()
+                && !self.spaces[space_id]
+                    .for_path(path_id)
+                    .lost_packets
+                    .is_empty()
+            {
                 self.drain_lost_packets(now, space_id, path_id);
                 allocation = reserve(self);
             }

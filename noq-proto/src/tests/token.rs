@@ -36,7 +36,8 @@ fn oversized_cached_initial_token() {
             .unwrap();
         let mut buf = Vec::new();
         assert_eq!(
-            conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).is_some(),
+            conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+                .is_some(),
             fits,
             "token {token_len}, MTU {mtu}"
         );
@@ -49,7 +50,10 @@ fn oversized_cached_initial_token() {
                 Some(Event::ConnectionLost { reason: ConnectionError::TransportError(err) })
                 if err.code == TransportErrorCode::PROTOCOL_VIOLATION
             );
-            assert!(conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).is_none());
+            assert!(
+                conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+                    .is_none()
+            );
             assert!(buf.is_empty());
         }
     }
@@ -64,7 +68,9 @@ fn client_after_retry(token_len: usize, echo_dcid: bool) -> (Connection, Instant
         .connect(now, client_config(), address, "localhost")
         .unwrap();
     let mut buf = Vec::new();
-    let _ = conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).unwrap();
+    let _ = conn
+        .poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+        .unwrap();
     let mut bytes = BytesMut::new();
     bytes.extend_from_slice(&buf);
     let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
@@ -112,7 +118,11 @@ fn oversized_retry_token() {
         let now = now + Duration::from_secs(1);
         let crypto_before = conn.stats().frame_tx.crypto;
         let mut buf = Vec::new();
-        assert_eq!(conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).is_some(), fits);
+        assert_eq!(
+            conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+                .is_some(),
+            fits
+        );
         if fits {
             assert!(conn.stats().frame_tx.crypto > crypto_before);
             assert!(buf.len() <= 1200);
@@ -122,7 +132,10 @@ fn oversized_retry_token() {
                 Some(Event::ConnectionLost { reason: ConnectionError::TransportError(err) })
                 if err.code == TransportErrorCode::PROTOCOL_VIOLATION
             );
-            assert!(conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).is_none());
+            assert!(
+                conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+                    .is_none()
+            );
             assert!(buf.is_empty());
         }
     }
@@ -135,7 +148,8 @@ fn retry_from_initial_dcid_is_discarded() {
         let (mut conn, now) = client_after_retry(64, echo_dcid);
         let mut buf = Vec::new();
         assert_eq!(
-            conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf).is_some(),
+            conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf)
+                .is_some(),
             !echo_dcid
         );
     }

@@ -1,10 +1,9 @@
-use alloc::vec::Vec;
-use std::{
-    cmp::Ordering,
+use alloc::{
     collections::{BinaryHeap, binary_heap::PeekMut},
-    mem,
     sync::Arc,
+    vec::Vec,
 };
+use core::{cmp::Ordering, mem};
 
 use bytes::{Buf, Bytes};
 
@@ -542,7 +541,7 @@ mod test {
 
     use super::*;
     use assert_matches::assert_matches;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
     fn copied_backing_estimate_excludes_discarded_packet_storage() {
@@ -556,7 +555,10 @@ mod test {
         }
         // No artificial fragmentation or compaction from the discarded packet allocation.
         assert_eq!(assembler.data.len(), 40);
-        assert_eq!(assembler.allocated, 40 * (1024 + OwnedBacking::OVERHEAD_BYTES));
+        assert_eq!(
+            assembler.allocated,
+            40 * (1024 + OwnedBacking::OVERHEAD_BYTES)
+        );
         for frame in 0..40 {
             let chunk = assembler.read(usize::MAX, true).unwrap();
             assert_eq!(chunk.offset, frame * 1024);
@@ -620,7 +622,9 @@ mod test {
 
         for offset in 0..3 {
             if offset != 0 {
-                assembler.insert(offset, Bytes::from_static(b"a"), 1).unwrap();
+                assembler
+                    .insert(offset, Bytes::from_static(b"a"), 1)
+                    .unwrap();
             }
             let chunk = assembler.read(usize::MAX, true).unwrap();
             assert_eq!(chunk.offset, offset);
@@ -651,7 +655,9 @@ mod test {
         let budget = BufferBudget::for_receive(1, None);
         let mut assembler = Assembler::new(budget.clone());
         for offset in 0..5 {
-            assembler.insert(offset, Bytes::from_static(b"a"), 1).unwrap();
+            assembler
+                .insert(offset, Bytes::from_static(b"a"), 1)
+                .unwrap();
         }
         assert!(assembler.data.capacity() > REUSABLE_BUFFER_CAPACITY);
         for offset in 0..5 {

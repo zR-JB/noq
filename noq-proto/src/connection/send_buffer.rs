@@ -1,6 +1,6 @@
-use alloc::{collections::VecDeque, sync::Arc};
 #[cfg(test)]
 use alloc::vec::Vec;
+use alloc::{collections::VecDeque, sync::Arc};
 use core::{mem, ops::Range};
 
 use super::buffer_budget::COPY_BLOCK_BYTES;
@@ -1111,8 +1111,8 @@ pub mod send_buffer_benches {
     //!
     //! These are defined here and re-exported via `bench_exports` in lib.rs,
     //! so we can access the private `SendBuffer` struct.
-    use alloc::{vec, vec::Vec};
     use alloc::collections::VecDeque;
+    use alloc::{vec, vec::Vec};
 
     use bytes::Bytes;
     use criterion::{Criterion, Throughput};
@@ -1200,7 +1200,7 @@ pub mod send_buffer_benches {
                             break;
                         }
                         packet.clear();
-                        buf.get_into(range.clone(), std::hint::black_box(&mut packet));
+                        buf.get_into(range.clone(), core::hint::black_box(&mut packet));
                         unacked += range.end - range.start;
                         sent.push_back(range);
                     }

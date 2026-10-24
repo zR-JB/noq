@@ -18,8 +18,7 @@ use tracing::trace;
 
 use super::{PathId, paths::PathResponses, paths::PathRetransmits};
 use crate::{
-    Dir, Duration, FourTuple, Instant, StreamId, TransportError,
-    TransportErrorCode, VarInt,
+    Dir, Duration, FourTuple, Instant, StreamId, TransportError, TransportErrorCode, VarInt,
     cid_queue::CidQueue,
     connection::StreamsState,
     frame::{self, AddAddress, RemoveAddress},

@@ -490,8 +490,8 @@ impl Default for DatagramState {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     use super::*;
 

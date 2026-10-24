@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, mem, ops::RangeBounds, sync::Arc};
+use alloc::{collections::BTreeMap, sync::Arc};
+use core::{mem, ops::RangeBounds};
 
 use super::buffer_budget::{Allocation, AllocationError, BufferBudget};
 

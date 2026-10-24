@@ -1,7 +1,7 @@
-use alloc::boxed::Box;
 use crate::connection::buffer_budget::{AllocationError, BufferBudget};
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use bytes::Bytes;
-use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{

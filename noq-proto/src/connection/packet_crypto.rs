@@ -123,7 +123,7 @@ impl CryptoState {
     ) -> Self {
         let initial_keys = session.initial_keys(init_cid, side);
         let budget = BufferBudget::for_receive(buffer_size as u64, shared);
-        let mut spaces = std::array::from_fn(|_| CryptoSpace {
+        let mut spaces = core::array::from_fn(|_| CryptoSpace {
             keys: None,
             crypto_stream: Assembler::new(budget.clone()),
             crypto_offset: 0,

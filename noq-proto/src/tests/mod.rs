@@ -1620,7 +1620,7 @@ impl CoalescedDatagram {
         ConnectionEvent(ConnectionEventInner::Datagram(DatagramConnectionEvent {
             storage_size: self.first_decode.data().len()
                 + self.remaining.as_ref().map_or(0, |x| x.len())
-                + std::mem::size_of::<DatagramConnectionEvent>(),
+                + core::mem::size_of::<DatagramConnectionEvent>(),
             now,
             network_path: FourTuple {
                 remote: self.remote,
@@ -2711,7 +2711,7 @@ fn empty_datagram_flood_is_bounded_and_reusable() {
         );
         pair.drive();
         assert!(
-            std::iter::from_fn(|| pair.client_conn_mut(client_ch).poll())
+            core::iter::from_fn(|| pair.client_conn_mut(client_ch).poll())
                 .any(|event| matches!(event, Event::DatagramsUnblocked))
         );
         for _ in 0..WINDOW * 2 {

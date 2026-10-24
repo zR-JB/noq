@@ -81,7 +81,7 @@ where
 
     pub(crate) fn with_capacity(
         capacity: usize,
-    ) -> Result<Self, std::collections::TryReserveError> {
+    ) -> Result<Self, alloc::collections::TryReserveError> {
         let mut ranges = Vec::new();
         ranges.try_reserve_exact(capacity)?;
         Ok(Self(TinyVec::Heap(ranges)))

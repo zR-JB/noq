@@ -155,7 +155,7 @@ impl Endpoint {
     ) -> Option<DatagramEvent> {
         // Partially decode packet or short-circuit if unable
         let datagram_len = data.len();
-        let storage_size = data.capacity() + std::mem::size_of::<DatagramConnectionEvent>();
+        let storage_size = data.capacity() + core::mem::size_of::<DatagramConnectionEvent>();
         let mut event = match PartialDecode::new(
             data,
             &FixedLengthConnectionIdParser::new(self.local_cid_generator.cid_len()),

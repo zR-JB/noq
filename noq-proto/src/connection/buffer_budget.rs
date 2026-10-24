@@ -1,14 +1,13 @@
-use alloc::vec::Vec;
-use crate::{TransportError, range_set::ArrayRangeSet};
-use bytes::Bytes;
-use std::{
+use alloc::{sync::Arc, vec::Vec};
+use core::{
     fmt, mem,
     ops::Range,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
-    },
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
 };
+
+use bytes::Bytes;
+
+use crate::{TransportError, range_set::ArrayRangeSet};
 
 pub(super) const COPY_BLOCK_BYTES: usize = 16 * 1024;
 
