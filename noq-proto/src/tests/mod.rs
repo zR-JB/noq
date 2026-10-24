@@ -1025,6 +1025,7 @@ fn zero_rtt_rejection() {
     assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
     let s2 = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     assert_eq!(s, s2);
+    assert_eq!(pair.client_conn_mut(client_ch).send_buffered_bytes(), 0);
 
     // `s2` was never successfully received by the server, so from its perspective the
     // stream has never been opened. We currently surface that as `ClosedStream`.
