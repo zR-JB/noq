@@ -539,6 +539,9 @@ mod test {
     use alloc::vec;
     use alloc::vec::Vec;
 
+    use rand::prelude::*;
+    use rand_pcg::Pcg32;
+
     use super::*;
     use assert_matches::assert_matches;
     use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -1108,6 +1111,121 @@ mod test {
         );
         x.ensure_ordering(false).unwrap();
         assert_eq!(x.read(1, false), None); // should be None, byte 0 already returned
+    }
+
+    #[test]
+    fn ordered_partial_overlap() {
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
+        x.insert(0, Bytes::from_static(b"0123456789"), 10).unwrap();
+        x.insert(2, Bytes::from_static(b"23456789abcdef"), 14)
+            .unwrap();
+        let chunk = x.read(5, true).unwrap();
+        assert_eq!(&chunk.bytes[..], b"01234");
+        let mut got = chunk.bytes.to_vec();
+        while let Some(chunk) = x.read(usize::MAX, true) {
+            got.extend_from_slice(&chunk.bytes);
+        }
+        assert_eq!(&got[..], b"0123456789abcdef");
+    }
+
+    #[test]
+    fn defrag_mixed_order() {
+        let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
+        // Too badly utilized to be marked defragmented, unlike the chunk after it
+        x.insert(0, Bytes::from_static(b"a"), 4096).unwrap();
+        x.insert(1, Bytes::from_static(b"bcdefghij"), 9).unwrap();
+        x.defragment().unwrap();
+        let mut got = Vec::new();
+        while let Some(chunk) = x.read(usize::MAX, true) {
+            got.extend_from_slice(&chunk.bytes);
+        }
+        assert_eq!(&got[..], b"abcdefghij");
+    }
+
+    #[test]
+    fn bulk_behind_one_loss_is_buffered() {
+        // A chunk count cap would reject a window's worth of packets queued behind one loss
+        let mut x = Assembler::new(BufferBudget::for_receive(64 * 1024 * 1024, None));
+        let packet = Bytes::from(vec![7; 1200]);
+        for k in 1..4096 {
+            x.insert(k * 1200, packet.clone(), 1252).unwrap();
+        }
+        x.insert(0, packet, 1252).unwrap();
+        let mut read = 0;
+        while let Some(chunk) = x.read(usize::MAX, true) {
+            read += chunk.bytes.len();
+        }
+        assert_eq!(read, 4096 * 1200);
+    }
+
+    #[test]
+    fn assemble_random() {
+        random_stream(true);
+    }
+
+    #[test]
+    fn assemble_random_unordered() {
+        random_stream(false);
+    }
+
+    fn random_stream(ordered: bool) {
+        const LEN: usize = 2048;
+        let mut rng = Pcg32::from_seed(0xdeadbeefdeadbeefdeadbeefdeadbeef_u128.to_le_bytes());
+        let stream: Vec<u8> = (0..LEN).map(|_| rng.random()).collect();
+        for _ in 0..64 {
+            let mut frags = Vec::new();
+            let mut at = 0;
+            while at < LEN {
+                let size = rng.random_range(1..=32).min(LEN - at);
+                frags.push((at as u64, size));
+                at += size;
+            }
+            // Retransmits are refragmented from scratch, so they overlap the original frames at
+            // arbitrary boundaries rather than repeating them
+            for _ in 0..frags.len() / 4 {
+                let start = rng.random_range(0..LEN);
+                let end = (start + rng.random_range(1..=64)).min(LEN);
+                let mut at = start;
+                while at < end {
+                    let size = rng.random_range(1..=32).min(end - at);
+                    frags.push((at as u64, size));
+                    at += size;
+                }
+            }
+            frags.shuffle(&mut rng);
+
+            let mut x = Assembler::new(BufferBudget::for_receive(1024 * 1024, None));
+            if !ordered {
+                x.ensure_ordering(false).unwrap();
+            }
+            let mut delivered = vec![false; LEN];
+            for (offset, size) in frags {
+                let bytes =
+                    Bytes::copy_from_slice(&stream[offset as usize..offset as usize + size]);
+                x.insert(offset, bytes, size).unwrap();
+                if rng.random_ratio(1, 3) {
+                    let max = rng.random_range(1..=64);
+                    drain(&mut x, max, ordered, &stream, &mut delivered);
+                }
+            }
+            drain(&mut x, usize::MAX, ordered, &stream, &mut delivered);
+            assert!(
+                delivered.iter().all(|d| *d),
+                "stream did not fully assemble"
+            );
+        }
+    }
+
+    fn drain(x: &mut Assembler, max: usize, ordered: bool, stream: &[u8], delivered: &mut [bool]) {
+        while let Some(chunk) = x.read(max, ordered) {
+            let start = chunk.offset as usize;
+            let end = start + chunk.bytes.len();
+            assert_eq!(&chunk.bytes[..], &stream[start..end]);
+            for d in &mut delivered[start..end] {
+                assert!(!*d, "offset {start} delivered twice");
+                *d = true;
+            }
+        }
     }
 
     fn next_unordered(x: &mut Assembler) -> Chunk {
