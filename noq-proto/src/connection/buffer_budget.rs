@@ -181,7 +181,10 @@ impl Drop for BufferBudget {
     fn drop(&mut self) {
         if let Some(shared) = &self.shared {
             let charged = self.floor
-                + *self.charged.get_mut().unwrap_or_else(PoisonError::into_inner);
+                + *self
+                    .charged
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner);
             if charged != 0 {
                 shared.refund(charged);
             }

@@ -77,8 +77,14 @@ impl Recv {
         // Don't bother storing data or releasing stream-level flow control credit if the stream's
         // already stopped
         if !self.stopped {
-            self.assembler
-                .insert(frame.offset, frame.data, payload_len)?;
+            let mut data = frame.data;
+            // Data past a reliable reset's size is never delivered and its credit is returned
+            if let RecvState::ResetRecvdAt { reliable_size, .. } = self.state {
+                data.truncate(reliable_size.saturating_sub(frame.offset) as usize);
+            }
+            if !data.is_empty() {
+                self.assembler.insert(frame.offset, data, payload_len)?;
+            }
         }
 
         Ok((new_bytes, self.stop_complete()))
@@ -819,6 +825,24 @@ mod tests {
         // Retransmitted reliable data [20, 40) arriving after the reset must not consume any more
         // connection credit: the final size was already fully accounted.
         assert_eq!(ingest_at(&mut r, 20, 20, 100), 0);
+    }
+
+    #[test]
+    fn reset_at_buffers_nothing_past_the_reliable_size() {
+        let budget = BufferBudget::for_receive(WINDOW, None);
+        let mut r = Recv::new(WINDOW, budget.clone());
+        r.reset_at(0u32.into(), 100u32.into(), 40u32.into(), 0, WINDOW)
+            .unwrap();
+        let before = budget.used();
+        ingest_at(&mut r, 40, 60, 100);
+        assert_eq!(budget.used(), before);
+        ingest_at(&mut r, 30, 30, 100);
+        assert_eq!(r.assembler.read(usize::MAX, true), None);
+        ingest_at(&mut r, 0, 30, 100);
+        let chunk = r.assembler.read(usize::MAX, true).unwrap();
+        assert_eq!((chunk.offset, chunk.bytes.len()), (0, 30));
+        let chunk = r.assembler.read(usize::MAX, true).unwrap();
+        assert_eq!((chunk.offset, chunk.bytes.len()), (30, 10));
     }
 
     #[test]
