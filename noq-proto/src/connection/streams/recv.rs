@@ -317,6 +317,7 @@ impl Recv {
                     reliable_size: deliver_cap,
                     error_code,
                 };
+                self.assembler.discard_from(deliver_cap);
                 // Release connection credit for data between the old and new caps that will no
                 // longer be delivered. The final size, and thus `data_recvd`, is unchanged.
                 Ok(ResetAtOutcome::Applied {
@@ -336,6 +337,7 @@ impl Recv {
                     reliable_size: deliver_cap,
                     error_code,
                 };
+                self.assembler.discard_from(deliver_cap);
                 // Release connection credit for the tail beyond the reliable size, which will never
                 // be delivered. Data up to the reliable size releases its credit as it is read.
                 Ok(ResetAtOutcome::Applied {
@@ -843,6 +845,24 @@ mod tests {
         assert_eq!((chunk.offset, chunk.bytes.len()), (0, 30));
         let chunk = r.assembler.read(usize::MAX, true).unwrap();
         assert_eq!((chunk.offset, chunk.bytes.len()), (30, 10));
+    }
+
+    #[test]
+    fn reset_at_drops_data_buffered_past_the_reliable_size() {
+        let budget = BufferBudget::for_receive(WINDOW, None);
+        let mut r = Recv::new(WINDOW, budget.clone());
+        ingest_at(&mut r, 1, 599, 0);
+        r.reset_at(0u32.into(), 600u32.into(), 300u32.into(), 600, WINDOW)
+            .unwrap();
+        let straddling = budget.used();
+        r.reset_at(0u32.into(), 600u32.into(), 1u32.into(), 600, WINDOW)
+            .unwrap();
+        assert!(budget.used() < straddling);
+        assert_eq!(r.assembler.read(usize::MAX, true), None);
+        ingest_at(&mut r, 0, 1, 600);
+        let chunk = r.assembler.read(usize::MAX, true).unwrap();
+        assert_eq!((chunk.offset, chunk.bytes.len()), (0, 1));
+        assert_eq!(r.assembler.read(usize::MAX, true), None);
     }
 
     #[test]

@@ -374,6 +374,24 @@ impl Assembler {
         Ok(())
     }
 
+    /// Drops buffered data at or past `offset`
+    pub(super) fn discard_from(&mut self, offset: u64) {
+        let mut buffers = mem::take(&mut self.data).into_vec();
+        buffers.retain_mut(|chunk| {
+            let keep = offset
+                .saturating_sub(chunk.offset)
+                .min(chunk.bytes.len() as u64) as usize;
+            self.buffered -= chunk.bytes.len() - keep;
+            if keep == 0 {
+                self.allocated -= chunk.allocation_size;
+                return false;
+            }
+            chunk.bytes.truncate(keep);
+            true
+        });
+        self.data = BinaryHeap::from(buffers);
+    }
+
     /// Number of bytes consumed by the application
     pub(super) fn bytes_read(&self) -> u64 {
         self.bytes_read
