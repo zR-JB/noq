@@ -300,6 +300,7 @@ impl Recv {
             RecvState::ResetRecvdAt {
                 reliable_size: prev_cap,
                 error_code: prev_code,
+                mut discarded,
                 ..
             } => {
                 // The error code is immutable across frames for the same stream (RFC §5.2).
@@ -312,12 +313,18 @@ impl Recv {
                     // The reliable size did not decrease; the spec requires ignoring increases.
                     return Ok(ResetAtOutcome::Ignored);
                 }
+                // Each drop scans the stream, so only once the undelivered span has halved
+                let prefix = self.assembler.delivered_prefix();
+                if deliver_cap - prefix <= (discarded - prefix) / 2 {
+                    self.assembler.discard_from(deliver_cap);
+                    discarded = deliver_cap;
+                }
                 self.state = RecvState::ResetRecvdAt {
                     size: final_size,
                     reliable_size: deliver_cap,
                     error_code,
+                    discarded,
                 };
-                self.assembler.discard_from(deliver_cap);
                 // Release connection credit for data between the old and new caps that will no
                 // longer be delivered. The final size, and thus `data_recvd`, is unchanged.
                 Ok(ResetAtOutcome::Applied {
@@ -336,6 +343,7 @@ impl Recv {
                     size: final_size,
                     reliable_size: deliver_cap,
                     error_code,
+                    discarded: deliver_cap,
                 };
                 self.assembler.discard_from(deliver_cap);
                 // Release connection credit for the tail beyond the reliable size, which will never
@@ -655,6 +663,8 @@ enum RecvState {
         size: u64,
         reliable_size: u64,
         error_code: VarInt,
+        /// Reliable size when buffered data past it was last dropped
+        discarded: u64,
     },
 }
 
