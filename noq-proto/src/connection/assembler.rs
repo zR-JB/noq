@@ -390,6 +390,12 @@ impl Assembler {
             true
         });
         self.data = BinaryHeap::from(buffers);
+        if self.data.is_empty() && self.data.capacity() > REUSABLE_BUFFER_CAPACITY {
+            self.data = BinaryHeap::new();
+            self.allocation
+                .resize(0)
+                .expect("releasing reassembly allocation");
+        }
     }
 
     /// Number of bytes consumed by the application
@@ -1199,6 +1205,18 @@ mod test {
         }
         assert!(result.is_err());
         assert_eq!(x.data.len(), MAX_UNORDERED_GAPS);
+    }
+
+    #[test]
+    fn discarding_everything_releases_the_heap() {
+        let budget = BufferBudget::for_receive(1024 * 1024, None);
+        let mut x = Assembler::new(budget.clone());
+        for k in 1..1000 {
+            x.insert(2 * k, Bytes::from_static(b"a"), 1).unwrap();
+        }
+        x.discard_from(0);
+        assert!(x.data.capacity() <= REUSABLE_BUFFER_CAPACITY);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
