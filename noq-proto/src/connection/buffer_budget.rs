@@ -33,9 +33,9 @@ pub(super) struct BufferBudget {
     limit: AtomicUsize,
     used: AtomicUsize,
     /// Bytes charged to the shared budget beyond the floor; at least what `used` needs once
-    /// concurrent acquires settle. Changes read `used` under the lock, so a release cannot trim
-    /// below an acquire that raced it.
-    charged: Mutex<usize>,
+    /// concurrent acquires settle. Written only under `charging`.
+    charged: AtomicUsize,
+    charging: Mutex<()>,
     shared: Option<Arc<dyn SharedBudget>>,
     floor: usize,
     refused: AtomicBool,
@@ -62,7 +62,8 @@ impl BufferBudget {
                     .max(MIN_BUFFER_BYTES),
             ),
             used: AtomicUsize::new(0),
-            charged: Mutex::new(0),
+            charged: AtomicUsize::new(0),
+            charging: Mutex::new(()),
             shared: shared.cloned(),
             floor,
             refused: AtomicBool::new(false),
@@ -108,7 +109,7 @@ impl BufferBudget {
             match self.used.compare_exchange(
                 used,
                 next,
-                AtomicOrdering::Relaxed,
+                AtomicOrdering::SeqCst,
                 AtomicOrdering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -127,13 +128,16 @@ impl BufferBudget {
     }
 
     fn release(&self, bytes: usize) {
-        self.used.fetch_sub(bytes, AtomicOrdering::Relaxed);
+        self.used.fetch_sub(bytes, AtomicOrdering::SeqCst);
         self.trim();
         self.refused.store(false, AtomicOrdering::Relaxed);
     }
 
-    fn beyond_floor(&self, used: usize) -> usize {
-        used.saturating_sub(self.floor)
+    /// Shared bytes `used` needs beyond the floor
+    fn need(&self) -> usize {
+        self.used
+            .load(AtomicOrdering::SeqCst)
+            .saturating_sub(self.floor)
     }
 
     /// Raises the shared charge to cover what `used` needs, a step past it where that fits.
@@ -141,19 +145,23 @@ impl BufferBudget {
         let Some(shared) = &self.shared else {
             return Ok(());
         };
-        let mut charged = self.charged.lock().unwrap_or_else(PoisonError::into_inner);
-        let need = self.beyond_floor(self.used());
-        if *charged >= need {
+        if self.charged.load(AtomicOrdering::SeqCst) >= self.need() {
+            return Ok(());
+        }
+        let _charging = self.charging.lock().unwrap_or_else(PoisonError::into_inner);
+        let (charged, need) = (self.charged.load(AtomicOrdering::SeqCst), self.need());
+        if charged >= need {
             return Ok(());
         }
         let stepped = need.saturating_add(SHARED_STEP);
-        *charged = if shared.try_charge(stepped - *charged) {
+        let target = if shared.try_charge(stepped - charged) {
             stepped
-        } else if shared.try_charge(need - *charged) {
+        } else if shared.try_charge(need - charged) {
             need
         } else {
             return Err(AllocationError);
         };
+        self.charged.store(target, AtomicOrdering::SeqCst);
         Ok(())
     }
 
@@ -163,28 +171,39 @@ impl BufferBudget {
         let Some(shared) = &self.shared else {
             return;
         };
-        let mut charged = self.charged.lock().unwrap_or_else(PoisonError::into_inner);
-        let need = self.beyond_floor(self.used());
+        // A stale read only delays a trim
+        if self.trim_target(self.charged.load(AtomicOrdering::SeqCst)).is_none() {
+            return;
+        }
+        let _charging = self.charging.lock().unwrap_or_else(PoisonError::into_inner);
+        let charged = self.charged.load(AtomicOrdering::SeqCst);
+        let Some(target) = self.trim_target(charged) else {
+            return;
+        };
+        self.charged.store(target, AtomicOrdering::SeqCst);
+        // An acquire that saw the old charge before the store relies on it
+        if self.need() > target {
+            self.charged.store(charged, AtomicOrdering::SeqCst);
+            return;
+        }
+        shared.refund(charged - target);
+    }
+
+    fn trim_target(&self, charged: usize) -> Option<usize> {
+        let need = self.need();
         let target = match need {
             0 => 0,
-            _ if *charged > need.saturating_add(2 * SHARED_STEP) => need + SHARED_STEP,
-            _ => return,
+            _ if charged > need.saturating_add(2 * SHARED_STEP) => need + SHARED_STEP,
+            _ => return None,
         };
-        if *charged > target {
-            shared.refund(*charged - target);
-            *charged = target;
-        }
+        (charged > target).then_some(target)
     }
 }
 
 impl Drop for BufferBudget {
     fn drop(&mut self) {
         if let Some(shared) = &self.shared {
-            let charged = self.floor
-                + *self
-                    .charged
-                    .get_mut()
-                    .unwrap_or_else(PoisonError::into_inner);
+            let charged = self.floor + *self.charged.get_mut();
             if charged != 0 {
                 shared.refund(charged);
             }
