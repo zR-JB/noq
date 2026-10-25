@@ -400,12 +400,11 @@ impl Connection {
             shared,
         );
         // Received datagrams get a budget of their own, so they cannot take the reassembly room
-        // that stream credit already granted needs. Without a floor, a refused charge drops them.
+        // that stream credit already granted needs; a refused charge drops them.
         let datagrams = DatagramState::new(
-            buffer_budget::BufferBudget::with_floor(
+            buffer_budget::BufferBudget::without_floor(
                 (config.datagram_receive_buffer_size.unwrap_or(0) as u64).saturating_mul(4),
                 shared,
-                0,
             ),
             streams.send_budget(),
         );

@@ -19,6 +19,8 @@ pub(super) const PACKET_QUEUE_BYTES: u64 = 16 * 1024 * 1024;
 /// Charges beyond the floor reach the shared budget in steps of this many bytes: above its floor a
 /// budget keeps at most two steps it does not use, at or below its floor none.
 const SHARED_STEP: usize = 64 * 1024;
+/// Step of a budget without a floor, so a few held bytes do not hold a whole `SHARED_STEP`
+const FLOORLESS_STEP: usize = 4 * 1024;
 
 /// Byte budget shared by connections beyond their floors
 pub trait SharedBudget: Send + Sync + fmt::Debug {
@@ -38,6 +40,7 @@ pub(super) struct BufferBudget {
     charging: Mutex<()>,
     shared: Option<Arc<dyn SharedBudget>>,
     floor: usize,
+    step: usize,
     refused: AtomicBool,
 }
 
@@ -46,10 +49,24 @@ impl BufferBudget {
         Self::with_floor(limit, shared, MIN_BUFFER_BYTES)
     }
 
+    /// A budget whose refused charges fail without closing anything
+    pub(super) fn without_floor(limit: u64, shared: Option<&Arc<dyn SharedBudget>>) -> Arc<Self> {
+        Self::build(limit, shared, 0, FLOORLESS_STEP)
+    }
+
     pub(super) fn with_floor(
         limit: u64,
         shared: Option<&Arc<dyn SharedBudget>>,
         floor: usize,
+    ) -> Arc<Self> {
+        Self::build(limit, shared, floor, SHARED_STEP)
+    }
+
+    fn build(
+        limit: u64,
+        shared: Option<&Arc<dyn SharedBudget>>,
+        floor: usize,
+        step: usize,
     ) -> Arc<Self> {
         let floor = match shared {
             Some(shared) if shared.try_charge(floor) => floor,
@@ -66,6 +83,7 @@ impl BufferBudget {
             charging: Mutex::new(()),
             shared: shared.cloned(),
             floor,
+            step,
             refused: AtomicBool::new(false),
         })
     }
@@ -153,7 +171,7 @@ impl BufferBudget {
         if charged >= need {
             return Ok(());
         }
-        let stepped = need.saturating_add(SHARED_STEP);
+        let stepped = need.saturating_add(self.step);
         let target = if shared.try_charge(stepped - charged) {
             stepped
         } else if shared.try_charge(need - charged) {
@@ -172,7 +190,10 @@ impl BufferBudget {
             return;
         };
         // A stale read only delays a trim
-        if self.trim_target(self.charged.load(AtomicOrdering::SeqCst)).is_none() {
+        if self
+            .trim_target(self.charged.load(AtomicOrdering::SeqCst))
+            .is_none()
+        {
             return;
         }
         let _charging = self.charging.lock().unwrap_or_else(PoisonError::into_inner);
@@ -193,7 +214,7 @@ impl BufferBudget {
         let need = self.need();
         let target = match need {
             0 => 0,
-            _ if charged > need.saturating_add(2 * SHARED_STEP) => need + SHARED_STEP,
+            _ if charged > need.saturating_add(2 * self.step) => need + self.step,
             _ => return None,
         };
         (charged > target).then_some(target)
@@ -502,6 +523,24 @@ mod tests {
         assert_eq!(budget.used(), 0);
         assert_eq!(shared.used.load(AtomicOrdering::Relaxed), MIN_BUFFER_BYTES);
         drop(budget);
+        assert_eq!(shared.used.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_floorless_budget_charges_small_steps() {
+        let shared = Arc::new(Shared {
+            limit: usize::MAX,
+            used: AtomicUsize::new(0),
+            charges: AtomicUsize::new(0),
+        });
+        let dyn_shared: Arc<dyn SharedBudget> = shared.clone();
+        let budget = BufferBudget::without_floor(1 << 20, Some(&dyn_shared));
+        let held = budget.acquire(49).unwrap();
+        assert_eq!(
+            shared.used.load(AtomicOrdering::Relaxed),
+            49 + FLOORLESS_STEP
+        );
+        drop(held);
         assert_eq!(shared.used.load(AtomicOrdering::Relaxed), 0);
     }
 
