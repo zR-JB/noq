@@ -1,10 +1,8 @@
-# Keep GitHub Actions up to date with GitHub's Dependabot...
-# https://docs.github.com/en/code-security/dependabot/working-with-dependabot/keeping-your-actions-up-to-date-with-dependabot
-# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file#package-ecosystem
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    open-pull-requests-limit: 0
     groups:
       github-actions:
         patterns:
@@ -20,6 +18,7 @@ updates:
       timezone: "America/New_York"
   - package-ecosystem: cargo
     directory: /
+    open-pull-requests-limit: 0
     cooldown:
       default-days: 7
     schedule:
