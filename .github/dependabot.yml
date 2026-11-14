@@ -2,7 +2,6 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
-    open-pull-requests-limit: 0
     groups:
       github-actions:
         patterns:
@@ -18,7 +17,6 @@ updates:
       timezone: "America/New_York"
   - package-ecosystem: cargo
     directory: /
-    open-pull-requests-limit: 0
     cooldown:
       default-days: 7
     schedule:
