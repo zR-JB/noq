@@ -1020,11 +1020,14 @@ impl StreamsState {
         id: StreamId,
         offset: u64,
     ) -> Result<(), TransportError> {
-        if id.initiator() != self.side && id.dir() == Dir::Uni {
-            debug!("got MAX_STREAM_DATA on recv-only {}", id);
-            return Err(TransportError::STREAM_STATE_ERROR(
-                "MAX_STREAM_DATA on recv-only stream",
-            ));
+        if id.initiator() != self.side {
+            if id.dir() == Dir::Uni {
+                debug!("got MAX_STREAM_DATA on recv-only {}", id);
+                return Err(TransportError::STREAM_STATE_ERROR(
+                    "MAX_STREAM_DATA on recv-only stream",
+                ));
+            }
+            self.validate_receive_id(id)?;
         }
 
         // Create state for this stream if the remote peer created it.
@@ -1343,7 +1346,7 @@ impl StreamsState {
         // If we initiated this stream, nothing to do
         if id.initiator() == self.side
             // If this stream is larger than the max allowed, return.
-            // NOTE: STREAM/RESET_STREAM already enforces this, however STOP_SENDING/MAX_STREAM_DATA do not
+            // STOP_SENDING does not validate the limit.
             || id.index() >= self.max_remote[dir_idx]
             // If this stream has already been opened, nothing to do
             || id.index() < self.next_remote[dir_idx]
